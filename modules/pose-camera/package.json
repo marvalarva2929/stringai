@@ -1,0 +1,6 @@
+{
+  "name": "pose-camera",
+  "version": "1.0.0",
+  "description": "Real-time body pose detection + camera preview for StringAI",
+  "main": "index.js"
+}

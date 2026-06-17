@@ -1,0 +1,6 @@
+{
+  "name": "video-audio-extractor",
+  "version": "1.0.0",
+  "description": "AVFoundation video-to-WAV audio extractor for StringAI",
+  "main": "index.js"
+}
