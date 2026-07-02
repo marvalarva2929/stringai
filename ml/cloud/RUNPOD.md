@@ -82,7 +82,8 @@ https://<POD_ID>-7860.proxy.runpod.net
 
 The pod's **Connect** menu shows this as "Connect to HTTP Service [Port 7860]".
 Log in with the `--auth` credentials, upload a frame, and you should see the
-amber (bow) and cyan (bridge) boxes in ~1–2 s each.
+amber (bow) and cyan (violin) boxes in ~1–2 s each, plus a magenta circle
+where the box-diagonal intersection estimates the bow/string contact point.
 
 ## 5. Bulk auto-labeling (once the prompts look good)
 
