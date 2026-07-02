@@ -119,10 +119,38 @@ def draw_box(draw: ImageDraw.ImageDraw, box: dict, color: str, label: str) -> No
     draw.text((box["x1"] + 3, ty + 3), label, fill="black")
 
 
+def make_box(x1n: float, y1n: float, x2n: float, y2n: float, img_w: int, img_h: int) -> dict:
+    return {
+        "x1": round(x1n * img_w), "y1": round(y1n * img_h),
+        "x2": round(x2n * img_w), "y2": round(y2n * img_h),
+        "x1_norm": round(x1n, 4), "y1_norm": round(y1n, 4),
+        "x2_norm": round(x2n, 4), "y2_norm": round(y2n, 4),
+    }
+
+
+def select_boxes(boxes: list[dict], mode: str, img_w: int, img_h: int) -> list[dict]:
+    """Reduce multiple detections to one box. The model emits no confidence
+    scores, so 'first' (emission order ≈ salience) and 'largest' are proxies;
+    'union' merges fragments of one object into a single enclosing box."""
+    if len(boxes) <= 1 or mode == "all":
+        return boxes
+    if mode == "first":
+        return boxes[:1]
+    if mode == "largest":
+        return [max(boxes, key=lambda b: (b["x2_norm"] - b["x1_norm"]) * (b["y2_norm"] - b["y1_norm"]))]
+    if mode == "union":
+        return [make_box(
+            min(b["x1_norm"] for b in boxes), min(b["y1_norm"] for b in boxes),
+            max(b["x2_norm"] for b in boxes), max(b["y2_norm"] for b in boxes),
+            img_w, img_h,
+        )]
+    return boxes
+
+
 # ── Gradio handler ─────────────────────────────────────────────────────────────
 
 def detect(image_np: np.ndarray, find_bow: bool, find_bridge: bool,
-           bow_prompt: str, bridge_prompt: str):
+           bow_prompt: str, bridge_prompt: str, box_mode: str):
     if image_np is None:
         return None, "Upload an image first.", "{}", ""
 
@@ -150,7 +178,7 @@ def detect(image_np: np.ndarray, find_bow: bool, find_bridge: bool,
         elapsed = time.perf_counter() - t0
         total += elapsed
 
-        boxes = parse_boxes(raw, W, H)
+        boxes = select_boxes(parse_boxes(raw, W, H), box_mode, W, H)
         results[name] = [
             {k: b[k] for k in ("x1_norm", "y1_norm", "x2_norm", "y2_norm")} for b in boxes
         ]
@@ -181,6 +209,13 @@ def build_ui():
                 with gr.Row():
                     cb_bow = gr.Checkbox(label="Detect bow", value=True)
                     cb_bridge = gr.Checkbox(label="Detect bridge", value=True)
+                box_mode = gr.Radio(
+                    ["largest", "union", "first", "all"],
+                    value="largest",
+                    label="Box selection (when the model returns several boxes)",
+                    info="largest = biggest box · union = merge all into one enclosing box · "
+                         "first = model's first detection · all = keep everything",
+                )
                 with gr.Accordion("Prompts", open=False):
                     tb_bow = gr.Textbox(label="Bow prompt", value=BOW_PROMPT)
                     tb_bridge = gr.Textbox(label="Bridge prompt", value=BRIDGE_PROMPT)
@@ -191,7 +226,7 @@ def build_ui():
                 boxes_out = gr.Code(label="Boxes (normalized JSON)", language="json")
                 raw_out = gr.Textbox(label="Raw model output", lines=6, interactive=False)
 
-        inputs = [img_in, cb_bow, cb_bridge, tb_bow, tb_bridge]
+        inputs = [img_in, cb_bow, cb_bridge, tb_bow, tb_bridge, box_mode]
         outputs = [img_out, status, boxes_out, raw_out]
         btn.click(detect, inputs=inputs, outputs=outputs)
         img_in.upload(detect, inputs=inputs, outputs=outputs)
