@@ -27,6 +27,14 @@ public class AppDelegate: ExpoAppDelegate {
       withModuleName: "main",
       in: window,
       launchOptions: launchOptions)
+    // Wrap root VC so JS can toggle prefersHomeIndicatorAutoHidden via HomeIndicatorWrapper.
+    // Must set wrapper as window root BEFORE calling embed/addChild, otherwise the child
+    // is simultaneously window.rootViewController which causes a VC containment conflict.
+    if let rootVC = window?.rootViewController {
+      let wrapper = HomeIndicatorWrapper()
+      window?.rootViewController = wrapper
+      wrapper.embed(rootVC)
+    }
 #endif
 
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)

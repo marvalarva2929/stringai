@@ -1,0 +1,10 @@
+# Training artifacts — large, reproducible from scripts
+runs/
+data/*
+*.pt
+*.onnx
+*.mlpackage
+*.mlmodel
+
+# Keep the manifest (useful reference)
+!data/manifest.csv

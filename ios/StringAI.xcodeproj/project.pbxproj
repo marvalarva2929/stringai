@@ -10,6 +10,7 @@
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
 		3E461D99554A48A4959DE609 /* SplashScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */; };
 		7E0CD69C27F342A09DE0F102 /* Pods_StringAI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6521B6F8CA61F75F09963A74 /* Pods_StringAI.framework */; };
+		A1B2C3D4E5F600010000AA01 /* HomeIndicatorWrapper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F600010000AA02 /* HomeIndicatorWrapper.swift */; };
 		BB2F792D24A3F905000567C9 /* Expo.plist in Resources */ = {isa = PBXBuildFile; fileRef = BB2F792C24A3F905000567C9 /* Expo.plist */; };
 		C640E423F1E1BDF3007EB50B /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = BF3DC23AA99125B01F1154D3 /* PrivacyInfo.xcprivacy */; };
 		C8D4E5F6A7B890120000CC01 /* VideoAudioExtractorModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8D4E5F6A7B890120000CC02 /* VideoAudioExtractorModule.swift */; };
@@ -23,6 +24,7 @@
 		13B07FB51A68108700A75B9A /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Images.xcassets; path = StringAI/Images.xcassets; sourceTree = "<group>"; };
 		13B07FB61A68108700A75B9A /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = Info.plist; path = StringAI/Info.plist; sourceTree = "<group>"; };
 		6521B6F8CA61F75F09963A74 /* Pods_StringAI.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_StringAI.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		A1B2C3D4E5F600010000AA02 /* HomeIndicatorWrapper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = HomeIndicatorWrapper.swift; path = StringAI/HomeIndicatorWrapper.swift; sourceTree = "<group>"; };
 		AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = SplashScreen.storyboard; path = StringAI/SplashScreen.storyboard; sourceTree = "<group>"; };
 		BB2F792C24A3F905000567C9 /* Expo.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; path = Expo.plist; sourceTree = "<group>"; };
 		BF3DC23AA99125B01F1154D3 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xml; name = PrivacyInfo.xcprivacy; path = StringAI/PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
@@ -50,6 +52,7 @@
 			isa = PBXGroup;
 			children = (
 				F11748412D0307B40044C1D9 /* AppDelegate.swift */,
+				A1B2C3D4E5F600010000AA02 /* HomeIndicatorWrapper.swift */,
 				F11748442D0722820044C1D9 /* StringAI-Bridging-Header.h */,
 				C8D4E5F6A7B890120000CC02 /* VideoAudioExtractorModule.swift */,
 				BB2F792B24A3F905000567C9 /* Supporting */,
@@ -278,6 +281,8 @@
 				"${PODS_CONFIGURATION_BUILD_DIR}/EXConstants/ExpoConstants_privacy.bundle",
 				"${PODS_CONFIGURATION_BUILD_DIR}/ExpoFileSystem/ExpoFileSystem_privacy.bundle",
 				"${PODS_ROOT}/../../modules/pose-camera/ios/hand_landmarker.task",
+				"${PODS_ROOT}/../../modules/pose-camera/ios/pose_landmarker_full.task",
+				"${PODS_ROOT}/../../modules/pose-camera/ios/bow_detector.mlmodelc",
 				"${PODS_CONFIGURATION_BUILD_DIR}/PurchasesHybridCommon/PurchasesHybridCommon.bundle",
 				"${PODS_CONFIGURATION_BUILD_DIR}/RNCAsyncStorage/RNCAsyncStorage_resources.bundle",
 				"${PODS_CONFIGURATION_BUILD_DIR}/RNSVG/RNSVGFilters.bundle",
@@ -291,6 +296,8 @@
 				"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/ExpoConstants_privacy.bundle",
 				"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/ExpoFileSystem_privacy.bundle",
 				"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/hand_landmarker.task",
+				"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/pose_landmarker_full.task",
+				"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/bow_detector.mlmodelc",
 				"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/PurchasesHybridCommon.bundle",
 				"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/RNCAsyncStorage_resources.bundle",
 				"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/RNSVGFilters.bundle",
@@ -351,6 +358,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				F11748422D0307B40044C1D9 /* AppDelegate.swift in Sources */,
+				A1B2C3D4E5F600010000AA01 /* HomeIndicatorWrapper.swift in Sources */,
 				FE9FAFBB570659242F8B75E7 /* ExpoModulesProvider.swift in Sources */,
 				C8D4E5F6A7B890120000CC01 /* VideoAudioExtractorModule.swift in Sources */,
 			);

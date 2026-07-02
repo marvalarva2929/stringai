@@ -9,10 +9,28 @@
  */
 
 import { File } from 'expo-file-system';
-import { MetricScore, TechniqueEvent, FlaggedTimestamp, severityFromScore, AudioAnalysisOutput, RawAudioSignals } from '../types/analysis';
+import { MetricScore, TechniqueEvent, FlaggedTimestamp, severityFromScore, AudioAnalysisOutput, RawAudioSignals, VibratoNoteResult, VibratoAnalysis, DynDebugInfo, DynPhraseDebug, PhraseShape, RhythmAnalysis, RhythmFlaggedRegion } from '../types/analysis';
 import { analyzeIntonation } from '../lib/intonationAnalysis';
 import { InstrumentId } from '../types/instrument';
 import { extractAudioFromVideo } from './videoAudioExtractor';
+import {
+  PitchFrame,
+  clamp,
+  detectPitches,
+  centsFromNearestNote,
+  magnitudeSpectrum,
+  computeRmsEnvelope,
+  estimateF0HPS,
+  sumHarmonicPower,
+} from './dsp';
+import { scoreToneQuality } from './toneAnalysis';
+import {
+  scoreIntonationStability,
+  computeIntonationStability,
+  classifyVibratoSegment,
+  VIBRATO_MIN_SEGMENT_S,
+  VIBRATO_MIN_FRAMES,
+} from './pitchContour';
 
 // ─────────────────────────────────────────────────────────────
 // WAV Parser
@@ -83,190 +101,164 @@ function parseWav(bytes: Uint8Array): WavData | null {
   return { samples, sampleRate, duration: totalSamples / sampleRate };
 }
 
-// ─────────────────────────────────────────────────────────────
-// YIN Pitch Detection
-// ─────────────────────────────────────────────────────────────
-
-interface PitchFrame {
-  frequency: number | null;
-  timestamp: number;
-}
-
-// Single YIN window. Returns detected frequency in Hz, or null.
-function yinWindow(
-  samples: Float32Array,
-  offset: number,
-  windowSize: number,
-  sampleRate: number,
-): number | null {
-  const half = windowSize >> 1;
-  const diff = new Float32Array(half);
-
-  // Difference function
-  for (let tau = 1; tau < half; tau++) {
-    let sum = 0;
-    for (let j = 0; j < half; j++) {
-      const d = samples[offset + j] - samples[offset + j + tau];
-      sum += d * d;
-    }
-    diff[tau] = sum;
-  }
-
-  // Cumulative mean normalized difference
-  const cmndf = new Float32Array(half);
-  cmndf[0] = 1;
-  let runSum = 0;
-  for (let tau = 1; tau < half; tau++) {
-    runSum += diff[tau];
-    cmndf[tau] = runSum > 0 ? (diff[tau] * tau) / runSum : 1;
-  }
-
-  // Find first valley below threshold, refined with parabolic interpolation
-  const threshold = 0.15;
-  for (let tau = 2; tau < half - 1; tau++) {
-    if (cmndf[tau] < threshold) {
-      while (tau + 1 < half - 1 && cmndf[tau + 1] < cmndf[tau]) tau++;
-      const prev = cmndf[tau - 1];
-      const curr = cmndf[tau];
-      const next = cmndf[tau + 1];
-      const denom = 2 * (2 * curr - prev - next);
-      const refined = denom !== 0 ? tau + (prev - next) / denom : tau;
-      const freq = sampleRate / refined;
-      if (freq >= 80 && freq <= 5000) return freq;
-    }
-  }
-  return null;
-}
-
-function detectPitches(samples: Float32Array, sampleRate: number): PitchFrame[] {
-  const windowSize = 1024; // ~23ms at 44100 Hz — keeps O(N²) cost manageable
-  const hopSize = Math.round(sampleRate * 0.025); // 25ms hop (was 50ms) — finer time resolution for fast passages
-  const RMS_NOISE_GATE = 0.01; // skip YIN on windows below this energy (prevents noise-floor pitch detections)
-  const frames: PitchFrame[] = [];
-
-  for (let offset = 0; offset + windowSize < samples.length; offset += hopSize) {
-    let rmsSum = 0;
-    for (let i = 0; i < windowSize; i++) rmsSum += samples[offset + i] ** 2;
-    const rms = Math.sqrt(rmsSum / windowSize);
-    frames.push({
-      frequency: rms >= RMS_NOISE_GATE ? yinWindow(samples, offset, windowSize, sampleRate) : null,
-      timestamp: offset / sampleRate,
-    });
-  }
-  return frames;
-}
+// PitchFrame, YIN pitch detection (yinWindow/detectPitches), centsFromNearestNote,
+// the FFT (fftInPlace/magnitudeSpectrum) and computeRmsEnvelope now live in ./dsp
+// (pure, unit-testable). They are imported at the top of this file.
 
 // ─────────────────────────────────────────────────────────────
-// Chromatic Scale Helper
+// Onset Detection — Two-Source (Spectral Flux + Pitch Change)
 // ─────────────────────────────────────────────────────────────
 
-// Cents deviation of freq from the nearest chromatic note.
-function centsFromNearestNote(freq: number): number {
-  // A4 = 440 Hz = MIDI 69
-  const midi = 12 * Math.log2(freq / 440) + 69;
-  const nearest = 440 * Math.pow(2, (Math.round(midi) - 69) / 12);
-  return 1200 * Math.log2(freq / nearest);
-}
+const SF_FFT_SIZE     = 512;   // 256 bins; resolves bow transients without 1024-pt cost
+const SF_HOP_SIZE_S   = 0.01;  // 10ms hop — 2× finer than RMS hop; catches fast detaché
+const SF_LOG_C        = 1000;  // log(1 + C*mag) compression (librosa default)
+const SF_MEDIAN_WIN   = 10;    // ±10 frames (±100ms) local median window
+const SF_MULTIPLIER   = 2.0;   // threshold = median × 2.0 + delta (raised from 1.5; reduces bow-noise triggers)
+const SF_DELTA        = 0.04;  // additive floor; prevents threshold → 0 during silence
 
-// ─────────────────────────────────────────────────────────────
-// In-Place Cooley-Tukey FFT
-// ─────────────────────────────────────────────────────────────
+const PC_SEMITONE_THRESH  = 1.0; // pitch must move ≥ 1 semitone (vibrato is ±0.3–0.6)
+const PC_STABILITY_FRAMES = 3;   // new pitch must hold 3×25ms = 75ms before confirming onset
+const MERGE_DEDUP_GAP_S   = 0.050; // within 50ms → same physical event, keep earlier
+const MERGE_MIN_IOI_S     = 0.120; // global minimum inter-onset (≈ 16th note at 120 BPM)
 
-function fftInPlace(re: Float32Array, im: Float32Array): void {
-  const n = re.length;
-  // Bit-reversal permutation
-  for (let i = 1, j = 0; i < n; i++) {
-    let bit = n >> 1;
-    for (; j & bit; bit >>= 1) j ^= bit;
-    j ^= bit;
-    if (i < j) {
-      let t = re[i]; re[i] = re[j]; re[j] = t;
-      t = im[i]; im[i] = im[j]; im[j] = t;
-    }
-  }
-  // Butterfly passes
-  for (let len = 2; len <= n; len <<= 1) {
-    const ang = -(2 * Math.PI) / len;
-    const wRe = Math.cos(ang);
-    const wIm = Math.sin(ang);
-    for (let i = 0; i < n; i += len) {
-      let curRe = 1, curIm = 0;
-      const half = len >> 1;
-      for (let j = 0; j < half; j++) {
-        const uRe = re[i + j], uIm = im[i + j];
-        const vRe = re[i + j + half] * curRe - im[i + j + half] * curIm;
-        const vIm = re[i + j + half] * curIm + im[i + j + half] * curRe;
-        re[i + j] = uRe + vRe; im[i + j] = uIm + vIm;
-        re[i + j + half] = uRe - vRe; im[i + j + half] = uIm - vIm;
-        const nr = curRe * wRe - curIm * wIm;
-        curIm = curRe * wIm + curIm * wRe;
-        curRe = nr;
+function computeSpectralFluxOnsets(samples: Float32Array, sampleRate: number): number[] {
+  const hopSize   = Math.round(sampleRate * SF_HOP_SIZE_S);
+  const numFrames = Math.max(0, Math.floor((samples.length - SF_FFT_SIZE) / hopSize) + 1);
+  if (numFrames < 2 * SF_MEDIAN_WIN + 3) return [];
+
+  // Pass 1: log-magnitude spectral flux (half-wave rectified)
+  const flux = new Float32Array(numFrames);
+  let prevLogMag: Float32Array | null = null;
+  for (let fi = 0; fi < numFrames; fi++) {
+    const mag = magnitudeSpectrum(samples, fi * hopSize, SF_FFT_SIZE);
+    const logMag = new Float32Array(mag.length);
+    for (let k = 0; k < mag.length; k++) logMag[k] = Math.log1p(SF_LOG_C * mag[k]);
+    if (prevLogMag !== null) {
+      let sf = 0;
+      for (let k = 0; k < logMag.length; k++) {
+        const d = logMag[k] - prevLogMag[k];
+        if (d > 0) sf += d;
       }
+      flux[fi] = sf;
     }
+    prevLogMag = logMag;
   }
-}
 
-// Returns magnitude spectrum (length = fftSize / 2).
-function magnitudeSpectrum(samples: Float32Array, offset: number, fftSize: number): Float32Array {
-  const re = new Float32Array(fftSize);
-  const im = new Float32Array(fftSize);
-  for (let i = 0; i < fftSize; i++) {
-    const w = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (fftSize - 1))); // Hann
-    re[i] = (offset + i < samples.length) ? samples[offset + i] * w : 0;
+  // Pass 2: adaptive threshold = local median × multiplier + delta
+  const thresh = new Float32Array(numFrames);
+  for (let fi = 0; fi < numFrames; fi++) {
+    const win: number[] = [];
+    for (let j = Math.max(0, fi - SF_MEDIAN_WIN); j <= Math.min(numFrames - 1, fi + SF_MEDIAN_WIN); j++)
+      win.push(flux[j]);
+    win.sort((a, b) => a - b);
+    thresh[fi] = win[Math.floor(win.length / 2)] * SF_MULTIPLIER + SF_DELTA;
   }
-  fftInPlace(re, im);
-  const half = fftSize >> 1;
-  const mag = new Float32Array(half);
-  for (let i = 0; i < half; i++) {
-    mag[i] = Math.sqrt(re[i] * re[i] + im[i] * im[i]);
-  }
-  return mag;
-}
 
-// ─────────────────────────────────────────────────────────────
-// RMS Envelope
-// ─────────────────────────────────────────────────────────────
-
-function computeRmsEnvelope(samples: Float32Array, windowSize: number, hopSize: number): Float32Array {
-  const frames = Math.max(1, Math.floor((samples.length - windowSize) / hopSize) + 1);
-  const rms = new Float32Array(frames);
-  for (let i = 0; i < frames; i++) {
-    const off = i * hopSize;
-    let sum = 0;
-    for (let j = 0; j < windowSize; j++) {
-      const s = samples[off + j] ?? 0;
-      sum += s * s;
-    }
-    rms[i] = Math.sqrt(sum / windowSize);
-  }
-  return rms;
-}
-
-// ─────────────────────────────────────────────────────────────
-// Onset Detection
-// ─────────────────────────────────────────────────────────────
-
-function detectOnsets(rms: Float32Array, hopSize: number, sampleRate: number): number[] {
+  // Pass 3: peak-pick above threshold, enforce min gap
   const onsets: number[] = [];
-  const minGapFrames = Math.round(0.1 * sampleRate / hopSize); // min 100ms gap
-  let lastOnset = -minGapFrames;
-
-  for (let i = 1; i < rms.length; i++) {
-    if (rms[i] - rms[i - 1] > 0.05 && i - lastOnset > minGapFrames) {
-      onsets.push((i * hopSize) / sampleRate);
-      lastOnset = i;
+  const minGapFrames = Math.round(MERGE_MIN_IOI_S / SF_HOP_SIZE_S);
+  let lastFrame = -minGapFrames;
+  for (let fi = 1; fi < numFrames - 1; fi++) {
+    if (flux[fi] > thresh[fi]
+        && flux[fi] >= flux[fi - 1] && flux[fi] >= flux[fi + 1]
+        && fi - lastFrame > minGapFrames) {
+      onsets.push((fi * hopSize) / sampleRate);
+      lastFrame = fi;
     }
   }
   return onsets;
 }
 
+function detectPitchChangeOnsets(pitches: PitchFrame[]): number[] {
+  const onsets: number[] = [];
+  const active = pitches.filter((f) => f.frequency !== null) as { frequency: number; timestamp: number }[];
+  if (active.length < PC_STABILITY_FRAMES + 1) return [];
+
+  let settledMidi = Math.round(12 * Math.log2(active[0].frequency / 440) + 69);
+  let candidateMidi: number | null = null;
+  let candidateStart: number | null = null;
+  let candidateCount = 0;
+  let prevWasNull = false;
+
+  for (const frame of pitches) {
+    if (frame.frequency === null) {
+      prevWasNull = true;
+      candidateMidi = null; candidateCount = 0; candidateStart = null;
+      continue;
+    }
+    const midi = Math.round(12 * Math.log2(frame.frequency / 440) + 69);
+    if (prevWasNull) {
+      // Only fire if the resumed pitch is a different note; bow changes on the same
+      // held pitch produce a brief YIN silence but shouldn't count as a new onset.
+      if (Math.abs(midi - settledMidi) >= PC_SEMITONE_THRESH) {
+        onsets.push(frame.timestamp);
+      }
+      settledMidi = midi; candidateMidi = null; candidateCount = 0;
+      prevWasNull = false;
+      continue;
+    }
+    prevWasNull = false;
+    if (Math.abs(midi - settledMidi) < PC_SEMITONE_THRESH) {
+      candidateMidi = null; candidateCount = 0; candidateStart = null;
+    } else if (midi === candidateMidi) {
+      candidateCount++;
+      if (candidateCount >= PC_STABILITY_FRAMES) {
+        onsets.push(candidateStart!);
+        settledMidi = candidateMidi!;
+        candidateMidi = null; candidateCount = 0; candidateStart = null;
+      }
+    } else {
+      candidateMidi = midi; candidateCount = 1; candidateStart = frame.timestamp;
+    }
+  }
+  return onsets;
+}
+
+function mergeOnsets(fluxOnsets: number[], pitchOnsets: number[]): number[] {
+  const combined = [...fluxOnsets, ...pitchOnsets].sort((a, b) => a - b);
+  if (combined.length === 0) return [];
+  const deduped: number[] = [combined[0]];
+  for (let i = 1; i < combined.length; i++)
+    if (combined[i] - deduped[deduped.length - 1] >= MERGE_DEDUP_GAP_S)
+      deduped.push(combined[i]);
+  const final: number[] = [deduped[0]];
+  for (let i = 1; i < deduped.length; i++)
+    if (deduped[i] - final[final.length - 1] >= MERGE_MIN_IOI_S)
+      final.push(deduped[i]);
+  return final;
+}
+
+function collapseAdjacentSameNoteOnsets(onsets: number[], pitches: PitchFrame[], audioDuration: number): number[] {
+  if (onsets.length < 2) return onsets;
+  const active = pitches.filter((f) => f.frequency !== null) as { frequency: number; timestamp: number }[];
+  if (active.length === 0) return onsets;
+
+  const medianMidi = (startS: number, endS: number): number | null => {
+    const frames = active.filter((f) => f.timestamp >= startS && f.timestamp < endS);
+    if (frames.length < 3) return null;
+    const midis = frames.map((f) => Math.round(12 * Math.log2(f.frequency / 440) + 69));
+    midis.sort((a, b) => a - b);
+    return midis[Math.floor(midis.length / 2)];
+  };
+
+  // Greedy: keep an onset only if the pitch changes across it.
+  // "prevStart" tracks the start of the current merged segment (last kept onset).
+  const kept: number[] = [onsets[0]];
+  for (let i = 1; i < onsets.length; i++) {
+    const prevStart = kept[kept.length - 1];
+    const nextEnd   = onsets[i + 1] ?? audioDuration;
+    const midiA = medianMidi(prevStart, onsets[i]);
+    const midiB = medianMidi(onsets[i], nextEnd);
+    if (midiA !== null && midiB !== null && midiA === midiB) continue; // same note — collapse
+    kept.push(onsets[i]);
+  }
+  return kept;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Scoring Functions
 // ─────────────────────────────────────────────────────────────
-
-function clamp(v: number, lo = 0, hi = 100): number {
-  return Math.max(lo, Math.min(hi, v));
-}
+// (clamp is imported from ./dsp)
 
 function scorePitchAccuracy(pitches: PitchFrame[], duration: number): MetricScore {
   const detected = pitches.filter((p) => p.frequency !== null);
@@ -274,262 +266,865 @@ function scorePitchAccuracy(pitches: PitchFrame[], duration: number): MetricScor
     return { key: 'pitchAccuracy', score: 50, flaggedTimestamps: [], severity: severityFromScore(50), events: [], occurrenceRate: 0, observationSummary: 'No pitch detected — check audio recording.' };
   }
 
-  const flagged: FlaggedTimestamp[] = [];
-  let inTune = 0;
-  let flagStart: number | null = null;
+  // Signed cents: negative = flat, positive = sharp.
+  // centsFromNearestNote already returns a signed value — don't discard the sign.
+  const signedDevs = detected.map((p) => centsFromNearestNote(p.frequency!));
+  const absDevs = signedDevs.map(Math.abs);
 
-  for (const f of detected) {
-    const cents = Math.abs(centsFromNearestNote(f.frequency!));
+  // Severity-weighted per-frame score: gradual penalty from 10¢ → 50¢.
+  // Previously a 20¢ flat note scored 100/100 (within 25¢ threshold).
+  // Now it scores 75/100 — still good, but not perfect.
+  const frameScores = absDevs.map((c) => {
+    if (c <= 10) return 100;
+    if (c <= 50) return 100 - (c - 10) * 2.5; // 100 at 10¢ → 0 at 50¢
+    return 0;
+  });
+  const baseScore = frameScores.reduce((a, b) => a + b, 0) / frameScores.length;
+
+  // Systematic bias: a student consistently 20¢ flat would previously score 100.
+  // Penalize directional offset — it indicates a physical setup problem, not a momentary lapse.
+  const meanBias = signedDevs.reduce((a, b) => a + b, 0) / signedDevs.length;
+  const biasPenalty = clamp(Math.abs(meanBias) * 1.5, 0, 35);
+
+  // Per-note-name tracking: find which specific pitches are chronically off.
+  // Gives actionable feedback: "F# is consistently 22¢ flat — check your second finger."
+  const noteDeviations = new Map<number, number[]>(); // MIDI note → [signed cents]
+  for (const p of detected) {
+    const midi = Math.round(12 * Math.log2(p.frequency! / 440) + 69);
+    if (!noteDeviations.has(midi)) noteDeviations.set(midi, []);
+    noteDeviations.get(midi)!.push(centsFromNearestNote(p.frequency!));
+  }
+  const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+  const worstNotes = [...noteDeviations.entries()]
+    .map(([midi, devs]) => ({
+      name: NOTE_NAMES[midi % 12],
+      mean: devs.reduce((a, b) => a + b, 0) / devs.length,
+      count: devs.length,
+    }))
+    .filter((n) => n.count >= 4 && Math.abs(n.mean) > 15)
+    .sort((a, b) => Math.abs(b.mean) - Math.abs(a.mean));
+
+  // Open-string resonance: notes that are unisons/octaves of G/D/A/E should ring sympathetically.
+  // These have an acoustic tuning reference — tighter 15¢ tolerance, and misses factor into summary.
+  const OPEN_HZ = [196.0, 293.7, 440.0, 659.3]; // G3, D4, A4, E5
+  let resonanceMisses = 0;
+  let resonanceChecked = 0;
+  for (const p of detected) {
+    const freq = p.frequency!;
+    const isResonant = OPEN_HZ.some((open) =>
+      [0.5, 1, 2, 4].some((ratio) => Math.abs(1200 * Math.log2(freq / (open * ratio))) < 30),
+    );
+    if (isResonant) {
+      resonanceChecked++;
+      if (Math.abs(centsFromNearestNote(freq)) > 15) resonanceMisses++;
+    }
+  }
+  const resonanceMissRate = resonanceChecked > 5 ? resonanceMisses / resonanceChecked : 0;
+
+  // Time-region flagging with direction — a teacher always says "sharp" or "flat", not just "off"
+  const flagged: FlaggedTimestamp[] = [];
+  let flagStart: number | null = null;
+  let flagBiasSum = 0, flagBiasCount = 0;
+  for (const p of detected) {
+    const signedC = centsFromNearestNote(p.frequency!);
+    const cents = Math.abs(signedC);
     if (cents <= 25) {
-      inTune++;
       if (flagStart !== null) {
-        if (f.timestamp - flagStart > 0.1) {
-          flagged.push({ startSeconds: flagStart, endSeconds: f.timestamp, note: 'Intonation off' });
+        if (p.timestamp - flagStart > 0.1) {
+          const avgBias = flagBiasCount > 0 ? flagBiasSum / flagBiasCount : 0;
+          const dir = avgBias < -5 ? 'flat' : avgBias > 5 ? 'sharp' : 'off';
+          flagged.push({ startSeconds: flagStart, endSeconds: p.timestamp, note: `Pitch ${dir} (~${Math.round(Math.abs(avgBias))}¢)` });
         }
-        flagStart = null;
+        flagStart = null; flagBiasSum = 0; flagBiasCount = 0;
       }
     } else {
-      if (flagStart === null) flagStart = f.timestamp;
+      if (flagStart === null) flagStart = p.timestamp;
+      flagBiasSum += signedC; flagBiasCount++;
     }
   }
   if (flagStart !== null) {
-    flagged.push({ startSeconds: flagStart, endSeconds: duration, note: 'Intonation off' });
+    const avgBias = flagBiasCount > 0 ? flagBiasSum / flagBiasCount : 0;
+    const dir = avgBias < -5 ? 'flat' : avgBias > 5 ? 'sharp' : 'off';
+    flagged.push({ startSeconds: flagStart, endSeconds: duration, note: `Pitch ${dir} (~${Math.round(Math.abs(avgBias))}¢)` });
   }
 
-  const score = clamp(Math.round((inTune / detected.length) * 100));
-  const occurrenceRate = 1 - inTune / detected.length;
+  const score = clamp(Math.round(baseScore - biasPenalty));
+  const occurrenceRate = Math.max(0, 1 - score / 100);
   const events: TechniqueEvent[] = flagged.slice(0, 6).map((ts) => ({ type: 'out_of_tune', startSeconds: ts.startSeconds, endSeconds: ts.endSeconds }));
-  const outOfTuneCount = flagged.length;
-  const ratePct = Math.round(occurrenceRate * 100);
-  const observationSummary =
-    outOfTuneCount === 0
-      ? 'Intonation was accurate throughout the session.'
-      : ratePct >= 30
-      ? `Intonation was off in ${ratePct}% of detected notes.`
-      : `${outOfTuneCount} ${outOfTuneCount === 1 ? 'passage was' : 'passages were'} noticeably out of tune.`;
+
+  // Lead the summary with the most actionable finding
+  const biasDir = meanBias < -8 ? 'flat' : meanBias > 8 ? 'sharp' : null;
+  let observationSummary: string;
+  if (flagged.length === 0 && !biasDir && score >= 85) {
+    observationSummary = resonanceMissRate > 0.4
+      ? 'Intonation is good overall, but notes that should ring against the open strings are slightly off.'
+      : 'Intonation was accurate throughout the session.';
+  } else if (biasDir && Math.abs(meanBias) > 10) {
+    observationSummary = `Playing is consistently ${biasDir} by ~${Math.round(Math.abs(meanBias))} cents — this often points to a physical setup issue.`;
+    if (worstNotes.length > 0) {
+      const w = worstNotes[0];
+      observationSummary += ` ${w.name} is most affected (${Math.round(Math.abs(w.mean))}¢ ${w.mean < 0 ? 'flat' : 'sharp'}).`;
+    }
+  } else if (worstNotes.length > 0) {
+    const w = worstNotes[0];
+    observationSummary = `${w.name} tends to be ${Math.round(Math.abs(w.mean))}¢ ${w.mean < 0 ? 'flat' : 'sharp'} — check finger placement and hand frame.`;
+    if (resonanceMissRate > 0.5) observationSummary += ' Open-string resonance notes are also slightly off.';
+  } else if (flagged.length > 0) {
+    observationSummary = `${flagged.length} ${flagged.length === 1 ? 'passage was' : 'passages were'} noticeably out of tune.`;
+  } else {
+    observationSummary = 'Intonation was mostly accurate with minor fluctuations.';
+  }
+
   return { key: 'pitchAccuracy', score, flaggedTimestamps: flagged.slice(0, 6), severity: severityFromScore(score), events, occurrenceRate, observationSummary };
 }
 
-function scoreIntonationStability(pitches: PitchFrame[]): MetricScore {
-  const detected = pitches.filter((p) => p.frequency !== null);
-  if (detected.length < 3) {
-    return { key: 'intonationStability', score: 60, flaggedTimestamps: [], severity: severityFromScore(60), events: [], occurrenceRate: 0, observationSummary: 'Insufficient notes to assess pitch stability.' };
-  }
-
-  // Std deviation of per-frame deviation from nearest note
-  const devs = detected.map((p) => centsFromNearestNote(p.frequency!));
-  const mean = devs.reduce((a, b) => a + b, 0) / devs.length;
-  const variance = devs.reduce((acc, d) => acc + (d - mean) ** 2, 0) / devs.length;
-  const stdCents = Math.sqrt(variance);
-
-  // stdCents ≈ 0 → perfect stability (100). stdCents ≈ 30 → very wobbly (0).
-  const score = clamp(Math.round(100 - stdCents * 3));
-  const occurrenceRate = Math.min(1, stdCents / 30);
-  const observationSummary =
-    stdCents < 8
-      ? 'Sustained notes held their pitch steadily.'
-      : stdCents < 18
-      ? `Some pitch wavering on held notes (avg ${Math.round(stdCents)} cents variation).`
-      : `Significant pitch wavering on held notes (avg ${Math.round(stdCents)} cents variation).`;
-  return { key: 'intonationStability', score, flaggedTimestamps: [], severity: severityFromScore(score), events: [], occurrenceRate, observationSummary };
-}
-
-function scoreToneQuality(samples: Float32Array, sampleRate: number, duration: number): MetricScore {
-  const fftSize = 2048;
-  const hopSize = Math.round(sampleRate * 0.1); // 100ms
-  const flagged: FlaggedTimestamp[] = [];
-  let goodFrames = 0;
-  let totalFrames = 0;
-  let flagStart: number | null = null;
-
-  for (let offset = 0; offset + fftSize < samples.length; offset += hopSize) {
-    const mag = magnitudeSpectrum(samples, offset, fftSize);
-    const t = offset / sampleRate;
-
-    let maxMag = 0;
-    let maxBin = 1;
-    let totalPow = 0;
-    for (let i = 1; i < mag.length; i++) {
-      const m2 = mag[i] * mag[i];
-      totalPow += m2;
-      if (mag[i] > maxMag) { maxMag = mag[i]; maxBin = i; }
-    }
-
-    if (maxMag < 0.002) { totalFrames++; continue; } // silence
-
-    const fundamentalPow = mag[maxBin] * mag[maxBin];
-    const ratio = fundamentalPow / (totalPow + 1e-10);
-    const isGood = ratio > 0.08 && ratio < 0.95; // noisy <0.08, very pure harmonic >0.95 is fine
-
-    totalFrames++;
-    if (isGood) {
-      goodFrames++;
-      if (flagStart !== null) {
-        flagged.push({ startSeconds: flagStart, endSeconds: t, note: 'Tone quality issue' });
-        flagStart = null;
-      }
-    } else {
-      if (flagStart === null) flagStart = t;
-    }
-  }
-  if (flagStart !== null) {
-    flagged.push({ startSeconds: flagStart, endSeconds: duration, note: 'Tone quality issue' });
-  }
-
-  const score = totalFrames > 0 ? clamp(Math.round((goodFrames / totalFrames) * 100)) : 65;
-  const occurrenceRate = totalFrames > 0 ? 1 - goodFrames / totalFrames : 0;
-  const events: TechniqueEvent[] = flagged.slice(0, 4).map((ts) => ({ type: 'scratchy_tone', startSeconds: ts.startSeconds, endSeconds: ts.endSeconds }));
-  const ratePct = Math.round(occurrenceRate * 100);
-  const observationSummary =
-    occurrenceRate < 0.1
-      ? 'Tone was full and resonant throughout.'
-      : ratePct >= 40
-      ? `Scratchy or thin tone in ${ratePct}% of the session.`
-      : `Some tone quality issues — ${ratePct}% of the session.`;
-  return { key: 'toneQuality', score, flaggedTimestamps: flagged.slice(0, 4), severity: severityFromScore(score), events, occurrenceRate, observationSummary };
-}
+// scoreIntonationStability now lives in ./pitchContour (pure, unit-testable).
+// estimateF0HPS / sumHarmonicPower now live in ./dsp.
+// scoreToneQuality now lives in ./toneAnalysis (multi-feature acoustic model).
 
 function scoreBowSmoothness(rms: Float32Array, hopSize: number, sampleRate: number): MetricScore {
   if (rms.length < 4) {
     return { key: 'bowSmoothness', score: 70, flaggedTimestamps: [], severity: severityFromScore(70), events: [], occurrenceRate: 0, observationSummary: 'Insufficient audio to assess bow smoothness.' };
   }
 
+  const hopS = hopSize / sampleRate;
+
+  // --- 1. Abrupt amplitude spike detection (bow bumps at reversals) ---
+  // Original logic: a sudden jump after a stable window = crunch.
+  // Lowered threshold slightly from 0.12 → 0.10 for better sensitivity.
   const flagged: FlaggedTimestamp[] = [];
   let abrupt = 0;
-
   for (let i = 2; i < rms.length; i++) {
     const change = Math.abs(rms[i] - rms[i - 1]);
-    if (change > 0.12 && Math.abs(rms[i - 1] - rms[i - 2]) <= 0.12) {
+    if (change > 0.10 && Math.abs(rms[i - 1] - rms[i - 2]) <= 0.10) {
       abrupt++;
-      const t = (i * hopSize) / sampleRate;
-      if (flagged.length < 5) {
-        flagged.push({ startSeconds: Math.max(0, t - 0.05), endSeconds: t + 0.1, note: 'Abrupt bow change' });
-      }
+      const t = i * hopS;
+      if (flagged.length < 5)
+        flagged.push({ startSeconds: Math.max(0, t - 0.05), endSeconds: t + 0.12, note: 'Abrupt bow change' });
     }
   }
 
-  const score = clamp(Math.round(100 - (abrupt / Math.max(rms.length, 1)) * 500));
+  // --- 2. Bow-arm tremor: amplitude oscillation at 2–6 Hz ---
+  // Bow arm tension manifests as rapid RMS fluctuation (not a single spike, but a sustained wobble).
+  // Measure local high-frequency variance of RMS relative to its slow mean.
+  // At 20ms hop, 2–6 Hz oscillation has period 3–8 frames — captured by a ±15-frame local window.
+  const TREMOR_WIN = 15; // ±15 frames = ±300ms slow envelope
+  let tremorEnergy = 0;
+  let playingFrames = 0;
+  for (let i = TREMOR_WIN; i < rms.length - TREMOR_WIN; i++) {
+    if (rms[i] < 0.02) continue; // skip silence
+    playingFrames++;
+    let localSum = 0;
+    for (let j = i - TREMOR_WIN; j <= i + TREMOR_WIN; j++) localSum += rms[j];
+    const localMean = localSum / (2 * TREMOR_WIN + 1);
+    tremorEnergy += (rms[i] - localMean) ** 2;
+  }
+  const avgTremorVar = playingFrames > 0 ? tremorEnergy / playingFrames : 0;
+  // Calibrated: avgTremorVar ~0.004 = perceptible bow arm tension; 0.008+ = clearly audible wobble
+  const tremorScore = clamp(Math.round((1 - Math.min(avgTremorVar / 0.005, 1)) * 100));
+  const hasTremor = avgTremorVar > 0.003;
+
+  // --- Combine: bump penalty (55%) + tremor score (45%) ---
+  const bumpScore = clamp(Math.round(100 - (abrupt / Math.max(rms.length, 1)) * 400));
+  const score = clamp(Math.round(0.55 * bumpScore + 0.45 * tremorScore));
   const occurrenceRate = Math.min(1, abrupt / Math.max(rms.length / 20, 1));
   const events: TechniqueEvent[] = flagged.map((ts) => ({ type: 'abrupt_bow_change', startSeconds: ts.startSeconds, endSeconds: ts.endSeconds }));
+
   const observationSummary =
-    abrupt === 0
-      ? 'Bow changes were smooth throughout.'
-      : abrupt === 1
-      ? '1 abrupt bow change detected.'
-      : `${abrupt} abrupt bow changes detected.`;
+    abrupt === 0 && !hasTremor
+      ? 'Bow strokes were smooth throughout.'
+      : hasTremor && abrupt === 0
+      ? 'Bow arm tension detected — volume wobbled slightly throughout. Focus on releasing shoulder and elbow tension.'
+      : abrupt > 0 && !hasTremor
+      ? `${abrupt} abrupt bow change${abrupt === 1 ? '' : 's'} — practice slow bow reversals at the frog and tip.`
+      : `${abrupt} abrupt bow change${abrupt === 1 ? '' : 's'} plus bow arm tension — work on relaxed, continuous bow strokes.`;
+
   return { key: 'bowSmoothness', score, flaggedTimestamps: flagged, severity: severityFromScore(score), events, occurrenceRate, observationSummary };
 }
 
-function scoreRhythmAccuracy(onsets: number[]): MetricScore {
-  if (onsets.length < 3) {
-    return { key: 'rhythmAccuracy', score: 65, flaggedTimestamps: [], severity: severityFromScore(65), events: [], occurrenceRate: 0, observationSummary: 'Too few notes detected to assess rhythm.' };
+function scoreRhythmAccuracy(onsets: number[]): { metric: MetricScore; analysis: RhythmAnalysis } {
+  const emptyAnalysis = (bpmEst = 0, isRubato = false, ioiCv?: number): RhythmAnalysis => ({
+    bpmEst, beatPeriodSeconds: bpmEst > 0 ? 60 / bpmEst : 0,
+    tendency: null, gridScore: 0, tempoDriftScore: 100,
+    rushCount: 0, dragCount: 0, onGridCount: 0, totalNotes: 0,
+    localBeatPeriods: [], localBeatTimestamps: [], flaggedRegions: [],
+    isRubato, ioiCv,
+  });
+
+  if (onsets.length < 6) {
+    return {
+      metric: { key: 'rhythmAccuracy', score: 65, flaggedTimestamps: [], severity: severityFromScore(65), events: [], occurrenceRate: 0, observationSummary: 'Too few distinct notes detected to assess tempo consistency.' },
+      analysis: emptyAnalysis(),
+    };
   }
 
   const iois: number[] = [];
   for (let i = 1; i < onsets.length; i++) iois.push(onsets[i] - onsets[i - 1]);
 
-  const mean = iois.reduce((a, b) => a + b, 0) / iois.length;
-  const variance = iois.reduce((acc, d) => acc + (d - mean) ** 2, 0) / iois.length;
-  const cv = Math.sqrt(variance) / (mean + 1e-10); // coefficient of variation; 0 = perfectly regular
-
-  const score = clamp(Math.round((1 - Math.min(cv, 1)) * 100));
-  const occurrenceRate = Math.min(1, cv);
-  const observationSummary =
-    cv < 0.15
-      ? 'Rhythm was steady throughout the session.'
-      : cv < 0.3
-      ? 'Some rhythmic inconsistency — note durations varied more than expected.'
-      : 'Rhythm was significantly unsteady — note durations varied widely.';
-  return { key: 'rhythmAccuracy', score, flaggedTimestamps: [], severity: severityFromScore(score), events: [], occurrenceRate, observationSummary };
-}
-
-function scoreDynamicControl(rms: Float32Array, hopSize: number, sampleRate: number): MetricScore {
-  if (rms.length < 10) {
-    return { key: 'dynamicControl', score: 70, flaggedTimestamps: [], severity: severityFromScore(70), events: [], occurrenceRate: 0, observationSummary: 'Insufficient audio to assess dynamics.' };
+  // Rubato/noise guard: compute CV on trimmed IOIs only.
+  // Raw CV over all IOIs is unreliable — phrase-end pauses (2–4× normal IOI) and
+  // any spurious short onsets inflate it far above 0.55 even for steady playing.
+  // Trim to IOIs within [median/3, median*4] before measuring variance.
+  const sortedIois = [...iois].sort((a, b) => a - b);
+  const ioiMedian = sortedIois[Math.floor(sortedIois.length / 2)];
+  const trimmedIois = iois.filter(v => v >= ioiMedian / 3 && v <= ioiMedian * 4);
+  const ioiMeanTrimmed = trimmedIois.length > 0
+    ? trimmedIois.reduce((a, b) => a + b, 0) / trimmedIois.length
+    : 0;
+  const ioiCv = trimmedIois.length > 1
+    ? Math.sqrt(trimmedIois.reduce((a, v) => a + (v - ioiMeanTrimmed) ** 2, 0) / trimmedIois.length) / (ioiMeanTrimmed + 1e-6)
+    : 0;
+  if (ioiCv > 0.70) {
+    return {
+      metric: { key: 'rhythmAccuracy', score: 65, flaggedTimestamps: [], severity: severityFromScore(65), events: [], occurrenceRate: 0,
+        observationSummary: 'Tempo varied significantly throughout — if you were playing expressively (ritardando, rubato), that explains the variation. This metric works best with steady, metronomic playing.' },
+      analysis: emptyAnalysis(0, true, ioiCv),
+    };
   }
 
-  // Low fast-fluctuation variance → good intentional dynamics
+  // --- 1. Extract dominant beat period via IOI histogram ---
+  // The old CV-of-all-IOIs approach penalizes intentional rhythmic variety (dotted rhythms,
+  // triplets, mixed values) because it assumes all notes should be equally spaced.
+  // A histogram approach finds the actual beat unit the student is using.
+  const BIN_MS    = 20;   // 20ms resolution
+  const MIN_MS    = 50;   // 50ms = 16th note at ~300 BPM (upper limit)
+  const MAX_MS    = 2000; // 2s = half note at 60 BPM (lower limit)
+  const NUM_BINS  = Math.ceil((MAX_MS - MIN_MS) / BIN_MS);
+  const histogram = new Float32Array(NUM_BINS);
+  for (const ioi of iois) {
+    const bin = Math.floor((ioi * 1000 - MIN_MS) / BIN_MS);
+    if (bin >= 0 && bin < NUM_BINS) histogram[bin]++;
+  }
+  // 3-bin Gaussian-ish smooth to remove aliasing
+  const smoothHist = new Float32Array(NUM_BINS);
+  for (let i = 0; i < NUM_BINS; i++) {
+    smoothHist[i] = (
+      (histogram[Math.max(0, i - 1)] * 0.25) +
+      (histogram[i] * 0.50) +
+      (histogram[Math.min(NUM_BINS - 1, i + 1)] * 0.25)
+    );
+  }
+  let peakBin = 0;
+  for (let i = 1; i < NUM_BINS; i++) if (smoothHist[i] > smoothHist[peakBin]) peakBin = i;
+  const beatPeriod = (peakBin * BIN_MS + MIN_MS) / 1000; // seconds
+  const bpmEst = Math.round(60 / beatPeriod);
+  if (bpmEst < 30 || bpmEst > 280) {
+    return {
+      metric: { key: 'rhythmAccuracy', score: 65, flaggedTimestamps: [], severity: severityFromScore(65), events: [], occurrenceRate: 0,
+        observationSummary: 'Could not identify a clear pulse — too few distinct note changes detected for tempo analysis.' },
+      analysis: emptyAnalysis(),
+    };
+  }
+
+  // --- 2. Grid alignment: each IOI should be near an integer multiple of the beat ---
+  // Tolerance = ±12% of beatPeriod × multiplier (looser for longer notes)
+  const GRID_TOLERANCE = 0.12;
+  let onGridCount = 0;
+  let rushCount = 0, dragCount = 0;
+  const rhythmFlagged: FlaggedTimestamp[] = [];
+  const flaggedRegions: RhythmFlaggedRegion[] = [];
+  for (let i = 0; i < iois.length; i++) {
+    const ioi = iois[i];
+    const ratio = ioi / beatPeriod;
+    const nearestInt = Math.max(1, Math.round(ratio));
+    const expected = nearestInt * beatPeriod;
+    const deviation = Math.abs(ioi - expected) / expected;
+    if (deviation <= GRID_TOLERANCE) {
+      onGridCount++;
+    } else {
+      const isRush = ioi < expected;
+      if (isRush) rushCount++; else dragCount++;
+      if (flaggedRegions.length < 6) {
+        const deviationPct = Math.round(deviation * 100);
+        const direction = isRush ? 'rushed' : 'dragged' as const;
+        const label = isRush ? `Rushed (${deviationPct}% short)` : `Dragged (${deviationPct}% long)`;
+        flaggedRegions.push({
+          startSeconds: onsets[i],
+          endSeconds: onsets[i + 1] ?? onsets[i] + ioi,
+          direction,
+          deviationPct,
+          label,
+        });
+        rhythmFlagged.push({
+          startSeconds: onsets[i],
+          endSeconds: onsets[i + 1] ?? onsets[i] + ioi,
+          note: label,
+        });
+      }
+    }
+  }
+  const gridScore = clamp(Math.round((onGridCount / iois.length) * 100));
+
+  // --- 3. Tempo consistency: does the beat drift over the session? ---
+  const WIN = Math.max(2, Math.min(5, Math.floor(iois.length / 3)));
+  const localBeatPeriods: number[] = [];
+  const localBeatTimestamps: number[] = [];
+  for (let i = WIN; i + WIN < iois.length; i++) {
+    let sum = 0;
+    for (let j = i - WIN; j <= i + WIN; j++) sum += iois[j];
+    localBeatPeriods.push(sum / (2 * WIN + 1));
+    localBeatTimestamps.push(onsets[i + 1]);
+  }
+  let tempoDriftScore = 100;
+  if (localBeatPeriods.length >= 3) {
+    const tmean = localBeatPeriods.reduce((a, b) => a + b, 0) / localBeatPeriods.length;
+    const tdrift = Math.sqrt(localBeatPeriods.reduce((acc, b) => acc + (b - tmean) ** 2, 0) / localBeatPeriods.length);
+    tempoDriftScore = clamp(Math.round((1 - Math.min(tdrift / beatPeriod / 0.15, 1)) * 100));
+  }
+
+  const score = clamp(Math.round(0.60 * gridScore + 0.40 * tempoDriftScore));
+  const occurrenceRate = 1 - onGridCount / iois.length;
+  const tendency = rushCount > dragCount * 1.5 ? 'rushing' : dragCount > rushCount * 1.5 ? 'dragging' : null;
+
+  const observationSummary =
+    score >= 85
+      ? `Tempo was steady throughout (~${bpmEst} BPM).`
+      : gridScore < 60 && tendency
+      ? `Tempo was unsteady — tendency toward ${tendency} at ~${bpmEst} BPM. Practice with a metronome and focus on even note durations.`
+      : gridScore < 60
+      ? `Tempo was unsteady — notes didn't align to a consistent pulse (~${bpmEst} BPM). Try practicing with a metronome.`
+      : tempoDriftScore < 60
+      ? `Tempo drifted noticeably over the session (~${bpmEst} BPM). Try locking to a metronome from start to finish.`
+      : tendency
+      ? `Some ${tendency} detected at ~${bpmEst} BPM — focus on counting subdivisions internally.`
+      : `Slight tempo unevenness at ~${bpmEst} BPM — keep working on consistent note durations.`;
+
+  return {
+    metric: { key: 'rhythmAccuracy', score, flaggedTimestamps: rhythmFlagged, severity: severityFromScore(score), events: [], occurrenceRate, observationSummary },
+    analysis: {
+      bpmEst,
+      beatPeriodSeconds: beatPeriod,
+      tendency,
+      gridScore,
+      tempoDriftScore,
+      rushCount,
+      dragCount,
+      onGridCount,
+      totalNotes: iois.length,
+      localBeatPeriods,
+      localBeatTimestamps,
+      flaggedRegions,
+      isRubato: false,
+      ioiCv,
+    },
+  };
+}
+
+function scoreDynamicControl(rms: Float32Array, hopSize: number, sampleRate: number, pitchFrames?: PitchFrame[]): MetricScore {
+  const hopS = hopSize / sampleRate;
+
+  const insufficient = (msg: string): MetricScore => ({
+    key: 'dynamicControl', score: 70, flaggedTimestamps: [], severity: severityFromScore(70),
+    events: [], occurrenceRate: 0, observationSummary: msg,
+  });
+  if (rms.length < 10) return insufficient('Insufficient audio to assess dynamics.');
+  const playing = Array.from(rms).filter(v => v > 0.015);
+  if (playing.length < 10) return insufficient('Insufficient non-silent audio to assess dynamics.');
+
+  // ─── 1. Bow jitter score (unchanged) ────────────────────────────────────
+  const globalMeanRms = playing.reduce((a, b) => a + b, 0) / playing.length;
   const hw = 10;
   let fastVar = 0;
   for (let i = 0; i < rms.length; i++) {
     let sum = 0, cnt = 0;
-    for (let j = Math.max(0, i - hw); j <= Math.min(rms.length - 1, i + hw); j++) {
-      sum += rms[j]; cnt++;
-    }
-    const d = rms[i] - sum / cnt;
-    fastVar += d * d;
+    for (let j = Math.max(0, i - hw); j <= Math.min(rms.length - 1, i + hw); j++) { sum += rms[j]; cnt++; }
+    fastVar += (rms[i] - sum / cnt) ** 2;
   }
   fastVar /= rms.length;
+  const jitterNorm = fastVar / (globalMeanRms * globalMeanRms * 0.15 + 1e-10);
+  const jitterScore = clamp(Math.round((1 - Math.min(jitterNorm, 1)) * 100));
 
-  const score = clamp(Math.round((1 - Math.min(fastVar * 80, 1)) * 100));
-  const occurrenceRate = Math.min(1, fastVar * 80);
-  const observationSummary =
-    score >= 75
-      ? 'Good dynamic variety — clear volume variation throughout.'
-      : score >= 55
-      ? 'Dynamics were somewhat limited — not much volume variation.'
-      : 'Dynamics were relatively flat throughout the session.';
-  return { key: 'dynamicControl', score, flaggedTimestamps: [], severity: severityFromScore(score), events: [], occurrenceRate, observationSummary };
+  // ─── 2. 250ms smoothed envelope ─────────────────────────────────────────
+  const SLOW_WIN = Math.max(1, Math.round(0.25 / hopS));
+  const slowRms = new Float32Array(rms.length);
+  for (let i = 0; i < rms.length; i++) {
+    let sum = 0, cnt = 0;
+    for (let j = Math.max(0, i - SLOW_WIN); j <= Math.min(rms.length - 1, i + SLOW_WIN); j++) { sum += rms[j]; cnt++; }
+    slowRms[i] = sum / cnt;
+  }
+  const slowPlaying = Array.from(slowRms).filter(v => v > 0.015);
+  const maxSlow = Math.max(...slowPlaying);
+  const minSlow = Math.min(...slowPlaying);
+  const dynamicRatio = maxSlow / Math.max(minSlow, 0.001);
+  const rangeScore = clamp(Math.round(((dynamicRatio - 1.3) / (4.0 - 1.3)) * 100));
+
+  // ─── 3. Phrase shape score (unchanged) ──────────────────────────────────
+  const WIN_FRAMES = Math.max(4, Math.round(2.0 / hopS));
+  let r2Sum = 0, r2Count = 0;
+  for (let i = 0; i + WIN_FRAMES < slowRms.length; i += Math.max(1, Math.floor(WIN_FRAMES / 2))) {
+    const windowActive = Array.from(slowRms).slice(i, i + WIN_FRAMES).filter(v => v > 0.015);
+    if (windowActive.length < WIN_FRAMES * 0.6) continue;
+    const n = WIN_FRAMES;
+    let sx = 0, sy = 0, sxy = 0, sx2 = 0;
+    for (let j = 0; j < n; j++) { sx += j; sy += slowRms[i + j]; sxy += j * slowRms[i + j]; sx2 += j * j; }
+    const denom = n * sx2 - sx * sx;
+    if (denom === 0) continue;
+    const slope = (n * sxy - sx * sy) / denom;
+    const intercept = (sy - slope * sx) / n;
+    let ssRes = 0, ssTot = 0;
+    const yMean = sy / n;
+    for (let j = 0; j < n; j++) {
+      ssRes += (slowRms[i + j] - (slope * j + intercept)) ** 2;
+      ssTot += (slowRms[i + j] - yMean) ** 2;
+    }
+    if (ssTot > 1e-10) { r2Sum += 1 - ssRes / ssTot; r2Count++; }
+  }
+  const shapeScore = clamp(Math.round((r2Count > 0 ? r2Sum / r2Count : 0.5) * 100));
+  const score = clamp(Math.round(0.30 * jitterScore + 0.35 * rangeScore + 0.35 * shapeScore));
+  const occurrenceRate = 1 - score / 100;
+
+  // ─── 4. Phrase segmentation (for event detection) ───────────────────────
+  // Tune these constants against real recordings — all keyed to hopS so they
+  // stay correct regardless of hop size.
+  const SILENCE_GATE   = 0.015;
+  const SILENCE_FRAMES = Math.max(10, Math.round(0.30 / hopS)); // 300ms gap = phrase break
+  const MIN_PH_FRAMES  = Math.max(30, Math.round(3.0  / hopS)); // skip phrases < 3s
+  const FLAT_CV2       = 0.004;  // stricter: only truly monotone phrases flagged
+  const INV_SLOPE_NORM = -0.20;  // normalized slope threshold for falling classification
+  const RISING_SLOPE   = 0.15;   // normalized slope threshold for rising classification
+  const PEAK_EARLY     = 0.15;   // tightened: sforzando-like attack (28% was too aggressive)
+  const PEAK_LATE      = 0.82;   // peak in last 18% with positive slope = late swell
+  const CONSEC_FALLING = 3;      // flag dyn_inverted only after this many consecutive falling phrases
+  const MAX_EVENTS     = 5;
+
+  const phrases: { start: number; end: number }[] = [];
+  let inPhrase = false, pStart = 0, silCnt = 0;
+  for (let i = 0; i <= rms.length; i++) {
+    const active = i < rms.length && rms[i] > SILENCE_GATE;
+    if (active) {
+      if (!inPhrase) { inPhrase = true; pStart = i; }
+      silCnt = 0;
+    } else if (inPhrase) {
+      silCnt++;
+      if (silCnt >= SILENCE_FRAMES || i === rms.length) {
+        const pEnd = i === rms.length ? i - 1 : i - silCnt;
+        if (pEnd - pStart >= MIN_PH_FRAMES) phrases.push({ start: pStart, end: pEnd });
+        inPhrase = false; silCnt = 0;
+      }
+    }
+  }
+
+  // ─── 5. Shape classifier ─────────────────────────────────────────────────
+  // Classifies each phrase into a musical shape before deciding whether to flag.
+  // Rising and falling are both valid choices — only truly shapeless or
+  // unexpectedly-shaped phrases get flagged.
+  function classifyPhraseShape(cv2: number, slopeNorm: number, peakPos: number): PhraseShape {
+    if (cv2 < FLAT_CV2) return 'plateau';
+    if (slopeNorm >= RISING_SLOPE && peakPos > 0.55) return 'rising';
+    if (slopeNorm <= INV_SLOPE_NORM && peakPos < 0.45) return 'falling';
+    if (peakPos >= 0.20 && peakPos <= 0.80) return 'arch';
+    return 'unclassified';
+  }
+
+  // Compute linear slope of pitch (cents) over a phrase for melodic contour correlation.
+  // Returns positive if pitch trends up, negative if pitch trends down, null if no data.
+  function phrasePitchSlope(startSec: number, endSec: number): number | null {
+    if (!pitchFrames) return null;
+    const frames = pitchFrames.filter(p => p.frequency !== null && p.timestamp >= startSec && p.timestamp <= endSec);
+    if (frames.length < 4) return null;
+    const cents = frames.map(p => 1200 * Math.log2(p.frequency! / 440));
+    const n = cents.length;
+    let sx = 0, sy = 0, sxy = 0, sx2 = 0;
+    for (let j = 0; j < n; j++) { sx += j; sy += cents[j]; sxy += j * cents[j]; sx2 += j * j; }
+    const den = n * sx2 - sx * sx;
+    return den !== 0 ? (n * sxy - sx * sy) / den : null;
+  }
+
+  // ─── 6. Issue detection ──────────────────────────────────────────────────
+  interface DynIssue { type: string; startSec: number; endSec: number; note: string; confidence: number; }
+  const issues: DynIssue[] = [];
+  const fmtT = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+
+  // Per-phrase debug rows — populated inside the phrase loop below
+  const phraseDebugRows: DynPhraseDebug[] = [];
+
+  // A3: Narrow dynamic range (objective — never suppressed)
+  if (dynamicRatio < 2.5) {
+    const conf = 1 - Math.max(0, dynamicRatio - 1.0) / (2.5 - 1.0);
+    const r = dynamicRatio.toFixed(1);
+    issues.push({
+      type: 'dyn_narrow_range', startSec: 0, endSec: rms.length * hopS, confidence: conf,
+      note: dynamicRatio < 2.0
+        ? `Dynamic range is very narrow (${r}× contrast) — try using a full, heavy bow for forte and a light touch for piano. Aim for 5× or more.`
+        : `Dynamic range is limited (${r}× contrast) — push the contrast between your softest and loudest moments.`,
+    });
+  }
+
+  // B-types: per-phrase shape analysis
+  const flatPhrases: { startSec: number; endSec: number }[] = [];
+  let consecutiveFalling = 0;
+  let fallingRunStart = -1;
+
+  for (const phrase of phrases) {
+    const arr = Array.from(slowRms).slice(phrase.start, phrase.end + 1);
+    const n = arr.length;
+    if (n < 4) continue;
+
+    const mean = arr.reduce((a, b) => a + b, 0) / n;
+    const variance = arr.reduce((a, v) => a + (v - mean) ** 2, 0) / n;
+    const cv2 = variance / (mean * mean + 1e-10);
+
+    const pMax = Math.max(...arr);
+    const pMin = Math.min(...arr);
+    const range = pMax - pMin;
+
+    let sx = 0, sy = 0, sxy = 0, sx2 = 0;
+    for (let j = 0; j < n; j++) { sx += j; sy += arr[j]; sxy += j * arr[j]; sx2 += j * j; }
+    const den = n * sx2 - sx * sx;
+    const rawSlope = den !== 0 ? (n * sxy - sx * sy) / den : 0;
+    const slopeNorm = rawSlope * n / (range + 1e-8);
+
+    let peakIdx = 0;
+    for (let j = 1; j < n; j++) { if (arr[j] > arr[peakIdx]) peakIdx = j; }
+    const peakPos = peakIdx / (n - 1);
+
+    const startSec = phrase.start * hopS;
+    const endSec   = phrase.end   * hopS;
+
+    // Classify shape, then apply melodic-contour correction
+    let shape = classifyPhraseShape(cv2, slopeNorm, peakPos);
+
+    // If both RMS and pitch trend in the same direction, it's melodic contour — no flag
+    const pitchSlope = phrasePitchSlope(startSec, endSec);
+    if (pitchSlope !== null && shape !== 'plateau') {
+      const rmsDir = rawSlope > 0 ? 1 : rawSlope < 0 ? -1 : 0;
+      const pitchDir = pitchSlope > 50 ? 1 : pitchSlope < -50 ? -1 : 0; // >50 cents/frame = clear trend
+      if (rmsDir !== 0 && rmsDir === pitchDir) shape = 'melodic_contour';
+    }
+
+    // Reset or advance the consecutive-falling counter
+    if (shape === 'falling') {
+      consecutiveFalling++;
+      if (consecutiveFalling === 1) fallingRunStart = startSec;
+    } else {
+      consecutiveFalling = 0;
+      fallingRunStart = -1;
+    }
+
+    // Issue rules by shape
+    if (shape === 'plateau') {
+      // Flat — flag it
+      phraseDebugRows.push({ startSec, endSec, durS: endSec - startSec, cv2, slopeNorm, peakPos, shape, issue: 'dyn_flat_phrase', confidence: 0.40 + 0.1 * flatPhrases.length });
+      flatPhrases.push({ startSec, endSec });
+
+    } else if (shape === 'falling') {
+      // Single falling phrase → valid diminuendo, no flag; 3+ in a row → flag the run
+      const debugIssue = consecutiveFalling >= CONSEC_FALLING ? 'dyn_inverted_phrase' : undefined;
+      phraseDebugRows.push({ startSec, endSec, durS: endSec - startSec, cv2, slopeNorm, peakPos, shape, issue: debugIssue });
+      if (consecutiveFalling === CONSEC_FALLING) {
+        const conf = Math.min(1, 0.50 + (consecutiveFalling - CONSEC_FALLING) * 0.15);
+        issues.push({
+          type: 'dyn_inverted_phrase',
+          startSec: fallingRunStart,
+          endSec,
+          confidence: conf,
+          note: `${consecutiveFalling} phrases in a row are fading out — at ${fmtT(fallingRunStart)}, try letting at least one phrase build or hold steady.`,
+        });
+      }
+
+    } else if (shape === 'rising' || shape === 'arch' || shape === 'melodic_contour') {
+      // All valid — never flag shape issues
+      phraseDebugRows.push({ startSec, endSec, durS: endSec - startSec, cv2, slopeNorm, peakPos, shape });
+
+    } else {
+      // unclassified — apply tightened peak thresholds
+      if (peakPos < PEAK_EARLY) {
+        const conf = Math.min(1, (PEAK_EARLY - peakPos) / PEAK_EARLY * 1.5);
+        if (conf >= 0.3) {
+          const peakSec = (phrase.start + peakIdx) * hopS;
+          phraseDebugRows.push({ startSec, endSec, durS: endSec - startSec, cv2, slopeNorm, peakPos, shape, issue: 'dyn_peak_early', confidence: conf });
+          issues.push({
+            type: 'dyn_peak_early', startSec, endSec, confidence: conf,
+            note: `At ${fmtT(startSec)}, you peaked at ${fmtT(peakSec)} — very early in the phrase. Save the climax for later.`,
+          });
+        } else {
+          phraseDebugRows.push({ startSec, endSec, durS: endSec - startSec, cv2, slopeNorm, peakPos, shape });
+        }
+      } else if (peakPos > PEAK_LATE && slopeNorm > 0.1) {
+        const conf = Math.min(1, (peakPos - PEAK_LATE) / (1 - PEAK_LATE) * 1.5);
+        if (conf >= 0.3) {
+          phraseDebugRows.push({ startSec, endSec, durS: endSec - startSec, cv2, slopeNorm, peakPos, shape, issue: 'dyn_peak_late', confidence: conf });
+          issues.push({
+            type: 'dyn_peak_late', startSec, endSec, confidence: conf,
+            note: `At ${fmtT(startSec)}, volume keeps building right to the end of the phrase at ${fmtT(endSec)} — try leveling off earlier.`,
+          });
+        } else {
+          phraseDebugRows.push({ startSec, endSec, durS: endSec - startSec, cv2, slopeNorm, peakPos, shape });
+        }
+      } else {
+        phraseDebugRows.push({ startSec, endSec, durS: endSec - startSec, cv2, slopeNorm, peakPos, shape });
+      }
+    }
+  }
+
+  // Aggregate flat phrases into events
+  if (flatPhrases.length >= 3) {
+    issues.push({
+      type: 'dyn_flat_phrases',
+      startSec: flatPhrases[0].startSec,
+      endSec:   flatPhrases[flatPhrases.length - 1].endSec,
+      confidence: Math.min(1, flatPhrases.length / 4),
+      note: `${flatPhrases.length} phrases in a row sound flat in volume — try adding shape to each phrase: build toward a peak or taper at the end.`,
+    });
+  } else {
+    for (const fp of flatPhrases) {
+      issues.push({
+        type: 'dyn_flat_phrase', startSec: fp.startSec, endSec: fp.endSec,
+        confidence: 0.40 + 0.1 * flatPhrases.length,
+        note: `The phrase at ${fmtT(fp.startSec)}–${fmtT(fp.endSec)} sounds flat in volume — add shape by building toward a peak or tapering at the end.`,
+      });
+    }
+  }
+
+  // D2: Session-wide volume fade (linear regression over phrase means)
+  if (phrases.length >= 4) {
+    const phraseMeans = phrases.map(p => {
+      const sl = Array.from(slowRms).slice(p.start, p.end + 1).filter(v => v > SILENCE_GATE);
+      return sl.length > 0 ? sl.reduce((a, b) => a + b, 0) / sl.length : 0;
+    });
+    const pn = phraseMeans.length;
+    let px = 0, py = 0, pxy = 0, px2 = 0;
+    for (let i = 0; i < pn; i++) { px += i; py += phraseMeans[i]; pxy += i * phraseMeans[i]; px2 += i * i; }
+    const pDen = pn * px2 - px * px;
+    if (pDen !== 0) {
+      const pSlope = (pn * pxy - px * py) / pDen;
+      const normSlope = pSlope / (py / pn + 1e-10);
+      if (normSlope < -0.04) {
+        issues.push({
+          type: 'dyn_fade_over_session', startSec: 0, endSec: rms.length * hopS,
+          confidence: Math.min(1, Math.abs(normSlope) / 0.08),
+          note: 'Your volume gradually fades over the session — stay physically engaged and keep bow arm energy in the second half.',
+        });
+      }
+    }
+  }
+
+  // ─── 6. Rank, filter, cap ────────────────────────────────────────────────
+  const allIssuesBeforeFilter = [...issues];
+  const ranked = issues
+    .filter(e => e.confidence >= 0.30)
+    .sort((a, b) => b.confidence - a.confidence)
+    .slice(0, MAX_EVENTS);
+
+  // ─── 7. Specific observationSummary from top issue ───────────────────────
+  const observationSummary = ranked.length > 0
+    ? ranked[0].note
+    : score >= 78
+      ? 'Good dynamic control — clear and deliberate volume shaping throughout.'
+      : jitterScore < 50
+        ? 'Bow arm tension is causing erratic volume — focus on a smooth, relaxed bow stroke.'
+        : 'Dynamics were relatively flat — work on deliberate phrase arcs (louder at the peak, softer at the end).';
+
+  // ─── 8. timeSeries: normalized slow envelope for waveform rendering ──────
+  const sessionMax = Math.max(...Array.from(rms));
+  const timeSeries = Array.from(slowRms).map((v, i) => ({
+    t: i * hopS,
+    v: Math.min(1, v / (sessionMax + 1e-10)),
+  }));
+
+  // ─── 9. Debug payload ────────────────────────────────────────────────────
+  const _dynDebug: DynDebugInfo = {
+    dynamicRatio, maxSlow, minSlow, jitterScore, rangeScore, shapeScore, score,
+    phrases: phraseDebugRows,
+    allIssues: allIssuesBeforeFilter.map(e => ({ type: e.type, startSec: e.startSec, endSec: e.endSec, confidence: e.confidence, note: e.note })),
+    ranked: ranked.map(e => ({ type: e.type, confidence: e.confidence })),
+  };
+
+  if (__DEV__) {
+    const fmtN = (n: number, d = 3) => n.toFixed(d);
+    console.log(
+      `\n[DYN DEBUG] ratio=${fmtN(dynamicRatio, 2)}× max=${fmtN(maxSlow)} min=${fmtN(minSlow)}` +
+      `  jitter=${jitterScore} range=${rangeScore} shape=${shapeScore} → score=${score}` +
+      `  thresholds: FLAT_CV2=${FLAT_CV2} INV_SLOPE=${INV_SLOPE_NORM} PEAK_E=${PEAK_EARLY} PEAK_L=${PEAK_LATE}\n` +
+      `  Phrases (${phraseDebugRows.length}):\n` +
+      phraseDebugRows.map((p, i) =>
+        `    #${i + 1}  ${fmtT(p.startSec)}–${fmtT(p.endSec)}  ${fmtN(p.durS, 1)}s` +
+        `  cv²=${fmtN(p.cv2)}  slope=${fmtN(p.slopeNorm)}  peak@${fmtN(p.peakPos)}  [${p.shape}]` +
+        (p.issue ? `  → ${p.issue} (conf=${fmtN(p.confidence ?? 0)})` : '  → ok')
+      ).join('\n') +
+      `\n  All issues (${allIssuesBeforeFilter.length}):\n` +
+      allIssuesBeforeFilter.map(e => `    ${e.type}  ${fmtT(e.startSec)}  conf=${fmtN(e.confidence)}`).join('\n') +
+      `\n  Ranked output (${ranked.length}): ${ranked.map(e => e.type).join(', ') || 'none'}\n`
+    );
+  }
+
+  return {
+    key: 'dynamicControl',
+    score,
+    flaggedTimestamps: ranked.map(e => ({ startSeconds: e.startSec, endSeconds: e.endSec, note: e.note })),
+    severity: severityFromScore(score),
+    events: ranked.map(e => ({ type: e.type, startSeconds: e.startSec, endSeconds: e.endSec })),
+    occurrenceRate,
+    observationSummary,
+    timeSeries,
+    _dynDebug,
+  };
 }
 
-function scoreVibrato(pitches: PitchFrame[]): MetricScore {
+/**
+ * Splits detected pitch frames into per-note segments using onset timestamps as boundaries.
+ * Each onset marks the start of a new note; frames before the first onset go into note 0.
+ * Falls back to the full detected array as one segment if no onsets are available.
+ */
+function segmentPitchesByOnsets(detected: PitchFrame[], onsets: number[]): PitchFrame[][] {
+  if (onsets.length === 0) return [detected];
+  const boundaries = [...onsets, Infinity];
+  const segments: PitchFrame[][] = [];
+  let seg: PitchFrame[] = [];
+  let bIdx = 0;
+  for (const frame of detected) {
+    while (bIdx < boundaries.length - 2 && frame.timestamp >= boundaries[bIdx + 1]) {
+      if (seg.length > 0) segments.push(seg);
+      seg = [];
+      bIdx++;
+    }
+    seg.push(frame);
+  }
+  if (seg.length > 0) segments.push(seg);
+  return segments;
+}
+
+// classifyVibratoSegment now lives in ./pitchContour (pure, unit-testable).
+
+function scoreVibrato(pitches: PitchFrame[], onsets?: number[]): { metric: MetricScore; analysis: VibratoAnalysis } {
   const detected = pitches.filter((p) => p.frequency !== null);
+  const audioDuration = detected.length > 0 ? detected[detected.length - 1].timestamp : 0;
+  const emptyAnalysis: VibratoAnalysis = { eligibleCount: 0, avgNoteScore: 0, notes: [] };
+
   if (detected.length < 20) {
-    return { key: 'vibrato', score: 50, flaggedTimestamps: [], severity: severityFromScore(50), events: [], occurrenceRate: 0.5, observationSummary: 'Insufficient sustained notes to assess vibrato.' };
+    return { metric: { key: 'vibrato', score: 50, flaggedTimestamps: [], severity: severityFromScore(50), events: [], occurrenceRate: 0.5, observationSummary: 'Insufficient sustained notes to assess vibrato.' }, analysis: emptyAnalysis };
   }
 
-  // Count zero-crossings in the pitch derivative — vibrato at ~5 Hz produces
-  // 2 * 5 * duration crossings; compare to actual crossings.
-  const diffs: number[] = [];
-  for (let i = 1; i < detected.length; i++) {
-    diffs.push(detected[i].frequency! - detected[i - 1].frequency!);
+  type SegWithBounds = { frames: PitchFrame[]; startS: number; endS: number };
+  let allSegs: SegWithBounds[];
+  if (onsets && onsets.length > 0) {
+    allSegs = onsets.map((startS, i) => {
+      const endS = onsets[i + 1] ?? audioDuration;
+      return { startS, endS, frames: detected.filter((f) => f.timestamp >= startS && f.timestamp < endS) };
+    });
+  } else {
+    const rawSegs: PitchFrame[][] = [];
+    let current: PitchFrame[] = [detected[0]];
+    for (let i = 1; i < detected.length; i++) {
+      const prev = detected[i - 1];
+      const curr = detected[i];
+      const centsDiff = Math.abs(1200 * Math.log2(curr.frequency! / prev.frequency!));
+      const timeDiff = curr.timestamp - prev.timestamp;
+      if (centsDiff > 100 || timeDiff > 0.2) { rawSegs.push(current); current = [curr]; }
+      else current.push(curr);
+    }
+    rawSegs.push(current);
+    allSegs = rawSegs.map((frames) => ({ frames, startS: frames[0].timestamp, endS: frames[frames.length - 1].timestamp }));
   }
 
-  let crossings = 0;
-  for (let i = 1; i < diffs.length; i++) {
-    if (diffs[i] * diffs[i - 1] < 0) crossings++;
+  const eligible = allSegs.filter((seg) => {
+    const dur = seg.endS - seg.startS;
+    return dur >= VIBRATO_MIN_SEGMENT_S && seg.frames.length >= VIBRATO_MIN_FRAMES;
+  });
+
+  if (eligible.length === 0) {
+    return { metric: { key: 'vibrato', score: 50, flaggedTimestamps: [], severity: severityFromScore(50), events: [], occurrenceRate: 0.5, observationSummary: 'No sustained notes long enough to detect vibrato.' }, analysis: emptyAnalysis };
   }
 
-  const duration = detected[detected.length - 1].timestamp - detected[0].timestamp;
-  const expected = 2 * 5 * duration;
-  const vibratoRatio = crossings / Math.max(expected, 1);
-  const score = clamp(Math.round(vibratoRatio * 80));
-  const occurrenceRate = Math.max(0, 1 - vibratoRatio);
+  const segResults = eligible.map((seg) => {
+    const freqs = seg.frames.map((f) => f.frequency!);
+    const sorted = [...freqs].sort((a, b) => a - b);
+    const medianFreq = sorted[Math.floor(sorted.length / 2)];
+    // Octave-correct each frame before computing cents deviation.
+    // YIN sometimes returns a frequency an octave too high or too low; without this,
+    // a single octave-flipped frame contributes ±1200¢ to the variance and destroys
+    // the depth and autocorrelation calculations.
+    const corrected = freqs.map((f) => {
+      const dist = Math.abs(1200 * Math.log2(f / medianFreq));
+      if (dist <= 600) return f;
+      const halfDist  = Math.abs(1200 * Math.log2((f / 2) / medianFreq));
+      const doubleDist = Math.abs(1200 * Math.log2((f * 2) / medianFreq));
+      if (halfDist < dist && halfDist <= doubleDist) return f / 2;
+      if (doubleDist < dist) return f * 2;
+      return f;
+    });
+    const devs = corrected.map((f) => 1200 * Math.log2(f / medianFreq));
+    return { seg, devs, result: classifyVibratoSegment(devs, 40) };
+  });
+
+  // Duration-weighted average so long sustained notes count more than brief ones
+  const totalDuration = segResults.reduce((a, r) => a + (r.seg.endS - r.seg.startS), 0);
+  const avgScore = clamp(Math.round(
+    segResults.reduce((a, r) => a + r.result.noteScore * (r.seg.endS - r.seg.startS), 0) / totalDuration,
+  ));
+
+  // Collect feedback ranked by how often each message appears across segments, cap at 3
+  const EXCLUDED_FEEDBACK = new Set(['no vibrato detected', 'vibrato rhythm is too uneven to measure — try for a steadier wrist motion']);
+  const feedbackCounts = new Map<string, number>();
+  for (const r of segResults) {
+    for (const msg of r.result.feedbackNotes) {
+      if (!EXCLUDED_FEEDBACK.has(msg)) feedbackCounts.set(msg, (feedbackCounts.get(msg) ?? 0) + 1);
+    }
+  }
+  const uniqueFeedback = [...feedbackCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([msg]) => msg);
+
+  const occurrenceRate = Math.max(0, 1 - avgScore / 100);
   const observationSummary =
-    vibratoRatio >= 0.6
-      ? 'Vibrato was present and consistent.'
-      : vibratoRatio >= 0.25
-      ? 'Vibrato was present but inconsistent.'
-      : 'Vibrato was mostly absent during the session.';
-  return { key: 'vibrato', score, flaggedTimestamps: [], severity: severityFromScore(score), events: [], occurrenceRate, observationSummary };
+    avgScore >= 70 ? 'Vibrato is well-controlled and musical.' :
+    avgScore >= 45 ? `Vibrato is present with some areas to refine. ${uniqueFeedback[0] ?? ''}` :
+    avgScore >= 20 ? `Vibrato is inconsistent — keep working on evenness and depth. ${uniqueFeedback.slice(0, 2).join(' ')}` :
+    'Vibrato mostly absent — try introducing a regular wrist motion.';
+
+  const vibratoNotes: VibratoNoteResult[] = segResults.map(({ seg, devs, result }) => ({
+    startS: Math.round(seg.startS * 100) / 100,
+    endS: Math.round(seg.endS * 100) / 100,
+    durationS: Math.round((seg.endS - seg.startS) * 100) / 100,
+    noteScore: result.noteScore,
+    rateHz: Math.round(result.rate * 10) / 10,
+    depthCents: Math.round(result.depth * 10) / 10,
+    periodicityScore: Math.round(result.periodicityScore * 100) / 100,
+    consistencyOk: result.consistencyOk,
+    feedbackNotes: result.feedbackNotes,
+    cents: devs.map((c) => Math.round(c * 10) / 10),
+  }));
+
+  return {
+    metric: { key: 'vibrato', score: avgScore, flaggedTimestamps: [], severity: severityFromScore(avgScore), events: [], occurrenceRate, observationSummary },
+    analysis: { eligibleCount: eligible.length, avgNoteScore: avgScore, notes: vibratoNotes },
+  };
 }
 
 // ─────────────────────────────────────────────────────────────
-// Raw signal extraction for note fusion
+// Raw signal extraction for note fusion and timbre analysis
 // ─────────────────────────────────────────────────────────────
 
-// Returns per-frame FFT fundamental ratio — same window as scoreToneQuality
-// but as a time-series for noteFusion.ts to consume per note.
-function computeToneFrames(
+// Per-frame tone quality + timbre proxies in a single FFT pass.
+// 2048-pt Hann-windowed FFT, 50ms hop — matches scoreToneQuality hop.
+function computeTimbreFrames(
   samples: Float32Array,
   sampleRate: number,
-): { fundamentalRatio: number; timestamp: number }[] {
+): { fundamentalRatio: number; spectralCentroid: number; brightness: number; timestamp: number }[] {
   const fftSize = 2048;
   const hopSize = Math.round(sampleRate * 0.05); // 50ms
-  const frames: { fundamentalRatio: number; timestamp: number }[] = [];
+  const binHz = sampleRate / fftSize;
+  const cutoffBin = Math.floor(3000 / binHz); // brightness: energy above 3 kHz
+  const frames: { fundamentalRatio: number; spectralCentroid: number; brightness: number; timestamp: number }[] = [];
 
   for (let offset = 0; offset + fftSize < samples.length; offset += hopSize) {
     const mag = magnitudeSpectrum(samples, offset, fftSize);
-    let maxMag = 0, maxBin = 1, totalPow = 0;
+    let maxMag = 0, maxBin = 1, totalPow = 0, weightedSum = 0, highPow = 0;
     for (let i = 1; i < mag.length; i++) {
       const m2 = mag[i] * mag[i];
       totalPow += m2;
+      weightedSum += (i * binHz) * m2;
+      if (i >= cutoffBin) highPow += m2;
       if (mag[i] > maxMag) { maxMag = mag[i]; maxBin = i; }
     }
-    const fundamentalRatio = maxMag < 0.002
-      ? 0
-      : (mag[maxBin] * mag[maxBin]) / (totalPow + 1e-10);
-    frames.push({ fundamentalRatio, timestamp: offset / sampleRate });
+    const isSilent = maxMag < 0.002;
+    frames.push({
+      fundamentalRatio:  isSilent ? 0 : (mag[maxBin] * mag[maxBin]) / (totalPow + 1e-10),
+      spectralCentroid:  isSilent || totalPow < 1e-10 ? 0 : weightedSum / totalPow,
+      brightness:        isSilent || totalPow < 1e-10 ? 0 : highPow / totalPow,
+      timestamp: offset / sampleRate,
+    });
   }
   return frames;
 }
@@ -562,9 +1157,26 @@ export interface AudioDebugInfo {
     abruptRatio: number;
     changeThreshold: number;
   };
-  rhythmAccuracy: { onsetCount: number; meanIoi: number; cvIoi: number };
+  rhythmAccuracy: { onsetCount: number; meanIoi: number; cvIoi: number; fluxOnsets: number; pitchOnsets: number };
   dynamicControl: { fastVar: number };
-  vibrato: { zeroCrossings: number; expectedCrossings: number; vibratoRatio: number };
+  vibrato: {
+    eligibleSegments: number;
+    avgNoteScore: number;
+    notes: Array<{
+      startS: number;
+      endS: number;
+      durationS: number;
+      pitchFrameCount: number;
+      eligible: boolean;
+      rateHz: number;
+      depthCents: number;
+      periodicityScore: number;
+      consistencyOk: boolean;
+      feedbackNotes: string[];
+      noteScore: number;
+      cents: number[];
+    }>;
+  };
 }
 
 async function analyzeWavFileWithDebug(
@@ -585,16 +1197,19 @@ async function analyzeWavFileWithDebug(
   const rmsHop = Math.round(sampleRate * 0.02);
   const rmsWin = Math.round(sampleRate * 0.05);
   const rms = computeRmsEnvelope(samples, rmsWin, rmsHop);
-  const onsets = detectOnsets(rms, rmsHop, sampleRate);
+  const fluxOnsets  = computeSpectralFluxOnsets(samples, sampleRate);
+  const pitchOnsets = detectPitchChangeOnsets(pitches);
+  const onsets      = collapseAdjacentSameNoteOnsets(mergeOnsets(fluxOnsets, pitchOnsets), pitches, duration);
 
+  const { metric: vibratoMetric } = scoreVibrato(pitches, onsets);
   const scores = [
     scorePitchAccuracy(pitches, duration),
-    scoreIntonationStability(pitches),
-    scoreToneQuality(samples, sampleRate, duration),
+    scoreIntonationStability(pitches).metric,
+    scoreToneQuality(samples, sampleRate, duration, pitches),
     scoreBowSmoothness(rms, rmsHop, sampleRate),
-    scoreRhythmAccuracy(onsets),
-    scoreDynamicControl(rms, rmsHop, sampleRate),
-    scoreVibrato(pitches),
+    scoreRhythmAccuracy(onsets).metric,
+    scoreDynamicControl(rms, rmsHop, sampleRate, pitches),
+    vibratoMetric,
   ];
 
   // Pitch
@@ -608,32 +1223,34 @@ async function analyzeWavFileWithDebug(
     if (cents <= IN_TUNE_CENTS) inTuneCount++;
   }
 
-  // Intonation stability
-  let stdCents = 0;
-  if (detected.length >= 3) {
-    const devs = detected.map((p) => centsFromNearestNote(p.frequency!));
-    const mean = devs.reduce((a, b) => a + b, 0) / devs.length;
-    const variance = devs.reduce((acc, d) => acc + (d - mean) ** 2, 0) / devs.length;
-    stdCents = Math.sqrt(variance);
-  }
+  // Intonation stability — reuse the single source of truth (vibrato-aware, legato-aware).
+  const stabilityStats = computeIntonationStability(pitches);
+  const stdCents =
+    stabilityStats.mode === 'per-note' ? stabilityStats.avgStd :
+    stabilityStats.mode === 'short'    ? stabilityStats.stdCents : 0;
 
-  // Tone quality
+  // Tone quality debug — mirrors HNR approach used in scoreToneQuality
   const fftSize = 2048;
-  const tqHop = Math.round(sampleRate * 0.1);
+  const tqHop = Math.round(sampleRate * 0.05); // 50ms, matches scoreToneQuality
   let tqGood = 0, tqTotal = 0, tqSilent = 0, tqSumRatio = 0;
   for (let offset = 0; offset + fftSize < samples.length; offset += tqHop) {
     const mag = magnitudeSpectrum(samples, offset, fftSize);
-    let maxMag = 0, maxBin = 1, totalPow = 0;
+    let maxMag = 0, totalPow = 0;
     for (let i = 1; i < mag.length; i++) {
       const m2 = mag[i] * mag[i];
       totalPow += m2;
-      if (mag[i] > maxMag) { maxMag = mag[i]; maxBin = i; }
+      if (mag[i] > maxMag) maxMag = mag[i];
     }
     tqTotal++;
     if (maxMag < 0.002) { tqSilent++; continue; }
-    const ratio = (mag[maxBin] * mag[maxBin]) / (totalPow + 1e-10);
-    tqSumRatio += ratio;
-    if (ratio > 0.08 && ratio < 0.95) tqGood++;
+    const f0 = estimateF0HPS(mag, sampleRate, fftSize);
+    let hnrRatio = 0;
+    if (f0 !== null) {
+      const { harmonicPow } = sumHarmonicPower(mag, f0, sampleRate, fftSize, 12, 2);
+      hnrRatio = harmonicPow / (totalPow + 1e-10);
+    }
+    tqSumRatio += hnrRatio;
+    if (hnrRatio >= 0.45) tqGood++;
   }
   const tqNonSilent = tqTotal - tqSilent;
 
@@ -663,14 +1280,63 @@ async function analyzeWavFileWithDebug(
   }
   fastVar /= rms.length;
 
-  // Vibrato
-  let zeroCrossings = 0, expectedCrossings = 0;
-  if (detected.length >= 20) {
-    const diffs = detected.slice(1).map((f, i) => f.frequency! - detected[i].frequency!);
-    for (let i = 1; i < diffs.length; i++) {
-      if (diffs[i] * diffs[i - 1] < 0) zeroCrossings++;
+  // Vibrato — all onset-bounded note windows, including short ones
+  let debugEligibleSegments = 0, debugAvgNoteScore = 0;
+  const debugNotes: AudioDebugInfo['vibrato']['notes'] = [];
+  if (detected.length >= 20 && onsets.length > 0) {
+    const eligibleScores: number[] = [];
+    for (let ni = 0; ni < onsets.length; ni++) {
+      const startS = onsets[ni];
+      const endS = onsets[ni + 1] ?? duration;
+      const noteDur = endS - startS;
+      const noteFrames = detected.filter((f) => f.timestamp >= startS && f.timestamp < endS);
+      const pitchFrameCount = noteFrames.length;
+      const eligible = noteDur >= VIBRATO_MIN_SEGMENT_S && pitchFrameCount >= VIBRATO_MIN_FRAMES;
+      if (!eligible) {
+        debugNotes.push({
+          startS: Math.round(startS * 100) / 100,
+          endS: Math.round(endS * 100) / 100,
+          durationS: Math.round(noteDur * 100) / 100,
+          pitchFrameCount,
+          eligible: false,
+          rateHz: 0, depthCents: 0, periodicityScore: 0,
+          consistencyOk: true, feedbackNotes: [], noteScore: 0,
+          cents: [],
+        });
+        continue;
+      }
+      debugEligibleSegments++;
+      const freqs = noteFrames.map((f) => f.frequency!);
+      const sorted = [...freqs].sort((a, b) => a - b);
+      const medianFreq = sorted[Math.floor(sorted.length / 2)];
+      const corrected = freqs.map((f) => {
+        const dist = Math.abs(1200 * Math.log2(f / medianFreq));
+        if (dist <= 600) return f;
+        const halfDist   = Math.abs(1200 * Math.log2((f / 2) / medianFreq));
+        const doubleDist = Math.abs(1200 * Math.log2((f * 2) / medianFreq));
+        if (halfDist < dist && halfDist <= doubleDist) return f / 2;
+        if (doubleDist < dist) return f * 2;
+        return f;
+      });
+      const devs = corrected.map((f) => 1200 * Math.log2(f / medianFreq));
+      const result = classifyVibratoSegment(devs, 40);
+      eligibleScores.push(result.noteScore);
+      debugNotes.push({
+        startS: Math.round(startS * 100) / 100,
+        endS: Math.round(endS * 100) / 100,
+        durationS: Math.round(noteDur * 100) / 100,
+        pitchFrameCount,
+        eligible: true,
+        rateHz: Math.round(result.rate * 10) / 10,
+        depthCents: Math.round(result.depth * 10) / 10,
+        periodicityScore: Math.round(result.periodicityScore * 100) / 100,
+        consistencyOk: result.consistencyOk,
+        feedbackNotes: result.feedbackNotes,
+        noteScore: result.noteScore,
+        cents: devs.map((c) => Math.round(c * 10) / 10),
+      });
     }
-    expectedCrossings = Math.round(2 * 5 * (detected[detected.length - 1].timestamp - detected[0].timestamp));
+    debugAvgNoteScore = eligibleScores.length > 0 ? Math.round(eligibleScores.reduce((a, b) => a + b, 0) / eligibleScores.length) : 0;
   }
 
   const debug: AudioDebugInfo = {
@@ -685,11 +1351,11 @@ async function analyzeWavFileWithDebug(
     },
     intonationStability: { stdCents },
     toneQuality: {
-      avgFundamentalRatio: tqNonSilent > 0 ? tqSumRatio / tqNonSilent : 0,
+      avgFundamentalRatio: tqNonSilent > 0 ? tqSumRatio / tqNonSilent : 0, // now = avg HNR ratio
       goodFrameRatio: tqTotal > 0 ? tqGood / tqTotal : 0,
       silentFrameCount: tqSilent,
-      lowerBound: 0.08,
-      upperBound: 0.95,
+      lowerBound: 0.20, // HNR_SCORE_FLOOR — maps to score 0
+      upperBound: 0.60, // HNR_SCORE_CEIL  — maps to score 100
     },
     bowSmoothness: {
       abruptChangeCount: abrupt,
@@ -697,9 +1363,9 @@ async function analyzeWavFileWithDebug(
       abruptRatio: rms.length > 0 ? abrupt / rms.length : 0,
       changeThreshold: 0.12,
     },
-    rhythmAccuracy: { onsetCount: onsets.length, meanIoi, cvIoi },
+    rhythmAccuracy: { onsetCount: onsets.length, meanIoi, cvIoi, fluxOnsets: fluxOnsets.length, pitchOnsets: pitchOnsets.length },
     dynamicControl: { fastVar },
-    vibrato: { zeroCrossings, expectedCrossings, vibratoRatio: expectedCrossings > 0 ? zeroCrossings / expectedCrossings : 0 },
+    vibrato: { eligibleSegments: debugEligibleSegments, avgNoteScore: debugAvgNoteScore, notes: debugNotes },
   };
 
   const intonationAnalysis = analyzeIntonation(pitches);
@@ -828,18 +1494,23 @@ export async function analyzeWavFile(
   const rmsHop = Math.round(sampleRate * 0.02); // 20ms
   const rmsWin = Math.round(sampleRate * 0.05); // 50ms
   const rms = computeRmsEnvelope(samples, rmsWin, rmsHop);
-  const onsets = detectOnsets(rms, rmsHop, sampleRate);
+  const fluxOnsets  = computeSpectralFluxOnsets(samples, sampleRate);
+  const pitchOnsets = detectPitchChangeOnsets(pitches);
+  const onsets      = collapseAdjacentSameNoteOnsets(mergeOnsets(fluxOnsets, pitchOnsets), pitches, duration);
 
-  const toneFrames = computeToneFrames(samples, sampleRate);
+  const timbreFrames = computeTimbreFrames(samples, sampleRate);
 
+  const { metric: vibratoMetric, analysis: vibratoAnalysis } = scoreVibrato(pitches, onsets);
+  const { metric: intonationStabilityMetric, analysis: intonationStabilityAnalysis } = scoreIntonationStability(pitches);
+  const { metric: rhythmMetric, analysis: rhythmAnalysis } = scoreRhythmAccuracy(onsets);
   const metrics = [
     scorePitchAccuracy(pitches, duration),
-    scoreIntonationStability(pitches),
-    scoreToneQuality(samples, sampleRate, duration),
+    intonationStabilityMetric,
+    scoreToneQuality(samples, sampleRate, duration, pitches),
     scoreBowSmoothness(rms, rmsHop, sampleRate),
-    scoreRhythmAccuracy(onsets),
-    scoreDynamicControl(rms, rmsHop, sampleRate),
-    scoreVibrato(pitches),
+    rhythmMetric,
+    scoreDynamicControl(rms, rmsHop, sampleRate, pitches),
+    vibratoMetric,
   ];
 
   const intonationAnalysis = analyzeIntonation(pitches);
@@ -847,11 +1518,36 @@ export async function analyzeWavFile(
   const rawSignals: RawAudioSignals = {
     pitchFrames: pitches,
     rmsFrames: Array.from(rms).map((value, i) => ({ value, timestamp: (i * rmsHop) / sampleRate })),
-    toneFrames,
+    toneFrames:             timbreFrames.map(({ fundamentalRatio, timestamp }) => ({ fundamentalRatio, timestamp })),
+    spectralCentroidFrames: timbreFrames.map(({ spectralCentroid, timestamp }) => ({ value: spectralCentroid, timestamp })),
+    brightnessFrames:       timbreFrames.map(({ brightness, timestamp })       => ({ value: brightness, timestamp })),
     onsetTimestamps: onsets,
     sampleRate,
     duration,
   };
 
-  return { metrics, intonationAnalysis, rawSignals };
+  return { metrics, intonationAnalysis, intonationStabilityAnalysis, vibratoAnalysis, rhythmAnalysis, rawSignals };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Real-time vibrato score from base64 WAV (for live monitoring)
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Decode a base64 PCM16 WAV string (from the native ring buffer) and return
+ * a vibrato MetricScore. Synchronous — runs on the JS thread.
+ * Returns null when the WAV is malformed or has too little data.
+ */
+export function scoreVibratoFromBase64(b64: string): MetricScore | null {
+  try {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const wav = parseWav(bytes);
+    if (!wav) return null;
+    const pitches = detectPitches(wav.samples, wav.sampleRate);
+    return scoreVibrato(pitches).metric;
+  } catch {
+    return null;
+  }
 }

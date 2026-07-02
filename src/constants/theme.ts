@@ -1,15 +1,15 @@
 export const colors = {
   brand: {
-    50:  '#f0e9ff',
-    100: '#ddd0ff',
-    200: '#c4a8ff',
-    300: '#a87aff',
-    400: '#8b4fff',
-    500: '#6c28e8',
-    600: '#5518c8',
-    700: '#420ea3',
-    800: '#310a7d',
-    900: '#1a0a2e',
+    50:  '#f0f9ff',
+    100: '#e0f2fe',
+    200: '#bae6fd',
+    300: '#7dd3fc',
+    400: '#38bdf8',
+    500: '#0ea5e9',
+    600: '#0284c7',
+    700: '#0369a1',
+    800: '#075985',
+    900: '#0c4a6e',
   },
   score: {
     excellent: '#22c55e',
@@ -18,7 +18,7 @@ export const colors = {
     critical: '#ef4444',
   },
   surface: '#ffffff',
-  background: '#f8f7ff',
+  background: '#f9fafb',
   muted: '#6b7280',
   text: {
     primary: '#111827',
@@ -37,9 +37,9 @@ export const spacing = {
 };
 
 export const radius = {
-  sm: 8,
-  md: 12,
-  lg: 16,
-  xl: 24,
+  sm: 4,
+  md: 8,
+  lg: 10,
+  xl: 14,
   full: 9999,
 };

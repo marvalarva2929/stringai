@@ -31,16 +31,19 @@ function ScoreBar({ score }: { score: number }) {
     : score >= 50 ? colors.score.needs_attention
     : colors.score.critical;
   return (
-    <View style={bar.track}>
-      <View style={[bar.fill, { width: `${score}%` as any, backgroundColor: color }]} />
+    <View style={bar.row}>
+      <View style={bar.track}>
+        <View style={[bar.fill, { width: `${score}%` as any, backgroundColor: color }]} />
+      </View>
       <Text style={[bar.label, { color }]}>{score}</Text>
     </View>
   );
 }
 const bar = StyleSheet.create({
-  track: { height: 6, backgroundColor: '#e5e7eb', borderRadius: 3, overflow: 'hidden', flex: 1, position: 'relative' },
+  row: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  track: { flex: 1, height: 6, backgroundColor: '#e5e7eb', borderRadius: 3, overflow: 'hidden' },
   fill: { position: 'absolute', top: 0, left: 0, bottom: 0, borderRadius: 3 },
-  label: { position: 'absolute', right: 0, top: -10, fontSize: 11, fontWeight: '700' },
+  label: { width: 28, textAlign: 'right', fontSize: 11, fontWeight: '700' },
 });
 
 // ── Exercise card ─────────────────────────────────────────────────────────────

@@ -8,12 +8,14 @@ import {
   Pressable,
 } from 'react-native';
 import { router } from 'expo-router';
-import { LinearGradient } from 'expo-linear-gradient';
+import { Ionicons } from '@expo/vector-icons';
 import { useAnalysisStore } from '../../src/store/useAnalysisStore';
+import { haptic } from '../../src/lib/haptics';
 import { Card } from '../../src/components/ui/Card';
 import { ScoreGauge } from '../../src/components/ui/ScoreGauge';
 import { colors, spacing, radius } from '../../src/constants/theme';
 import { severityFromScore, SessionSummary } from '../../src/types/analysis';
+import { scoreColor } from '../../src/lib/scoreColor';
 
 type ProgressView = 'by_song' | 'all_sessions';
 
@@ -30,32 +32,20 @@ interface PieceGroup {
   latestDate: string;
 }
 
-function Sparkline({ scores }: { scores: number[] }) {
-  if (scores.length < 2) return null;
+function ScoreDots({ scores }: { scores: number[] }) {
+  const recent = scores.slice(-6);
   return (
-    <View style={spark.row}>
-      {scores.map((score, i) => (
-        <View
-          key={i}
-          style={[
-            spark.bar,
-            {
-              height: Math.max(3, Math.round((score / 100) * 28)),
-              backgroundColor:
-                score >= 70 ? colors.score.excellent :
-                score >= 50 ? '#f59e0b' :
-                colors.score.critical,
-            },
-          ]}
-        />
+    <View style={dot.row}>
+      {recent.map((s, i) => (
+        <View key={i} style={[dot.circle, { backgroundColor: scoreColor(s) }]} />
       ))}
     </View>
   );
 }
 
-const spark = StyleSheet.create({
-  row: { flexDirection: 'row', alignItems: 'flex-end', height: 28, gap: 3 },
-  bar: { width: 7, borderRadius: 2 },
+const dot = StyleSheet.create({
+  row:    { flexDirection: 'row', alignItems: 'center', gap: 5 },
+  circle: { width: 8, height: 8, borderRadius: 4 },
 });
 
 export default function ProgressScreen() {
@@ -107,40 +97,42 @@ export default function ProgressScreen() {
 
   return (
     <SafeAreaView style={styles.safe}>
-      <LinearGradient colors={[colors.brand[900], colors.brand[800]]} style={styles.header}>
+      <View style={styles.header}>
         <Text style={styles.title}>Progress</Text>
         <Text style={styles.subtitle}>
           {hasData
             ? `${sessionHistory.length} session${sessionHistory.length === 1 ? '' : 's'} · ${namedGroups.length} piece${namedGroups.length === 1 ? '' : 's'}`
             : 'Record your first session to start tracking'}
         </Text>
-      </LinearGradient>
+      </View>
 
-      {/* View toggle */}
-      <View style={styles.toggleRow}>
-        <Pressable
-          style={[styles.toggleChip, view === 'by_song' && styles.toggleChipActive]}
-          onPress={() => setView('by_song')}
-        >
-          <Text style={[styles.toggleText, view === 'by_song' && styles.toggleTextActive]}>
-            By Song
-          </Text>
-        </Pressable>
-        <Pressable
-          style={[styles.toggleChip, view === 'all_sessions' && styles.toggleChipActive]}
-          onPress={() => setView('all_sessions')}
-        >
-          <Text style={[styles.toggleText, view === 'all_sessions' && styles.toggleTextActive]}>
-            All Sessions
-          </Text>
-        </Pressable>
+      {/* View toggle — styled as iOS segmented control */}
+      <View style={styles.toggleContainer}>
+        <View style={styles.toggleTrack}>
+          <Pressable
+            style={[styles.toggleChip, view === 'by_song' && styles.toggleChipActive]}
+            onPress={() => setView('by_song')}
+          >
+            <Text style={[styles.toggleText, view === 'by_song' && styles.toggleTextActive]}>
+              By Song
+            </Text>
+          </Pressable>
+          <Pressable
+            style={[styles.toggleChip, view === 'all_sessions' && styles.toggleChipActive]}
+            onPress={() => setView('all_sessions')}
+          >
+            <Text style={[styles.toggleText, view === 'all_sessions' && styles.toggleTextActive]}>
+              All Sessions
+            </Text>
+          </Pressable>
+        </View>
       </View>
 
       <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
 
         {/* Practice plan entry point */}
         <Pressable style={styles.practiceCard} onPress={() => router.push('/tips')}>
-          <Text style={styles.practiceCardIcon}>📋</Text>
+          <Ionicons name="list" size={24} color={colors.brand[600]} />
           <View style={styles.practiceCardText}>
             <Text style={styles.practiceCardTitle}>Practice Plan</Text>
             <Text style={styles.practiceCardSub}>Personalized exercises based on your sessions</Text>
@@ -229,7 +221,7 @@ function PieceGroupCard({
 
   return (
     <Pressable
-      style={styles.groupCard}
+      style={({ pressed }) => [styles.groupCard, { opacity: pressed ? 0.85 : 1 }]}
       onPress={onPress}
     >
       <View style={styles.groupTop}>
@@ -245,7 +237,7 @@ function PieceGroupCard({
       </View>
 
       <View style={styles.groupBottom}>
-        <Sparkline scores={group.scoreHistory} />
+        <ScoreDots scores={group.scoreHistory} />
         <View style={styles.groupStats}>
           <Text style={styles.groupBest}>Best {group.bestScore}</Text>
           {group.improvement !== null && (
@@ -264,7 +256,7 @@ function PieceGroupCard({
 
 function SessionRow({ session, onPress }: { session: SessionSummary; onPress?: () => void }) {
   return (
-    <Pressable onPress={onPress} style={({ pressed }) => [{ opacity: pressed ? 0.75 : 1 }]}>
+    <Pressable onPress={() => { haptic.light(); onPress?.(); }} style={({ pressed }) => [{ opacity: pressed ? 0.75 : 1 }]}>
       <Card style={styles.sessionCard}>
         <View style={styles.sessionRow}>
           <ScoreGauge
@@ -304,7 +296,7 @@ function SessionRow({ session, onPress }: { session: SessionSummary; onPress?: (
 function EmptyState() {
   return (
     <View style={styles.emptyState}>
-      <Text style={styles.emptyEmoji}>🎻</Text>
+      <Ionicons name="musical-notes-outline" size={64} color={colors.brand[300]} />
       <Text style={styles.emptyTitle}>No sessions yet</Text>
       <Text style={styles.emptyBody}>
         Head to the Analyze tab and record your first session.
@@ -317,29 +309,45 @@ function EmptyState() {
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.background },
-  header: { paddingTop: 20, paddingBottom: spacing.xl, paddingHorizontal: spacing.xl },
-  title: { fontSize: 24, fontWeight: '700', color: '#fff' },
-  subtitle: { fontSize: 13, color: 'rgba(255,255,255,0.65)', marginTop: 4 },
+  header: {
+    paddingTop: 20, paddingBottom: spacing.xl, paddingHorizontal: spacing.xl,
+    backgroundColor: colors.surface,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#e5e7eb',
+  },
+  title: { fontSize: 24, fontWeight: '700', color: colors.text.primary },
+  subtitle: { fontSize: 13, color: colors.text.muted, marginTop: 4 },
 
-  toggleRow: {
-    flexDirection: 'row',
-    gap: spacing.sm,
+  toggleContainer: {
     paddingHorizontal: spacing.lg,
     paddingVertical: spacing.md,
     backgroundColor: colors.background,
     borderBottomWidth: 1,
     borderBottomColor: '#f0f0f0',
   },
+  toggleTrack: {
+    flexDirection: 'row',
+    backgroundColor: '#f3f4f6',
+    borderRadius: radius.lg,
+    padding: 3,
+    gap: 3,
+  },
   toggleChip: {
     flex: 1,
     alignItems: 'center',
-    paddingVertical: 8,
-    borderRadius: radius.lg,
-    backgroundColor: '#f3f4f6',
+    paddingVertical: 7,
+    borderRadius: radius.md,
   },
-  toggleChipActive: { backgroundColor: colors.brand[600] },
+  toggleChipActive: {
+    backgroundColor: '#fff',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.08,
+    shadowRadius: 4,
+    elevation: 2,
+  },
   toggleText: { fontSize: 14, fontWeight: '600', color: colors.text.secondary },
-  toggleTextActive: { color: '#fff' },
+  toggleTextActive: { color: colors.brand[600] },
 
   content: { padding: spacing.lg, gap: spacing.md },
 
@@ -360,7 +368,7 @@ const styles = StyleSheet.create({
   groupTitle: { fontSize: 15, fontWeight: '700', color: colors.text.primary },
   groupSub: { fontSize: 12, color: colors.text.muted, marginTop: 2 },
   groupScoreBlock: { alignItems: 'center', minWidth: 36 },
-  groupAvg: { fontSize: 22, fontWeight: '700', color: colors.brand[700], lineHeight: 26 },
+  groupAvg: { fontSize: 22, fontWeight: '700', color: colors.text.primary, lineHeight: 26 },
   groupAvgLabel: { fontSize: 10, color: colors.text.muted, fontWeight: '600', textTransform: 'uppercase' },
   groupArrow: { fontSize: 22, color: colors.text.muted, fontWeight: '300', alignSelf: 'center' },
   groupBottom: { flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-between' },

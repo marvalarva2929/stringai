@@ -14,6 +14,10 @@
     "submit:android": "eas submit --platform android",
     "lint": "eslint . --ext .ts,.tsx",
     "typecheck": "tsc --noEmit",
+    "test:tone": "node --experimental-strip-types --loader ./test/ts-resolver.mjs test/toneAnalysis.test.ts",
+    "test:intonation": "node --experimental-strip-types --loader ./test/ts-resolver.mjs test/intonationStability.test.ts",
+    "calibrate:intonation": "node --experimental-strip-types --loader ./test/ts-resolver.mjs test/calibrateIntonation.ts",
+    "synth:gen": "node --experimental-strip-types test/generate-synth.ts",
     "postinstall": "node scripts/postinstall.js"
   },
   "dependencies": {

@@ -3,20 +3,20 @@ import { View, Text, StyleSheet } from 'react-native';
 import { colors, spacing } from '../../constants/theme';
 
 export interface SlideData {
-  emoji: string;
+  icon: React.ReactNode;
   title: string;
   subtitle: string;
   body: string;
 }
 
-interface OnboardingSlidePrpos {
+interface OnboardingSlideProps {
   slide: SlideData;
 }
 
-export function OnboardingSlide({ slide }: OnboardingSlidePrpos) {
+export function OnboardingSlide({ slide }: OnboardingSlideProps) {
   return (
     <View style={styles.container}>
-      <Text style={styles.emoji}>{slide.emoji}</Text>
+      <View style={styles.iconWrap}>{slide.icon}</View>
       <Text style={styles.title}>{slide.title}</Text>
       <Text style={styles.subtitle}>{slide.subtitle}</Text>
       <Text style={styles.body}>{slide.body}</Text>
@@ -32,7 +32,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.xl,
     paddingBottom: spacing.xxl,
   },
-  emoji: { fontSize: 72, marginBottom: spacing.lg },
+  iconWrap: { marginBottom: spacing.lg, alignItems: 'center', justifyContent: 'center' },
   title: {
     fontSize: 28,
     fontWeight: '700',

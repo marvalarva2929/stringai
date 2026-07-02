@@ -1,6 +1,8 @@
 import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { View, Text, Pressable, StyleSheet, Dimensions, PanResponder } from 'react-native';
 import { Video, ResizeMode, AVPlaybackStatus, Audio } from 'expo-av';
+import { Ionicons } from '@expo/vector-icons';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors, spacing } from '../../constants/theme';
 import type { NoteEvent } from '../../lib/noteFusion';
 
@@ -8,12 +10,16 @@ export interface InlineVideoPlayerProps {
   uri: string;
   seekVersion?: number;
   seekSeconds?: number;
+  /** If set alongside seekVersion/seekSeconds, auto-plays and pauses at this position. */
+  seekEndSeconds?: number;
   fullScreen?: boolean;
   noteEvents?: NoteEvent[];
   /** Known recording duration in seconds — used as duration fallback so stamps
    *  appear immediately on remount before the Video component reports durationMillis. */
   durationSeconds?: number;
   onMarkerPress?: (seconds: number) => void;
+  /** Called at most every 250ms with the current playback position in seconds. */
+  onTimeUpdate?: (seconds: number) => void;
 }
 
 const VIDEO_H = Math.round(Dimensions.get('window').height * 0.28);
@@ -57,7 +63,7 @@ const gs = StyleSheet.create({
 
 // ── Main player ────────────────────────────────────────────────────────────────
 export function InlineVideoPlayer({
-  uri, seekVersion, seekSeconds, fullScreen, noteEvents, durationSeconds, onMarkerPress,
+  uri, seekVersion, seekSeconds, seekEndSeconds, fullScreen, noteEvents, durationSeconds, onMarkerPress, onTimeUpdate,
 }: InlineVideoPlayerProps) {
   const videoRef  = useRef<Video>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -67,8 +73,13 @@ export function InlineVideoPlayer({
   const [dragMs, setDragMs] = useState<number | null>(null);
   const [playbackRate, setPlaybackRateState] = useState(1.0);
   const loadedRef       = useRef(false);
+  const insets          = useSafeAreaInsets();
   const playbackRateRef = useRef(1.0);
   const appliedSeekVersion = useRef<number | undefined>(undefined);
+  const lastTimeUpdateMs = useRef(0);
+  const stopAtMsRef = useRef<number | null>(null);
+  const seekEndSecondsRef = useRef<number | undefined>(seekEndSeconds);
+  seekEndSecondsRef.current = seekEndSeconds;
 
   // Refs for PanResponder closures — always fresh, no stale captures
   const durationRef     = useRef(0);
@@ -127,8 +138,12 @@ export function InlineVideoPlayer({
   useEffect(() => {
     if (seekVersion === undefined || seekVersion === appliedSeekVersion.current) return;
     appliedSeekVersion.current = seekVersion;
+    const endMs = seekEndSecondsRef.current != null ? seekEndSecondsRef.current * 1000 : null;
+    stopAtMsRef.current = endMs;
     if (loadedRef.current) {
-      videoRef.current?.setPositionAsync((seekSeconds ?? 0) * 1000, { toleranceMillisBefore: 0, toleranceMillisAfter: 0 }).catch(() => {});
+      videoRef.current?.setPositionAsync((seekSeconds ?? 0) * 1000, { toleranceMillisBefore: 0, toleranceMillisAfter: 0 })
+        .then(() => { if (endMs != null) videoRef.current?.playAsync().catch(() => {}); })
+        .catch(() => {});
     }
   }, [seekVersion, seekSeconds]);
 
@@ -143,8 +158,17 @@ export function InlineVideoPlayer({
       }
     }
     setIsPlaying(status.isPlaying ?? false);
-    setPosition(status.positionMillis ?? 0);
+    const posMs = status.positionMillis ?? 0;
+    setPosition(posMs);
     if (status.durationMillis) setDuration(status.durationMillis);
+    if (stopAtMsRef.current !== null && status.isPlaying && posMs >= stopAtMsRef.current) {
+      stopAtMsRef.current = null;
+      videoRef.current?.pauseAsync().catch(() => {});
+    }
+    if (onTimeUpdate && Math.abs(posMs - lastTimeUpdateMs.current) >= 250) {
+      lastTimeUpdateMs.current = posMs;
+      onTimeUpdate(posMs / 1000);
+    }
   };
 
   const togglePlay = async () => {
@@ -207,7 +231,7 @@ export function InlineVideoPlayer({
         />
         <View style={styles.controls}>
           <Pressable style={styles.playBtn} onPress={togglePlay}>
-            <Text style={styles.playBtnText}>{isPlaying ? '⏸' : '▶'}</Text>
+            <Ionicons name={isPlaying ? 'pause' : 'play'} size={14} color="#fff" />
           </Pressable>
           <Text style={styles.timeText}>{fmtMs(displayMs)}</Text>
           <View
@@ -268,7 +292,7 @@ export function InlineVideoPlayer({
       />
 
       {/* ── Note + speedometer — top right overlay ── */}
-      <View style={styles.noteOverlay} pointerEvents="none">
+      <View style={[styles.noteOverlay, { top: insets.top + 8 }]} pointerEvents="none">
         <Text style={[styles.noteOverlayName, { color: noteColor }]}>
           {currentNote?.noteName ?? '—'}
         </Text>
@@ -283,7 +307,7 @@ export function InlineVideoPlayer({
       {/* ── Bottom controls: play/pause + draggable track + time ── */}
       <View style={styles.controlsOverlay}>
         <Pressable style={styles.playBtn} onPress={togglePlay}>
-          <Text style={styles.playBtnText}>{isPlaying ? '⏸' : '▶'}</Text>
+          <Ionicons name={isPlaying ? 'pause' : 'play'} size={14} color="#fff" />
         </Pressable>
         <Text style={styles.timeText}>{fmtMs(displayMs)}</Text>
         {/* Track — PanResponder handles both tap-to-seek and drag-to-scrub */}
@@ -384,11 +408,11 @@ const styles = StyleSheet.create({
   // ── Fullscreen ────────────────────────────────────────────────────────────
   containerFull: { flex: 1, backgroundColor: '#000' },
 
-  // Note + intonation card — top right
+  // Note + intonation card — top right (top is overridden inline to respect safe area)
   noteOverlay: {
     position: 'absolute',
     top: 10,
-    right: 10,
+    right: 12,
     backgroundColor: 'rgba(0,0,0,0.70)',
     borderRadius: 10,
     paddingHorizontal: 10,
@@ -434,7 +458,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  playBtnText: { color: '#fff', fontSize: 13 },
   timeText: {
     fontSize: 11,
     color: '#aaa',

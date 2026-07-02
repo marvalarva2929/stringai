@@ -19,9 +19,9 @@ import { colors, spacing } from '../../src/constants/theme';
 import { SkillLevel } from '../../src/types/user';
 
 const SKILL_OPTIONS: { label: string; value: SkillLevel }[] = [
-  { label: 'Beginner (0–2 years)', value: 'beginner' },
-  { label: 'Intermediate (2–5 years)', value: 'intermediate' },
-  { label: 'Advanced (5+ years)', value: 'advanced' },
+  { label: 'Beginner', value: 'beginner' },
+  { label: 'Intermediate', value: 'intermediate' },
+  { label: 'Advanced', value: 'advanced' },
 ];
 
 export default function Register() {
@@ -29,6 +29,8 @@ export default function Register() {
   const [password, setPassword] = useState('');
   const [skillLevel, setSkillLevel] = useState<SkillLevel>('beginner');
   const [loading, setLoading] = useState(false);
+  const [emailFocused, setEmailFocused] = useState(false);
+  const [passwordFocused, setPasswordFocused] = useState(false);
 
   const { setOnboardingComplete } = useAuthStore();
 
@@ -82,24 +84,48 @@ export default function Register() {
           <View style={styles.form}>
             <Text style={styles.fieldLabel}>Email</Text>
             <TextInput
-              style={styles.input}
+              style={[styles.input, emailFocused && styles.inputFocused]}
               value={email}
               onChangeText={setEmail}
               autoCapitalize="none"
               keyboardType="email-address"
               placeholder="you@example.com"
               placeholderTextColor="rgba(255,255,255,0.4)"
+              onFocus={() => setEmailFocused(true)}
+              onBlur={() => setEmailFocused(false)}
             />
 
             <Text style={styles.fieldLabel}>Password</Text>
             <TextInput
-              style={styles.input}
+              style={[styles.input, passwordFocused && styles.inputFocused]}
               value={password}
               onChangeText={setPassword}
               secureTextEntry
               placeholder="At least 8 characters"
               placeholderTextColor="rgba(255,255,255,0.4)"
+              onFocus={() => setPasswordFocused(true)}
+              onBlur={() => setPasswordFocused(false)}
             />
+            <View style={styles.strengthRow}>
+              {[0, 1, 2].map((i) => (
+                <View
+                  key={i}
+                  style={[
+                    styles.strengthSegment,
+                    {
+                      backgroundColor:
+                        password.length === 0
+                          ? 'rgba(255,255,255,0.15)'
+                          : password.length < 8
+                          ? i === 0 ? '#ef4444' : 'rgba(255,255,255,0.15)'
+                          : password.length < 13
+                          ? i < 2 ? '#f59e0b' : 'rgba(255,255,255,0.15)'
+                          : '#22c55e',
+                    },
+                  ]}
+                />
+              ))}
+            </View>
 
             <Text style={styles.sectionLabel}>Your skill level</Text>
             <View style={styles.skillRow}>
@@ -125,9 +151,17 @@ export default function Register() {
             />
           </View>
 
-          <Text style={styles.terms}>
-            By continuing you agree to our Terms of Service and Privacy Policy.
-          </Text>
+          <View style={styles.termsRow}>
+            <Text style={styles.terms}>By continuing you agree to our </Text>
+            <Pressable>
+              <Text style={styles.termsLink}>Terms of Service</Text>
+            </Pressable>
+            <Text style={styles.terms}> and </Text>
+            <Pressable>
+              <Text style={styles.termsLink}>Privacy Policy</Text>
+            </Pressable>
+            <Text style={styles.terms}>.</Text>
+          </View>
 
           <View style={styles.footer}>
             <Text style={styles.footerText}>Already have an account? </Text>
@@ -167,13 +201,15 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.15)',
   },
-  skillRow: { gap: spacing.xs, marginBottom: spacing.sm },
+  skillRow: { flexDirection: 'row', gap: spacing.xs, marginBottom: spacing.sm },
   skillChip: {
+    flex: 1,
     paddingVertical: 10,
-    paddingHorizontal: spacing.md,
+    paddingHorizontal: spacing.sm,
     borderRadius: 10,
     borderWidth: 1.5,
     borderColor: 'rgba(255,255,255,0.25)',
+    alignItems: 'center',
   },
   skillChipActive: {
     backgroundColor: colors.brand[600],
@@ -181,12 +217,37 @@ const styles = StyleSheet.create({
   },
   skillChipText: { color: 'rgba(255,255,255,0.65)', fontSize: 13 },
   skillChipTextActive: { color: '#fff', fontWeight: '600' },
-  terms: {
-    color: 'rgba(255,255,255,0.35)',
-    fontSize: 11,
-    textAlign: 'center',
+  termsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
     marginTop: spacing.md,
-    lineHeight: 16,
+  },
+  terms: {
+    color: 'rgba(255,255,255,0.7)',
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  termsLink: {
+    color: colors.brand[200],
+    fontSize: 12,
+    lineHeight: 18,
+    textDecorationLine: 'underline',
+  },
+  inputFocused: {
+    borderColor: 'rgba(255,255,255,0.65)',
+    backgroundColor: 'rgba(255,255,255,0.18)',
+  },
+  strengthRow: {
+    flexDirection: 'row',
+    gap: 4,
+    marginTop: -spacing.xs,
+    marginBottom: spacing.sm,
+  },
+  strengthSegment: {
+    flex: 1,
+    height: 3,
+    borderRadius: 2,
   },
   footer: { flexDirection: 'row', justifyContent: 'center', marginTop: spacing.lg },
   footerText: { color: 'rgba(255,255,255,0.55)', fontSize: 14 },

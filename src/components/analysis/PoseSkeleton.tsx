@@ -19,7 +19,8 @@ export interface HandLandmarks {
 
 export type PoseJoints = Partial<Record<
   'leftShoulder' | 'rightShoulder' | 'leftElbow' | 'rightElbow' |
-  'leftWrist' | 'rightWrist' | 'neck',
+  'leftWrist' | 'rightWrist' | 'neck' |
+  'leftIndexTip' | 'leftPinkyTip',
   PoseJoint
 >>;
 

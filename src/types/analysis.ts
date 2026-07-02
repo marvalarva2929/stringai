@@ -1,5 +1,5 @@
-import { InstrumentId } from './instrument';
-import { Piece } from './piece';
+import type { InstrumentId } from './instrument';
+import type { Piece } from './piece';
 
 export type MetricKey =
   | 'pitchAccuracy'
@@ -38,6 +38,24 @@ export interface TechniqueEvent {
   value?: number;         // measured magnitude (e.g., degrees, cents)
 }
 
+/**
+ * Tone-quality fault categories, derived from violin acoustics (Schelleng's
+ * force/speed/contact-point space). Used as TechniqueEvent.type for the
+ * toneQuality metric so coaching can name the specific fault.
+ */
+export type ToneFault =
+  | 'clean'            // ideal Helmholtz regime — no fault
+  | 'scratch'          // over-pressure / crunch (force too high for speed)
+  | 'rasp'             // general roughness / raised noise floor (mild over-pressure)
+  | 'thin'             // surface sound / under-pressure (force too low for speed)
+  | 'ponticello'       // bow too close to bridge — glassy, weak fundamental
+  | 'tasto'            // bow too close to fingerboard — dull, weak highs
+  | 'whistle'          // whistle / harmonic squeak / wolf
+  | 'onset_scratch'    // attack starts scratchy then clears
+  | 'delayed_speech'   // note speaks late (airy onset that catches)
+  | 'decay'            // tone thins / degrades toward the end of a note
+  | 'flicker';         // uneven / flickering tone within a note
+
 export type MeasurementQuality = 'high' | 'low' | 'proxy' | 'unavailable';
 
 export interface MetricScore {
@@ -52,6 +70,41 @@ export interface MetricScore {
   observationSummary: string;   // "Wrist collapsed 23 times" — the user-facing description
   /** Omitted or 'high' for reliable metrics; 'unavailable' excludes from overall score. */
   measurementQuality?: MeasurementQuality;
+  /** Per-frame time series for metrics that support graphing. Not persisted to DB. */
+  timeSeries?: Array<{ t: number; v: number }>;
+  /** Per-frame debug intermediates for wrist angle diagnosis. Not persisted to DB. */
+  debugSeries?: Array<{ t: number; cos: number | null; magF: number | null; magH: number | null; mode: '3D' | '2D' }>;
+  /** Runtime-only debug payload for dynamics tuning. Stripped before persistence. */
+  _dynDebug?: DynDebugInfo;
+}
+
+export type PhraseShape = 'arch' | 'rising' | 'falling' | 'plateau' | 'unclassified' | 'melodic_contour';
+
+export interface DynPhraseDebug {
+  startSec: number;
+  endSec: number;
+  durS: number;
+  cv2: number;
+  slopeNorm: number;
+  peakPos: number;
+  shape: PhraseShape;
+  /** Issue type that fired for this phrase, if any */
+  issue?: string;
+  confidence?: number;
+}
+
+export interface DynDebugInfo {
+  dynamicRatio: number;
+  maxSlow: number;
+  minSlow: number;
+  jitterScore: number;
+  rangeScore: number;
+  shapeScore: number;
+  score: number;
+  phrases: DynPhraseDebug[];
+  /** All candidate issues before confidence filter and MAX_EVENTS cap */
+  allIssues: { type: string; startSec: number; endSec: number; confidence: number; note: string }[];
+  ranked: { type: string; confidence: number }[];
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -96,6 +149,76 @@ export interface IntonationAnalysis {
   problemNotes: PitchClassIssue[];  // sorted by outOfTuneCount desc
   observationSummary: string;
   _score: number;            // 0-100 internal score for trend tracking
+}
+
+export interface VibratoNoteResult {
+  startS: number;
+  endS: number;
+  durationS: number;
+  noteScore: number;
+  rateHz: number;
+  depthCents: number;
+  periodicityScore: number;
+  consistencyOk: boolean;
+  feedbackNotes: string[];
+  cents: number[];
+}
+
+export interface VibratoAnalysis {
+  eligibleCount: number;
+  avgNoteScore: number;
+  notes: VibratoNoteResult[];
+}
+
+export interface RhythmFlaggedRegion {
+  startSeconds: number;
+  endSeconds: number;
+  direction: 'rushed' | 'dragged';
+  deviationPct: number;
+  label: string;
+}
+
+export interface RhythmAnalysis {
+  bpmEst: number;
+  beatPeriodSeconds: number;
+  tendency: 'rushing' | 'dragging' | null;
+  gridScore: number;
+  tempoDriftScore: number;
+  rushCount: number;
+  dragCount: number;
+  onGridCount: number;
+  totalNotes: number;
+  /** Moving-average beat period per window (seconds). Not persisted to DB. */
+  localBeatPeriods: number[];
+  /** Session timestamp for each localBeatPeriods sample (seconds). */
+  localBeatTimestamps: number[];
+  flaggedRegions: RhythmFlaggedRegion[];
+  isRubato: boolean;
+  ioiCv?: number;
+}
+
+// Per-note intonation STABILITY detail (within-note pitch-center steadiness).
+// Distinct from intonation accuracy (PitchClassIssue) and from vibrato: it reports how
+// the pitch CENTER drifted/wavered within a held note, after vibrato is removed.
+export type IntonationFaultType = 'drift_sharp' | 'drift_flat' | 'scoop' | 'waver';
+
+export interface IntonationStabilityNoteResult {
+  startS: number;
+  endS: number;
+  noteName: string;          // nearest ET note to the center, e.g. "F#4"
+  driftCents: number;        // center-line std — the stability measure
+  noteScore: number;         // 0-100
+  faultType: IntonationFaultType;
+  feedbackNote: string;      // actionable coaching string
+  cents: number[];           // raw deviation from the note median (faint background line)
+  centerCents: number[];     // vibrato-removed center line (bold line — the variation shown)
+}
+
+export interface IntonationStabilityAnalysis {
+  assessedCount: number;     // notes assessed for stability
+  unsteadyCount: number;     // notes above the attention threshold
+  avgDriftCents: number;
+  worstNotes: IntonationStabilityNoteResult[];  // ranked worst-first, capped
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -151,6 +274,9 @@ export interface AnalysisResult {
   sessionAssessment?: SessionAssessment;
   llmFeedback?: LLMFeedback;
   intonationAnalysis?: IntonationAnalysis;
+  intonationStabilityAnalysis?: IntonationStabilityAnalysis;
+  vibratoAnalysis?: VibratoAnalysis;
+  rhythmAnalysis?: RhythmAnalysis;
   audioQualityWarning?: string;
   videoUri?: string;  // local path to the session video for replay
   noteEvents?: import('../lib/noteFusion').NoteEvent[];
@@ -161,6 +287,8 @@ export interface RawAudioSignals {
   pitchFrames: { frequency: number | null; timestamp: number }[];
   rmsFrames:   { value: number; timestamp: number }[];
   toneFrames:  { fundamentalRatio: number; timestamp: number }[];
+  spectralCentroidFrames: { value: number; timestamp: number }[];
+  brightnessFrames:       { value: number; timestamp: number }[];
   onsetTimestamps: number[];
   sampleRate: number;
   duration: number;
@@ -170,6 +298,9 @@ export interface RawAudioSignals {
 export interface AudioAnalysisOutput {
   metrics: MetricScore[];
   intonationAnalysis: IntonationAnalysis;
+  intonationStabilityAnalysis: IntonationStabilityAnalysis;
+  vibratoAnalysis: VibratoAnalysis;
+  rhythmAnalysis?: RhythmAnalysis;
   rawSignals: RawAudioSignals;
 }
 

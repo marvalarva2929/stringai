@@ -18,3 +18,22 @@ web-build/
 
 expo-env.d.ts
 # @end expo-cli
+# Tone-quality fixture source videos (large; WAVs are extracted from these — see
+# test/fixtures/tone/README.md). Keep the .wav clips, ignore the raw recordings.
+test/fixtures/tone/*.MOV
+test/fixtures/tone/*.mov
+# Intonation-stability calibration clips: ignore raw video + the ffmpeg-converted WAV cache.
+test/fixtures/intonation/*.MOV
+test/fixtures/intonation/*.mov
+test/fixtures/intonation/*.mp4
+test/fixtures/intonation/*.m4a
+test/fixtures/intonation/*.cal.wav
+
+# Fixture audio itself is large and reproducible/re-recordable — keep only the docs.
+test/fixtures/tone/*
+!test/fixtures/tone/README.md
+test/fixtures/intonation/*
+!test/fixtures/intonation/README.md
+
+# Xcode simulator app-data captures (huge, machine-local debugging dumps)
+*.xcappdata/

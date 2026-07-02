@@ -1,11 +1,12 @@
 import { supabase } from './supabase';
-import { AnalysisResult, MetricScore, SessionSummary, IntonationAnalysis, AudioAnalysisOutput, severityFromScore } from '../types/analysis';
+import { AnalysisResult, MetricScore, SessionSummary, IntonationAnalysis, AudioAnalysisOutput, severityFromScore, VibratoAnalysis } from '../types/analysis';
 import { Piece } from '../types/piece';
 import { InstrumentId } from '../types/instrument';
 import { analyzeMediaFile } from './audioEngine';
 import { buildSessionFeedback } from './llmFeedback';
 import { FrameKeypoints } from '../lib/poseScoring';
 import { scorePoseFrames, extractVideoFrames } from './videoAnalysis';
+import { RawBowFrame } from '../types/signals';
 
 // Fallback mock used when the audio file cannot be parsed (e.g. M4A on Android).
 function mockMetrics(): MetricScore[] {
@@ -56,7 +57,9 @@ export async function runAudioAnalysis(
     return {
       metrics: mockMetrics(),
       intonationAnalysis: mockIntonationAnalysis(),
-      rawSignals: { pitchFrames: [], rmsFrames: [], toneFrames: [], onsetTimestamps: [], sampleRate: 44100, duration: durationSeconds },
+      intonationStabilityAnalysis: { assessedCount: 0, unsteadyCount: 0, avgDriftCents: 0, worstNotes: [] },
+      vibratoAnalysis: { eligibleCount: 0, avgNoteScore: 0, notes: [] } satisfies VibratoAnalysis,
+      rawSignals: { pitchFrames: [], rmsFrames: [], toneFrames: [], spectralCentroidFrames: [], brightnessFrames: [], onsetTimestamps: [], sampleRate: 44100, duration: durationSeconds },
     };
   }
 }
@@ -66,16 +69,19 @@ export async function runVideoAnalysis(
   instrument: InstrumentId,
   poseFrames?: FrameKeypoints[],
   durationSeconds?: number,
+  liveBowFrames?: RawBowFrame[],
 ): Promise<MetricScore[]> {
   if (poseFrames && poseFrames.length >= 5) {
-    return scorePoseFrames(poseFrames, instrument, durationSeconds ?? 0);
+    // Live-recording path: use bow frames collected during recording (may be empty
+    // if the model isn't integrated yet — bow metrics gracefully return unavailable).
+    return scorePoseFrames(poseFrames, instrument, durationSeconds ?? 0, liveBowFrames ?? []);
   }
 
-  // Uploaded-video path: extract frames via Apple Vision on the video file.
+  // Uploaded-video path: extract pose + bow frames from the video file.
   try {
-    const extracted = await extractVideoFrames(videoUri);
+    const { poseFrames: extracted, bowFrames } = await extractVideoFrames(videoUri);
     if (extracted.length >= 5) {
-      return scorePoseFrames(extracted, instrument, durationSeconds ?? 0);
+      return scorePoseFrames(extracted, instrument, durationSeconds ?? 0, bowFrames);
     }
   } catch {
     // module unavailable (Android) or video unreadable — fall through to mock

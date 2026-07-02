@@ -105,7 +105,7 @@ export async function getReferenceNoteUri(pitchClass: string, midiNote?: number)
   const safe = pitchClass.replace('#', 's');
   const octave = Math.floor(midi / 12) - 1;
   const file = new File(Paths.cache, `ref_${safe}${octave}.wav`);
-  file.write(wav);
+  await file.write(wav);
   return file.uri;
 }
 

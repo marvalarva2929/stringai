@@ -1,5 +1,6 @@
 import React from 'react';
 import { Pressable, View, Text, StyleSheet } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 import { Piece } from '../../types/piece';
 import { colors, spacing, radius } from '../../constants/theme';
 
@@ -12,7 +13,7 @@ export function PieceCard({ piece, onSelect }: Props) {
   return (
     <Pressable style={({ pressed }) => [styles.card, pressed && styles.pressed]} onPress={() => onSelect(piece)}>
       <View style={styles.iconCircle}>
-        <Text style={styles.icon}>🎵</Text>
+        <Ionicons name="musical-note" size={22} color={colors.brand[600]} />
       </View>
       <View style={styles.info}>
         <Text style={styles.title} numberOfLines={1}>{piece.title}</Text>

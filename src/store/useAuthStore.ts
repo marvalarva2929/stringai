@@ -38,12 +38,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   setOnboardingComplete: () => {
     set({ hasCompletedOnboarding: true });
-    AsyncStorage.setItem(ONBOARDING_KEY, 'true');
+    AsyncStorage.setItem(ONBOARDING_KEY, 'true').catch(() => {});
   },
 
   setPlayerCategory: async (category) => {
     set({ playerCategory: category });
-    await AsyncStorage.setItem(PLAYER_CATEGORY_KEY, category);
+    await AsyncStorage.setItem(PLAYER_CATEGORY_KEY, category).catch(() => {});
   },
 
   loadOnboardingStatus: async () => {
@@ -68,7 +68,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   incrementGuestCount: async () => {
     const next = get().guestAnalysesUsed + 1;
     set({ guestAnalysesUsed: next });
-    await AsyncStorage.setItem(GUEST_ANALYSES_KEY, String(next));
+    await AsyncStorage.setItem(GUEST_ANALYSES_KEY, String(next)).catch(() => {});
   },
 
   canAnalyzeAsGuest: () => get().guestAnalysesUsed < FREE_LIMIT,

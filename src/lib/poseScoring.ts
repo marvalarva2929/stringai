@@ -13,6 +13,8 @@
 
 import { MetricScore, MetricKey, MeasurementQuality, TechniqueEvent, FlaggedTimestamp, severityFromScore } from '../types/analysis';
 import { InstrumentId } from '../types/instrument';
+import { RawBowFrame } from '../types/signals';
+import { deriveBowTimeSeries, BowTimeSeries } from './bowAnalysis';
 
 // ─────────────────────────────────────────────────────────────
 // Landmark type definitions (MediaPipe format)
@@ -37,6 +39,8 @@ export const POSE = {
   RIGHT_ELBOW: 14,
   LEFT_WRIST: 15,
   RIGHT_WRIST: 16,
+  LEFT_PINKY_TIP: 17,
+  LEFT_INDEX_TIP: 19,
 } as const;
 
 // MediaPipe Hands — 21 landmarks per hand
@@ -59,7 +63,7 @@ export interface FrameKeypoints {
 // ─────────────────────────────────────────────────────────────
 
 export const CONFIDENCE_THRESHOLD = 0.6;
-const MIN_CONSECUTIVE_FRAMES = 3;
+const MIN_CONSECUTIVE_FRAMES = 5;
 
 function clamp(v: number, lo = 0, hi = 100): number {
   return Math.max(lo, Math.min(hi, v));
@@ -82,6 +86,7 @@ export function jointAngle(a: Landmark, b: Landmark, c: Landmark): number {
   if (mag < 0.0001) return 180;
   return deg(Math.acos(Math.max(-1, Math.min(1, (abx * cbx + aby * cby) / mag))));
 }
+
 
 /**
  * Z-component of the palm's unit normal vector computed from MediaPipe world landmarks.
@@ -127,10 +132,7 @@ export function filterConsecutiveRuns(indexes: number[], minLength = MIN_CONSECU
   return result;
 }
 
-const UNAVAILABLE_BOW_MSG =
-  'Requires bow tracking — not available until a bow detector is integrated.';
-
-function unavailableMetric(key: MetricKey): MetricScore {
+function unavailableMetric(key: MetricKey, reason?: string): MetricScore {
   return {
     key,
     score: 0,
@@ -138,7 +140,7 @@ function unavailableMetric(key: MetricKey): MetricScore {
     severity: 'good',
     events: [],
     occurrenceRate: 0,
-    observationSummary: UNAVAILABLE_BOW_MSG,
+    observationSummary: reason ?? 'Bow tracking data not available for this session.',
     measurementQuality: 'unavailable',
   };
 }
@@ -201,8 +203,19 @@ const THRESHOLDS = {
     minStraightAngle: 160,
   },
   posture: {
-    shoulderDiff: 0.04,
-    headTilt: 0.15,
+    // |leftShoulder.y − rightShoulder.y| in normalized frame coords.
+    // Violin players have natural asymmetry so this is intentionally lenient.
+    shoulderDiff: 0.05,
+  },
+  bow: {
+    // Deviation from the session-median bow angle that triggers a flag.
+    // Using session median as baseline makes this camera-angle agnostic.
+    angleDeviationDeg: 15,
+    // Minimum fraction of bow length (0-1) the player must use.
+    // Below this the distribution is considered too narrow.
+    minDistributionRange: 0.35,
+    // Minimum bow frames required before a metric is considered reliable.
+    minFrames: 5,
   },
 };
 
@@ -210,58 +223,156 @@ const THRESHOLDS = {
 // Per-metric scoring
 // ─────────────────────────────────────────────────────────────
 
-function scoreBowPlacement(_frames: FrameKeypoints[]): MetricScore {
-  return unavailableMetric('bowPlacement');
+// Bow placement (sul ponticello / normal / sul tasto) requires knowing bridge
+// position in the frame, which needs a bridge detector. Deferred.
+function scoreBowPlacement(_bow: BowTimeSeries): MetricScore {
+  return unavailableMetric('bowPlacement', 'Bow contact zone (bridge vs fingerboard) requires bridge position detection — coming in a future update.');
 }
 
-function scoreBowAngle(_frames: FrameKeypoints[]): MetricScore {
-  return unavailableMetric('bowAngle');
+function scoreBowAngle(bow: BowTimeSeries): MetricScore {
+  const pts = bow.bowAngle.points.filter(p => p.v !== null) as Array<{ t: number; v: number }>;
+  if (pts.length < THRESHOLDS.bow.minFrames) {
+    return unavailableMetric('bowAngle', 'Not enough bow frames detected in this session.');
+  }
+
+  // Session median as baseline — makes this robust to camera tilt/orientation.
+  const sorted = [...pts].map(p => p.v).sort((a, b) => a - b);
+  const baseline = sorted[Math.floor(sorted.length / 2)];
+  const timestamps = pts.map(p => p.t);
+
+  const flaggedIndexes: number[] = [];
+  let goodFrames = 0;
+  for (let i = 0; i < pts.length; i++) {
+    if (Math.abs(pts[i].v - baseline) <= THRESHOLDS.bow.angleDeviationDeg) {
+      goodFrames++;
+    } else {
+      flaggedIndexes.push(i);
+    }
+  }
+
+  const confirmedFlags = filterConsecutiveRuns(flaggedIndexes);
+  const score = clamp(Math.round((goodFrames / pts.length) * 100));
+  const occurrenceRate = confirmedFlags.length / pts.length;
+  const flaggedTimestamps = framesToTimestamps(confirmedFlags, timestamps, 'Bow angle deviation — keep the stick more consistent');
+  const events = timestampsToEvents(flaggedTimestamps, 'bow_angle_deviation');
+
+  const entryCount = countEntries(confirmedFlags);
+  const ratePct = Math.round(occurrenceRate * 100);
+  const observationSummary = entryCount === 0
+    ? 'Bow stick angle was consistent throughout.'
+    : ratePct >= 50
+    ? `Bow stick tilted beyond normal range ${ratePct}% of the session.`
+    : `Bow angle deviation detected ${entryCount} ${entryCount === 1 ? 'time' : 'times'}.`;
+
+  return {
+    key: 'bowAngle',
+    score,
+    flaggedTimestamps,
+    severity: severityFromScore(score),
+    events,
+    occurrenceRate,
+    observationSummary,
+    measurementQuality: 'high',
+  };
 }
 
-function scoreBowArmLevel(_frames: FrameKeypoints[], _instrument: InstrumentId): MetricScore {
-  return unavailableMetric('bowArmLevel');
+// Bow arm level requires correlating elbow height to the current string (from pitch).
+// Partial — needs pitch-string mapping from SessionSignals. Deferred to next sprint.
+function scoreBowArmLevel(_bow: BowTimeSeries, _instrument: InstrumentId): MetricScore {
+  return unavailableMetric('bowArmLevel', 'Bow arm level assessment requires pitch-to-string mapping — coming in next sprint.');
 }
 
-function scoreBowDistribution(_frames: FrameKeypoints[]): MetricScore {
-  return unavailableMetric('bowDistribution');
+function scoreBowDistribution(bow: BowTimeSeries): MetricScore {
+  const pts = bow.bowContactPoint.points.filter(p => p.v !== null) as Array<{ t: number; v: number }>;
+  if (pts.length < THRESHOLDS.bow.minFrames) {
+    return unavailableMetric('bowDistribution', 'Not enough bow frames detected in this session.');
+  }
+
+  const values = pts.map(p => p.v);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min;
+
+  let score: number;
+  if (range >= 0.7)  score = 92;
+  else if (range >= 0.5) score = 78;
+  else if (range >= THRESHOLDS.bow.minDistributionRange) score = 62;
+  else score = 35;
+
+  const pctUsed = Math.round(range * 100);
+  const observationSummary = range >= 0.7
+    ? `Using ${pctUsed}% of the bow — excellent range.`
+    : range >= 0.5
+    ? `Using ${pctUsed}% of the bow — good range.`
+    : range >= THRESHOLDS.bow.minDistributionRange
+    ? `Using only ${pctUsed}% of the bow — try to extend to the tip and frog more.`
+    : `Using only ${pctUsed}% of the bow — very restricted range.`;
+
+  return {
+    key: 'bowDistribution',
+    score,
+    flaggedTimestamps: [],
+    severity: severityFromScore(score),
+    events: [],
+    occurrenceRate: range < THRESHOLDS.bow.minDistributionRange ? 1.0 : 0,
+    observationSummary,
+    measurementQuality: 'high',
+  };
 }
 
 function scoreLeftHandWrist(frames: FrameKeypoints[]): MetricScore {
   const flaggedIndexes: number[] = [];
   const timestamps = frames.map((f) => f.timestamp);
+  const timeSeries: Array<{ t: number; v: number }> = [];
+  const debugSeries: Array<{ t: number; cos: number | null; magF: number | null; magH: number | null; mode: '3D' | '2D' }> = [];
   let goodFrames = 0;
   let totalFrames = 0;
   let noDataFrames = 0;
 
   for (let i = 0; i < frames.length; i++) {
-    const pose     = frames[i].poseLandmarks;
-    const leftHand = frames[i].leftHandLandmarks;
-    if (!pose || !leftHand) { noDataFrames++; continue; }
+    const pose = frames[i].poseLandmarks;
+    if (!pose) { noDataFrames++; continue; }
 
     const elbow    = pose[POSE.LEFT_ELBOW];
     const wrist    = pose[POSE.LEFT_WRIST];
-    const indexMcp = leftHand[HAND.INDEX_MCP];
-    if (!elbow || !wrist || !indexMcp) { noDataFrames++; continue; }
-    if (!visible(elbow) || !visible(wrist) || !visible(indexMcp)) { noDataFrames++; continue; }
+    const indexTip = pose[POSE.LEFT_INDEX_TIP];
+    if (!elbow || !wrist || !indexTip) { noDataFrames++; continue; }
+    if (!visible(elbow) || !visible(wrist) || !visible(indexTip)) { noDataFrames++; continue; }
 
-    // Skip frames outside the calibrated palm orientation window (-0.25 to 0).
-    // Only active when MediaPipe world coords are available; falls back to scoring
-    // all frames when they are not (e.g. uploaded video, Vision-only path).
-    const pnz = palmNormalZ(leftHand);
-    if (pnz !== null && (pnz > 0 || pnz < -0.25)) { noDataFrames++; continue; }
+    // All three landmarks come from the same MediaPipe Pose world coordinate frame
+    // (hip-centred, metres). The 3D angle is camera-angle-independent and needs no
+    // palm-orientation gate. Fall back to the 2D projected angle when world coords
+    // are unavailable (e.g. useMpPose prop is off).
+    let angle: number;
+    if (elbow.wx != null && wrist.wx != null && indexTip.wx != null) {
+      const fax = elbow.wx - wrist.wx, fay = elbow.wy! - wrist.wy!, faz = elbow.wz! - wrist.wz!;
+      const hx = indexTip.wx - wrist.wx, hy = indexTip.wy! - wrist.wy!, hz = indexTip.wz! - wrist.wz!;
+      const magF = Math.sqrt(fax * fax + fay * fay + faz * faz);
+      const magH = Math.sqrt(hx * hx + hy * hy + hz * hz);
+      if (magF < 0.0001 || magH < 0.0001) { noDataFrames++; continue; }
+      const cosA = Math.max(-1, Math.min(1, (fax * hx + fay * hy + faz * hz) / (magF * magH)));
+      angle = deg(Math.acos(cosA));
+      debugSeries.push({ t: timestamps[i], cos: Math.round(cosA * 100) / 100, magF: Math.round(magF * 100), magH: Math.round(magH * 100), mode: '3D' });
+    } else {
+      angle = jointAngle(elbow, wrist, indexTip);
+      debugSeries.push({ t: timestamps[i], cos: null, magF: null, magH: null, mode: '2D' });
+    }
 
-    // Interior angle at the wrist between the forearm (elbow→wrist) and the hand
-    // (wrist→indexMCP). 180° = straight; below threshold = collapsed.
-    // When the arm points at the camera the projection foreshortens to a line, so
-    // the measured angle stays near 180° — no false positives at bad angles.
-    const angle = jointAngle(elbow, wrist, indexMcp);
     totalFrames++;
+    timeSeries.push({ t: timestamps[i], v: angle });
     if (angle >= THRESHOLDS.leftHandWrist.minStraightAngle) {
       goodFrames++;
     } else {
       flaggedIndexes.push(i);
     }
   }
+
+  // 3-frame sliding median to smooth the graph display.
+  // Violation detection uses frame indices above, so it is unaffected.
+  const smoothedTimeSeries = timeSeries.map((pt, i) => {
+    const win = timeSeries.slice(Math.max(0, i - 1), i + 2).map(p => p.v).sort((a, b) => a - b);
+    return { t: pt.t, v: win[Math.floor(win.length / 2)] };
+  });
 
   const allFrames = totalFrames + noDataFrames;
   const quality: MeasurementQuality =
@@ -283,6 +394,12 @@ function scoreLeftHandWrist(frames: FrameKeypoints[]): MetricScore {
       ? `Left wrist was collapsed ${ratePct}% of the session.`
       : `Left wrist collapsed ${entryCount} ${entryCount === 1 ? 'time' : 'times'}.`;
 
+  // Log every frame so we can inspect from Metro logs.
+  // grep for WRIST_DEBUG in the Metro terminal output.
+  if (debugSeries.length > 0) {
+    console.log('WRIST_DEBUG', JSON.stringify(debugSeries));
+  }
+
   return {
     key: 'leftHandWrist',
     score,
@@ -292,6 +409,8 @@ function scoreLeftHandWrist(frames: FrameKeypoints[]): MetricScore {
     occurrenceRate,
     observationSummary,
     measurementQuality: quality,
+    timeSeries: smoothedTimeSeries.length >= 2 ? smoothedTimeSeries : undefined,
+    debugSeries: debugSeries.length >= 2 ? debugSeries : undefined,
   };
 }
 
@@ -307,19 +426,15 @@ function scorePosture(frames: FrameKeypoints[]): MetricScore {
 
     const lShoulder = pose[POSE.LEFT_SHOULDER];
     const rShoulder = pose[POSE.RIGHT_SHOULDER];
-    const nose = pose[POSE.NOSE];
-    if (!visible(lShoulder) || !visible(rShoulder) || !visible(nose)) continue;
+    // Violin players must tilt their head to hold the instrument — head position is
+    // intentionally excluded. Shoulder level is the only reliable posture signal
+    // measurable from a front-facing camera.
+    if (!visible(lShoulder) || !visible(rShoulder)) continue;
 
-    const shoulderWidth = Math.abs(lShoulder.x - rShoulder.x);
     const shoulderDiff = Math.abs(lShoulder.y - rShoulder.y);
-    const midX = (lShoulder.x + rShoulder.x) / 2;
-    const headTilt = Math.abs(nose.x - midX) / shoulderWidth;
 
     totalFrames++;
-    const isShoulderUneven = shoulderDiff > THRESHOLDS.posture.shoulderDiff;
-    const isHeadTilted = headTilt > THRESHOLDS.posture.headTilt;
-
-    if (!isShoulderUneven && !isHeadTilted) {
+    if (shoulderDiff <= THRESHOLDS.posture.shoulderDiff) {
       goodFrames++;
     } else {
       flaggedIndexes.push(i);
@@ -331,17 +446,17 @@ function scorePosture(frames: FrameKeypoints[]): MetricScore {
     ? clamp(Math.round((goodFrames / totalFrames) * 100))
     : 75;
   const occurrenceRate = totalFrames > 0 ? confirmedFlags.length / totalFrames : 0;
-  const flaggedTimestamps = framesToTimestamps(confirmedFlags, timestamps, 'Posture issue — check shoulders and head position');
-  const events = timestampsToEvents(flaggedTimestamps, 'shoulder_raised');
+  const flaggedTimestamps = framesToTimestamps(confirmedFlags, timestamps, 'Shoulders uneven — try to keep them level');
+  const events = timestampsToEvents(flaggedTimestamps, 'shoulder_uneven');
   const ratePct = Math.round(occurrenceRate * 100);
   const observationSummary =
     totalFrames === 0
       ? 'Step back so your shoulders are fully visible for posture assessment.'
       : occurrenceRate === 0
-      ? 'Posture was well-balanced throughout the session.'
+      ? 'Shoulders stayed level throughout the session.'
       : ratePct >= 40
-      ? `Posture issues present ${ratePct}% of the session.`
-      : `Posture issues detected ${flaggedTimestamps.length} ${flaggedTimestamps.length === 1 ? 'time' : 'times'}.`;
+      ? `Shoulder unevenness present ${ratePct}% of the session.`
+      : `Uneven shoulders detected ${flaggedTimestamps.length} ${flaggedTimestamps.length === 1 ? 'time' : 'times'}.`;
   return {
     key: 'posture',
     score,
@@ -359,24 +474,27 @@ function scorePosture(frames: FrameKeypoints[]): MetricScore {
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Score all video-based metrics from an array of per-frame pose keypoints.
+ * Score all video-based metrics from pose frames and bow detector output.
  *
- * Called from runVideoAnalysis() once MediaPipe is integrated:
- *   const frames = await sampleFramesWithMediaPipe(videoUri, 2); // 2 fps
- *   return scorePoseMetrics(frames, audioMetrics, instrument, duration);
+ * @param frames    Normalized FrameKeypoints[] (after preparePoseFramesForScoring).
+ * @param bowFrames RawBowFrame[] from the native bow detector. Pass [] when
+ *                  bow data is unavailable — bow metrics gracefully return
+ *                  measurementQuality: 'unavailable'.
+ * @param instrument Instrument config key.
  */
 export function scorePoseMetrics(
   frames: FrameKeypoints[],
-  _audioMetrics: MetricScore[],
+  bowFrames: RawBowFrame[],
   instrument: InstrumentId,
   _duration: number,
 ): MetricScore[] {
   if (frames.length === 0) return [];
+  const bow = deriveBowTimeSeries(bowFrames);
   return [
-    scoreBowPlacement(frames),
-    scoreBowAngle(frames),
-    scoreBowArmLevel(frames, instrument),
-    scoreBowDistribution(frames),
+    scoreBowPlacement(bow),
+    scoreBowAngle(bow),
+    scoreBowArmLevel(bow, instrument),
+    scoreBowDistribution(bow),
     scoreLeftHandWrist(frames),
     scorePosture(frames),
   ];

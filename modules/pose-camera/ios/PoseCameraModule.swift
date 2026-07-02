@@ -22,6 +22,13 @@ public class PoseCameraModule: Module {
             }
         }
 
+        AsyncFunction("getRecentAudioWav") { (windowSeconds: Double, promise: Promise) in
+            DispatchQueue.global(qos: .utility).async {
+                let b64 = PoseCameraView.current?.getRecentAudioWav(windowSeconds: windowSeconds)
+                promise.resolve(b64)
+            }
+        }
+
         // Samples an existing video file at 2 fps, runs Apple Vision pose + hands on each
         // frame, and returns an array of frame dicts in the same format as onPose events
         // (with an added "timestamp" field in seconds). Used for the uploaded-video path
@@ -46,8 +53,21 @@ public class PoseCameraModule: Module {
             }
         }
 
+        Function("setHomeIndicatorHidden") { (hidden: Bool) in
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(
+                    name: Notification.Name("PoseCameraSetHomeIndicatorHidden"),
+                    object: nil,
+                    userInfo: ["hidden": hidden]
+                )
+            }
+        }
+
         View(PoseCameraView.self) {
-            Events("onPose", "onRecordingFinished", "onCameraReady")
+            Events("onPose", "onRecordingFinished", "onCameraReady", "onPitch")
+            Prop("useMpPose") { (view: PoseCameraView, value: Bool) in
+                view.useMpPose = value
+            }
         }
     }
 
@@ -163,6 +183,32 @@ public class PoseCameraModule: Module {
             var payload: [String: Any] = ["timestamp": actual.seconds, "joints": joints]
             if !leftHand.isEmpty  { payload["leftHand"]  = leftHand  }
             if !rightHand.isEmpty { payload["rightHand"] = rightHand }
+
+            // Bow detection — runs only if bow_detector.mlpackage is present in bundle.
+            // Frames where the bow is not detected (or model absent) simply omit these
+            // keys; the JS side treats absent keys as null RawBowFrame fields.
+            if let detector = BowDetector.shared,
+               let bow = detector.detect(in: image),
+               bow.confidence >= BowDetector.confidenceThreshold {
+                payload["bowTip"] = [
+                    "x": Double(bow.tipX), "y": Double(bow.tipY),
+                    "visible": bow.tipVisible,
+                ]
+                payload["bowFrog"] = [
+                    "x": Double(bow.frogX), "y": Double(bow.frogY),
+                    "visible": bow.frogVisible,
+                ]
+                payload["bowContact"] = [
+                    "x": Double(bow.contactX), "y": Double(bow.contactY),
+                    "visible": bow.contactVisible,
+                ]
+                payload["bowBox"] = [
+                    "x1": Double(bow.boxX1), "y1": Double(bow.boxY1),
+                    "x2": Double(bow.boxX2), "y2": Double(bow.boxY2),
+                ]
+                payload["bowConfidence"] = Double(bow.confidence)
+            }
+
             frames.append(payload)
 
             t += step

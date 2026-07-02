@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import {
   View,
   Text,
@@ -9,7 +9,10 @@ import {
   ActivityIndicator,
   Share,
   Alert,
+  Dimensions,
 } from 'react-native';
+import Svg, { Path, Line } from 'react-native-svg';
+import { Video, AVPlaybackStatus, ResizeMode, Audio } from 'expo-av';
 import * as ImagePicker from 'expo-image-picker';
 import { router } from 'expo-router';
 import { analyzeMediaFileWithDebug, AudioDebugInfo } from '../src/services/audioEngine';
@@ -18,6 +21,7 @@ import { colors, spacing, radius } from '../src/constants/theme';
 
 interface RunResult {
   fileName: string;
+  videoUri: string;
   scores: MetricScore[];
   debug: AudioDebugInfo;
   durationMs: number;
@@ -27,6 +31,12 @@ export default function DebugScreen() {
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<RunResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const videoRef = useRef<Video>(null);
+  const segEndMsRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    Audio.setAudioModeAsync({ playsInSilentModeIOS: true, allowsRecordingIOS: false });
+  }, []);
 
   const pickAndRun = async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -49,17 +59,35 @@ export default function DebugScreen() {
     setRunning(true);
     setResult(null);
     setError(null);
+    segEndMsRef.current = null;
 
     const t0 = Date.now();
     try {
       const { scores, debug } = await analyzeMediaFileWithDebug(asset.uri, 'violin', durationSec);
-      setResult({ fileName, scores, debug, durationMs: Date.now() - t0 });
+      setResult({ fileName, videoUri: asset.uri, scores, debug, durationMs: Date.now() - t0 });
     } catch (err: any) {
       setError(err?.message ?? 'Analysis failed');
     } finally {
       setRunning(false);
     }
   };
+
+  const onPlaybackStatusUpdate = useCallback((status: AVPlaybackStatus) => {
+    if (!status.isLoaded || !status.isPlaying) return;
+    const endMs = segEndMsRef.current;
+    if (endMs !== null && status.positionMillis >= endMs) {
+      segEndMsRef.current = null;
+      videoRef.current?.pauseAsync().catch(() => {});
+    }
+  }, []);
+
+  const playSegment = useCallback(async (startS: number, endS: number) => {
+    const video = videoRef.current;
+    if (!video) return;
+    segEndMsRef.current = endS * 1000;
+    await video.setPositionAsync(startS * 1000, { toleranceMillisBefore: 0, toleranceMillisAfter: 100 }).catch(() => {});
+    await video.playAsync().catch(() => {});
+  }, []);
 
   const shareResult = async () => {
     if (!result) return;
@@ -146,6 +174,8 @@ export default function DebugScreen() {
               score={result.scores.find((s) => s.key === 'rhythmAccuracy')}
               rows={[
                 ['Onsets detected', String(result.debug.rhythmAccuracy.onsetCount)],
+                ['  ↳ spectral flux', String(result.debug.rhythmAccuracy.fluxOnsets)],
+                ['  ↳ pitch change', String(result.debug.rhythmAccuracy.pitchOnsets)],
                 ['Mean IOI', `${result.debug.rhythmAccuracy.meanIoi.toFixed(3)}s`],
                 ['CV of IOI', `${result.debug.rhythmAccuracy.cvIoi.toFixed(3)}  (lower = more regular)`],
               ]}
@@ -159,14 +189,19 @@ export default function DebugScreen() {
               ]}
             />
 
-            <MetricDebugCard
-              label="Vibrato"
+            <VibratoDebugCard
               score={result.scores.find((s) => s.key === 'vibrato')}
-              rows={[
-                ['Zero crossings', String(result.debug.vibrato.zeroCrossings)],
-                ['Expected (5 Hz)', String(result.debug.vibrato.expectedCrossings)],
-                ['Vibrato ratio', `${result.debug.vibrato.vibratoRatio.toFixed(3)}  (score = ratio × 80)`],
-              ]}
+              vibrato={result.debug.vibrato}
+              onSegmentPress={playSegment}
+            />
+
+            <Video
+              ref={videoRef}
+              source={{ uri: result.videoUri }}
+              style={styles.videoPlayer}
+              resizeMode={ResizeMode.CONTAIN}
+              onPlaybackStatusUpdate={onPlaybackStatusUpdate}
+              useNativeControls
             />
 
             <Pressable style={styles.shareBtn} onPress={shareResult}>
@@ -212,6 +247,156 @@ function MetricDebugCard({ label, score, rows }: MetricDebugCardProps) {
   );
 }
 
+const GRAPH_W = Dimensions.get('window').width - 64;
+const GRAPH_H = 130;
+const GRAPH_RANGE = 50; // ±50 cents
+
+function buildSegmentPath(cents: number[], w: number, h: number): string {
+  if (cents.length < 2) return '';
+  const PAD = 8;
+  const mh = h - PAD * 2;
+  let d = '';
+  cents.forEach((c, i) => {
+    const x = (i / Math.max(cents.length - 1, 1)) * w;
+    const clamped = Math.max(-GRAPH_RANGE, Math.min(GRAPH_RANGE, c));
+    const y = PAD + mh / 2 - (clamped / GRAPH_RANGE) * (mh / 2);
+    d += i === 0 ? `M${x.toFixed(1)} ${y.toFixed(1)}` : ` L${x.toFixed(1)} ${y.toFixed(1)}`;
+  });
+  return d;
+}
+
+const IDEAL_RATE_HZ = 5.5;
+const IDEAL_DEPTH_CENTS = 25;
+const PITCH_HOP_HZ = 40; // classifyVibratoSegment uses hopHz=40
+
+function SegmentPitchGraph({ cents }: { cents: number[] }) {
+  const PAD = 8;
+  const mh = GRAPH_H - PAD * 2;
+  const cy = PAD + mh / 2;
+  const yAt = (c: number) => PAD + mh / 2 - (c / GRAPH_RANGE) * (mh / 2);
+  const path = buildSegmentPath(cents, GRAPH_W, GRAPH_H);
+
+  // Ideal vibrato: sine wave at 5.5 Hz ±25¢, same frame count as actual
+  const idealCents = Array.from({ length: cents.length }, (_, i) =>
+    IDEAL_DEPTH_CENTS * Math.sin(2 * Math.PI * IDEAL_RATE_HZ * (i / PITCH_HOP_HZ)),
+  );
+  const idealPath = buildSegmentPath(idealCents, GRAPH_W, GRAPH_H);
+
+  return (
+    <View style={styles.segGraph}>
+      <Svg width={GRAPH_W} height={GRAPH_H}>
+        <Line x1={0} y1={yAt(40)}  x2={GRAPH_W} y2={yAt(40)}  stroke="rgba(255,255,255,0.06)" strokeWidth={1} />
+        <Line x1={0} y1={yAt(20)}  x2={GRAPH_W} y2={yAt(20)}  stroke="rgba(255,255,255,0.10)" strokeWidth={1} />
+        <Line x1={0} y1={cy}       x2={GRAPH_W} y2={cy}        stroke="rgba(255,255,255,0.28)" strokeWidth={1} />
+        <Line x1={0} y1={yAt(-20)} x2={GRAPH_W} y2={yAt(-20)} stroke="rgba(255,255,255,0.10)" strokeWidth={1} />
+        <Line x1={0} y1={yAt(-40)} x2={GRAPH_W} y2={yAt(-40)} stroke="rgba(255,255,255,0.06)" strokeWidth={1} />
+        {idealPath ? <Path d={idealPath} stroke="rgba(250,180,50,0.35)" strokeWidth={2} fill="none" strokeDasharray="6,4" strokeLinejoin="round" strokeLinecap="round" /> : null}
+        {path ? <Path d={path} stroke="rgba(100,210,255,0.9)" strokeWidth={2} fill="none" strokeLinejoin="round" strokeLinecap="round" /> : null}
+      </Svg>
+      <View style={styles.segGraphLabels}>
+        <Text style={styles.segGraphLabel}>+{GRAPH_RANGE}¢</Text>
+        <Text style={styles.segGraphLabel}>0</Text>
+        <Text style={styles.segGraphLabel}>−{GRAPH_RANGE}¢</Text>
+      </View>
+    </View>
+  );
+}
+
+function VibratoDebugCard({ score, vibrato, onSegmentPress }: {
+  score: MetricScore | undefined;
+  vibrato: AudioDebugInfo['vibrato'];
+  onSegmentPress?: (startS: number, endS: number) => void;
+}) {
+  const [selectedSeg, setSelectedSeg] = useState(0);
+  const activeNote = vibrato.notes[selectedSeg];
+
+  return (
+    <View style={styles.metricCard}>
+      <View style={styles.metricHeader}>
+        <Text style={styles.metricLabel}>Vibrato</Text>
+        {score && (
+          <View style={[styles.scoreBadge, { backgroundColor: severityColor(score.severity) }]}>
+            <Text style={styles.scoreBadgeText}>{score.score}  {score.severity}</Text>
+          </View>
+        )}
+      </View>
+      <Row label="Notes detected" value={String(vibrato.notes.length)} />
+      <Row label="Eligible (≥0.5s)" value={String(vibrato.eligibleSegments)} />
+      <Row label="Avg note score" value={String(vibrato.avgNoteScore)} />
+      {vibrato.notes.length > 0 && (
+        <View style={styles.segTable}>
+          <View style={styles.segHeader}>
+            <Text style={[styles.segCell, styles.segCellLabel]}>#</Text>
+            <Text style={[styles.segCell, styles.segCellStart]}>@ s</Text>
+            <Text style={[styles.segCell, styles.segCellDur]}>dur</Text>
+            <Text style={[styles.segCell, styles.segCellRate]}>rate</Text>
+            <Text style={[styles.segCell, styles.segCellDepth]}>depth</Text>
+            <Text style={[styles.segCell, styles.segCellAC]}>AC</Text>
+            <Text style={[styles.segCell, styles.segCellCons]}>cons</Text>
+            <Text style={styles.segCellPass}>score</Text>
+          </View>
+          {vibrato.notes.map((note, i) => (
+            <View key={i}>
+              <Pressable
+                onPress={() => { setSelectedSeg(i); onSegmentPress?.(note.startS, note.endS); }}
+                style={[styles.segRow, i === selectedSeg && styles.segRowSelected, !note.eligible && styles.segRowIneligible]}
+              >
+                <Text style={[styles.segCell, styles.segCellLabel, i === selectedSeg && styles.segCellActive]}>{i + 1}</Text>
+                <Text style={[styles.segCell, styles.segCellStart, i === selectedSeg && styles.segCellActive]}>{note.startS}s</Text>
+                <Text style={[styles.segCell, styles.segCellDur, i === selectedSeg && styles.segCellActive]}>{note.durationS}s</Text>
+                {note.eligible ? (
+                  <>
+                    <Text style={[styles.segCell, styles.segCellRate, i === selectedSeg && styles.segCellActive]}>{note.rateHz} Hz</Text>
+                    <Text style={[styles.segCell, styles.segCellDepth, i === selectedSeg && styles.segCellActive]}>{note.depthCents}¢</Text>
+                    <Text style={[styles.segCell, styles.segCellAC, i === selectedSeg && styles.segCellActive]}>{note.periodicityScore.toFixed(2)}</Text>
+                    <Text style={[styles.segCell, styles.segCellCons, { color: note.consistencyOk ? '#4ade80' : '#f87171' }]}>
+                      {note.consistencyOk ? '✓' : '✗'}
+                    </Text>
+                    <Text style={[styles.segCellPass, { color: note.noteScore >= 75 ? '#4ade80' : note.noteScore >= 40 ? '#fbbf24' : '#f87171' }]}>
+                      {note.noteScore}
+                    </Text>
+                  </>
+                ) : (
+                  <>
+                    <Text style={[styles.segCell, styles.segCellRate, styles.segCellDim]}>—</Text>
+                    <Text style={[styles.segCell, styles.segCellDepth, styles.segCellDim]}>—</Text>
+                    <Text style={[styles.segCell, styles.segCellAC, styles.segCellDim]}>—</Text>
+                    <Text style={[styles.segCell, styles.segCellCons, styles.segCellDim]}>—</Text>
+                    <Text style={[styles.segCellPass, styles.segCellDim]}>short</Text>
+                  </>
+                )}
+              </Pressable>
+              {note.feedbackNotes.map((fb, fi) => (
+                <Text key={fi} style={styles.segFeedbackNote}>{fb}</Text>
+              ))}
+            </View>
+          ))}
+        </View>
+      )}
+      {activeNote?.eligible && activeNote.cents.length > 1 && (
+        <View style={{ marginTop: 10 }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+            <Text style={styles.segGraphTitle}>
+              Note {selectedSeg + 1} — {activeNote.startS}s–{activeNote.endS}s — pitch (¢ from median)
+            </Text>
+            <View style={{ flexDirection: 'row', gap: 10 }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+                <View style={{ width: 14, height: 2, backgroundColor: 'rgba(100,210,255,0.9)' }} />
+                <Text style={styles.segGraphLabel}>actual</Text>
+              </View>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+                <View style={{ width: 14, height: 2, backgroundColor: 'rgba(250,180,50,0.6)' }} />
+                <Text style={styles.segGraphLabel}>ideal</Text>
+              </View>
+            </View>
+          </View>
+          <SegmentPitchGraph cents={activeNote.cents} />
+        </View>
+      )}
+    </View>
+  );
+}
+
 function Row({ label, value }: { label: string; value: string }) {
   return (
     <View style={styles.row}>
@@ -243,6 +428,14 @@ const styles = StyleSheet.create({
   subtitle: { fontSize: 12, color: 'rgba(255,255,255,0.4)', marginTop: 2 },
   scroll: { flex: 1 },
   scrollContent: { padding: spacing.lg, gap: spacing.sm, paddingBottom: 40 },
+
+  videoPlayer: {
+    width: '100%',
+    height: 220,
+    backgroundColor: '#000',
+    borderRadius: radius.md,
+    overflow: 'hidden',
+  },
 
   pickBtn: {
     backgroundColor: colors.brand[600],
@@ -290,6 +483,28 @@ const styles = StyleSheet.create({
   row: { flexDirection: 'row', justifyContent: 'space-between', gap: spacing.sm },
   rowLabel: { fontSize: 12, color: 'rgba(255,255,255,0.45)', flex: 1 },
   rowValue: { fontSize: 12, color: 'rgba(255,255,255,0.85)', fontVariant: ['tabular-nums'], textAlign: 'right', flexShrink: 0 },
+
+  segTable: { marginTop: 8, borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.08)', paddingTop: 6, gap: 3 },
+  segHeader: { flexDirection: 'row', marginBottom: 2 },
+  segRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 2, paddingHorizontal: 4, borderRadius: 4 },
+  segRowSelected: { backgroundColor: 'rgba(100,210,255,0.10)' },
+  segRowIneligible: { opacity: 0.5 },
+  segCellDim: { color: 'rgba(255,255,255,0.25)' },
+  segCell: { fontSize: 11, fontVariant: ['tabular-nums'] },
+  segCellActive: { color: 'rgba(100,210,255,0.95)' },
+  segCellLabel: { width: 20, color: 'rgba(255,255,255,0.35)' },
+  segCellStart: { width: 44, color: 'rgba(255,255,255,0.6)' },
+  segCellDur: { width: 40, color: 'rgba(255,255,255,0.6)' },
+  segCellRate: { width: 56, color: 'rgba(255,255,255,0.6)' },
+  segCellDepth: { width: 40, color: 'rgba(255,255,255,0.6)' },
+  segCellAC: { width: 36, color: 'rgba(255,255,255,0.6)' },
+  segCellCons: { width: 20, fontWeight: '700' },
+  segCellPass: { fontSize: 11, fontWeight: '700' },
+  segFeedbackNote: { fontSize: 10, color: 'rgba(255,200,100,0.7)', fontStyle: 'italic', marginLeft: 24, marginBottom: 3 },
+  segGraphTitle: { fontSize: 10, color: 'rgba(255,255,255,0.35)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 },
+  segGraph: { position: 'relative' },
+  segGraphLabels: { position: 'absolute', right: -28, top: 0, bottom: 0, justifyContent: 'space-between', paddingVertical: 8 },
+  segGraphLabel: { fontSize: 9, color: 'rgba(255,255,255,0.3)', fontVariant: ['tabular-nums'] },
 
   shareBtn: {
     borderWidth: 1,

@@ -1,18 +1,25 @@
 import { create } from 'zustand';
-import { persist, createJSONStorage } from 'zustand/middleware';
+import { persist, createJSONStorage, StateStorage } from 'zustand/middleware';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { AnalysisResult, MetricScore, SessionSummary } from '../types/analysis';
 import { Piece } from '../types/piece';
+
+// Wraps AsyncStorage so full-device errors are swallowed rather than crashing.
+const safeStorage: StateStorage = {
+  getItem: (name) => AsyncStorage.getItem(name).catch(() => null),
+  setItem: (name, value) => AsyncStorage.setItem(name, value).catch(() => {}),
+  removeItem: (name) => AsyncStorage.removeItem(name).catch(() => {}),
+};
 
 // In-memory cache of full results keyed by session ID.
 // Not persisted — rebuilt from currentResult + sessionHistory on load.
 type SessionResultCache = Record<string, AnalysisResult>;
 
 export type AnalysisPhase =
-  | 'piece_input'      // step 1 — type the song name + optional sheet music
-  | 'method_select'    // step 2 — choose record in-app or upload video
+  | 'piece_input'        // step 1 — type the song name + optional sheet music
+  | 'method_select'      // step 2 — choose record in-app or upload video
   | 'camera_tip'       // step 2b — camera position guide before live recording
-  | 'calibrating'      // step 2c — 8s wrist baseline calibration
+  | 'calibrating'      // legacy — no longer used
   | 'recording'
   | 'processing_audio'
   | 'processing_video'
@@ -83,7 +90,7 @@ export const useAnalysisStore = create<AnalysisState>()(
     }),
     {
       name: 'stringai-analysis-v1',
-      storage: createJSONStorage(() => AsyncStorage),
+      storage: createJSONStorage(() => safeStorage),
       // Only persist state that must survive navigation and app restarts.
       // sessionResultCache is omitted (in-memory cache, can be large).
       // recordingUri/selectedPiece/error are transient.

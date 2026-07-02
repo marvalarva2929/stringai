@@ -17,12 +17,12 @@ import { Button } from '../src/components/ui/Button';
 type Plan = 'monthly' | 'annual';
 
 const FEATURES = [
-  '✅  Unlimited analyses',
-  '✅  Full session history',
-  '✅  13 detailed metrics',
-  '✅  Progress charts & milestones',
-  '✅  Bow & posture video analysis',
-  '✅  Personalized practice tips',
+  'Unlimited analyses',
+  'Full session history',
+  '13 detailed metrics',
+  'Progress charts & milestones',
+  'Bow & posture video analysis',
+  'Personalized practice tips',
 ];
 
 export default function Paywall() {
@@ -74,33 +74,48 @@ export default function Paywall() {
           {/* Feature list */}
           <View style={styles.features}>
             {FEATURES.map((f) => (
-              <Text key={f} style={styles.feature}>{f}</Text>
+              <View key={f} style={styles.featureRow}>
+                <View style={styles.featureCheck}>
+                  <Text style={styles.featureCheckText}>✓</Text>
+                </View>
+                <Text style={styles.feature}>{f}</Text>
+              </View>
             ))}
           </View>
 
           {/* Plan picker */}
           <View style={styles.plans}>
             <Pressable
-              style={[styles.planCard, selectedPlan === 'annual' && styles.planCardSelected]}
+              style={[styles.planCard, selectedPlan !== 'annual' && styles.planCardDimmed]}
               onPress={() => setSelectedPlan('annual')}
             >
-              <View style={styles.planCardInner}>
+              <View style={[styles.planCardInner, selectedPlan === 'annual' && styles.planCardInnerSelected]}>
+                {selectedPlan === 'annual' && (
+                  <View style={styles.planSelectedMark}>
+                    <Text style={styles.planSelectedMarkText}>✓</Text>
+                  </View>
+                )}
                 <View style={styles.planBadge}>
                   <Text style={styles.planBadgeText}>Best Value</Text>
                 </View>
                 <Text style={styles.planName}>Annual</Text>
-                <Text style={styles.planPrice}>$59.99</Text>
+                <Text style={[styles.planPrice, selectedPlan === 'annual' && styles.planPriceSelected]}>$59.99</Text>
                 <Text style={styles.planPer}>per year — just $5/mo</Text>
               </View>
             </Pressable>
 
             <Pressable
-              style={[styles.planCard, selectedPlan === 'monthly' && styles.planCardSelected]}
+              style={[styles.planCard, selectedPlan !== 'monthly' && styles.planCardDimmed]}
               onPress={() => setSelectedPlan('monthly')}
             >
-              <View style={styles.planCardInner}>
+              <View style={[styles.planCardInner, selectedPlan === 'monthly' && styles.planCardInnerSelected]}>
+                {selectedPlan === 'monthly' && (
+                  <View style={styles.planSelectedMark}>
+                    <Text style={styles.planSelectedMarkText}>✓</Text>
+                  </View>
+                )}
                 <Text style={styles.planName}>Monthly</Text>
-                <Text style={styles.planPrice}>$9.99</Text>
+                <Text style={[styles.planPrice, selectedPlan === 'monthly' && styles.planPriceSelected]}>$9.99</Text>
                 <Text style={styles.planPer}>per month</Text>
               </View>
             </Pressable>
@@ -156,16 +171,31 @@ const styles = StyleSheet.create({
   heroSubtitle: { fontSize: 15, color: 'rgba(255,255,255,0.75)', marginTop: spacing.sm, textAlign: 'center' },
   content: { padding: spacing.xl, gap: spacing.lg },
   features: { gap: 10 },
-  feature: { fontSize: 15, color: colors.text.primary, lineHeight: 22 },
+  featureRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 10 },
+  featureCheck: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: colors.brand[100],
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 2,
+    flexShrink: 0,
+  },
+  featureCheckText: { color: colors.brand[600], fontSize: 12, fontWeight: '800' },
+  feature: { fontSize: 15, color: colors.text.primary, lineHeight: 22, flex: 1 },
   plans: { flexDirection: 'row', gap: spacing.sm },
   planCard: {
     flex: 1,
     borderRadius: radius.lg,
     borderWidth: 2,
-    borderColor: '#e5e7eb',
+    borderColor: colors.brand[600],
     overflow: 'hidden',
   },
-  planCardSelected: { borderColor: colors.brand[600] },
+  planCardDimmed: {
+    borderColor: '#e5e7eb',
+    opacity: 0.7,
+  },
   planCardInner: {
     padding: spacing.md,
     backgroundColor: '#fff',
@@ -174,6 +204,22 @@ const styles = StyleSheet.create({
     minHeight: 130,
     justifyContent: 'center',
   },
+  planCardInnerSelected: {
+    backgroundColor: colors.brand[50],
+  },
+  planSelectedMark: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: colors.brand[600],
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  planSelectedMarkText: { color: '#fff', fontSize: 11, fontWeight: '800' },
+  planPriceSelected: { fontWeight: '800' },
   planBadge: {
     backgroundColor: colors.brand[600],
     borderRadius: 12,

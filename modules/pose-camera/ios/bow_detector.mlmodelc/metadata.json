@@ -1,0 +1,94 @@
+[
+  {
+    "shortDescription" : "Ultralytics YOLOv8s-pose model trained on \/Users\/joshv\/Projects\/stringai\/ml\/data.yaml",
+    "metadataOutputVersion" : "3.0",
+    "outputSchema" : [
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float32",
+        "formattedType" : "MultiArray (Float32 1 × 14 × 8400)",
+        "shortDescription" : "",
+        "shape" : "[1, 14, 8400]",
+        "name" : "var_1031",
+        "type" : "MultiArray"
+      }
+    ],
+    "version" : "8.4.71",
+    "modelParameters" : [
+
+    ],
+    "author" : "Ultralytics",
+    "specificationVersion" : 7,
+    "storagePrecision" : "Mixed (Float16, Palettized (8 bits))",
+    "license" : "AGPL-3.0 License (https:\/\/ultralytics.com\/license)",
+    "mlProgramOperationTypeHistogram" : {
+      "Concat" : 19,
+      "Ios16.cast" : 2,
+      "Ios16.mul" : 5,
+      "SliceByIndex" : 2,
+      "Ios16.constexprLutToDense" : 69,
+      "Transpose" : 1,
+      "Ios16.sub" : 2,
+      "Ios16.maxPool" : 3,
+      "UpsampleNearestNeighbor" : 2,
+      "Ios16.conv" : 73,
+      "Ios16.add" : 9,
+      "Ios16.sigmoid" : 2,
+      "Ios16.softmax" : 1,
+      "Split" : 9,
+      "Ios16.reshape" : 13,
+      "Ios16.silu" : 62
+    },
+    "computePrecision" : "Mixed (Float16, Float32, Int32)",
+    "stateSchema" : [
+
+    ],
+    "isUpdatable" : "0",
+    "availability" : {
+      "macOS" : "13.0",
+      "tvOS" : "16.0",
+      "visionOS" : "1.0",
+      "watchOS" : "9.0",
+      "iOS" : "16.0",
+      "macCatalyst" : "16.0"
+    },
+    "modelType" : {
+      "name" : "MLModelType_mlProgram"
+    },
+    "inputSchema" : [
+      {
+        "height" : "640",
+        "colorspace" : "RGB",
+        "isOptional" : "0",
+        "width" : "640",
+        "isColor" : "1",
+        "formattedType" : "Image (Color 640 × 640)",
+        "hasSizeFlexibility" : "0",
+        "type" : "Image",
+        "shortDescription" : "",
+        "name" : "image"
+      }
+    ],
+    "userDefinedMetadata" : {
+      "batch" : "1",
+      "docs" : "https:\/\/docs.ultralytics.com",
+      "com.github.apple.coremltools.version" : "9.0",
+      "imgsz" : "[640, 640]",
+      "kpt_names" : "{0: ['0', '1', '2']}",
+      "names" : "{0: 'bow'}",
+      "channels" : "3",
+      "com.github.apple.coremltools.conversion_date" : "2026-06-25",
+      "stride" : "32",
+      "date" : "2026-06-25T13:04:22.780367",
+      "args" : "{'batch': 1, 'half': False, 'int8': True, 'dynamic': False, 'nms': True}",
+      "com.github.apple.coremltools.source_dialect" : "TorchScript",
+      "com.github.apple.coremltools.source" : "torch==2.8.0",
+      "kpt_shape" : "[3, 3]",
+      "task" : "pose",
+      "end2end" : "False"
+    },
+    "generatedClassName" : "bow_detector",
+    "method" : "predict"
+  }
+]

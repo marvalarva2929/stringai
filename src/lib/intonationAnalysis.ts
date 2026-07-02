@@ -41,7 +41,7 @@ interface NoteEvent {
 // Violinists read sharps, not flats — use the sharp spelling throughout.
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
 
-function frequencyToNoteInfo(hz: number): {
+export function frequencyToNoteInfo(hz: number): {
   pitchClass: string;
   octave: number;
   noteName: string;

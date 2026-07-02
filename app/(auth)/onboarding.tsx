@@ -12,7 +12,10 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { router } from 'expo-router';
 import { useAuthStore } from '../../src/store/useAuthStore';
 import { OnboardingSlide, SlideData } from '../../src/components/onboarding/OnboardingSlide';
-import { Button } from '../../src/components/ui/Button';
+import { Ionicons, FontAwesome6, MaterialCommunityIcons } from '@expo/vector-icons';
+import { BigButton } from '../../src/components/ui/BigButton';
+import { MaestroAvatar } from '../../src/components/ui/MaestroAvatar';
+import { haptic } from '../../src/lib/haptics';
 import { colors, spacing, radius } from '../../src/constants/theme';
 import { PlayerCategory } from '../../src/types/analysis';
 
@@ -20,29 +23,37 @@ const { width } = Dimensions.get('window');
 
 const INFO_SLIDES: SlideData[] = [
   {
-    emoji: '🎻',
+    icon: <Ionicons name="musical-notes" size={72} color="rgba(255,255,255,0.9)" />,
     title: 'Meet Your AI\nViolin Teacher',
     subtitle: 'Real feedback, anytime.',
     body: 'StringAI listens to your playing and shows you exactly what to improve — no lesson required.',
   },
   {
-    emoji: '🔬',
+    icon: <Ionicons name="search" size={72} color="rgba(255,255,255,0.9)" />,
     title: 'How It Works',
     subtitle: 'Record → Analyze → Improve',
     body: 'Record a 30–90 second clip of yourself playing. StringAI analyzes your intonation, tone, bow technique, rhythm, and posture.',
   },
   {
-    emoji: '📊',
+    icon: <Ionicons name="bar-chart" size={72} color="rgba(255,255,255,0.9)" />,
     title: 'What We Measure',
     subtitle: '13 metrics. Real science.',
     body: 'Pitch accuracy, tone quality, bow placement, bow angle, bow smoothness, vibrato, rhythm, dynamics, posture, and more.',
   },
   {
-    emoji: '📈',
+    icon: <Ionicons name="trending-up" size={72} color="rgba(255,255,255,0.9)" />,
     title: 'Track Your Progress',
     subtitle: 'See yourself getting better.',
     body: 'Every session is scored. Watch your charts improve week over week and unlock milestones as you grow.',
   },
+];
+
+const SLIDE_MESSAGES = [
+  "Hi! I'm Maestro, your AI violin coach",
+  "I'll watch your technique frame by frame.",
+  "You'll get a real score on 13 metrics.",
+  "Every session, you'll see yourself improve!",
+  "What's your main goal right now?",
 ];
 
 // Total slide count includes the goal-picker as the last slide
@@ -51,19 +62,19 @@ const GOAL_SLIDE_INDEX = INFO_SLIDES.length;
 
 const GOALS: Array<{
   category: PlayerCategory;
-  emoji: string;
+  icon: React.ReactNode;
   title: string;
   description: string;
 }> = [
   {
     category: 'foundation',
-    emoji: '🎓',
+    icon: <Ionicons name="school" size={36} color="rgba(255,255,255,0.85)" />,
     title: 'Learn the Fundamentals',
     description: "I'm building my technique from scratch. Help me develop correct posture, bow hold, and form.",
   },
   {
     category: 'refinement',
-    emoji: '🎯',
+    icon: <FontAwesome6 name="bullseye" size={36} color="rgba(255,255,255,0.85)" />,
     title: 'Improve My Playing',
     description: 'I know the basics and want to get better. Help me refine technique and learn new music.',
   },
@@ -80,6 +91,7 @@ export default function Onboarding() {
   const canAdvance = !isGoalSlide || selectedGoal !== null;
 
   const advance = async () => {
+    haptic.light();
     if (isLast) {
       if (selectedGoal) await setPlayerCategory(selectedGoal);
       setOnboardingComplete();
@@ -109,6 +121,13 @@ export default function Onboarding() {
       colors={[colors.brand[900], colors.brand[700], colors.brand[500]]}
       style={styles.container}
     >
+      {/* Skip button — fixed top-right so it's always visible */}
+      {!isLast && (
+        <Pressable onPress={skip} style={styles.skipBtnFixed}>
+          <Text style={styles.skipText}>Skip</Text>
+        </Pressable>
+      )}
+
       {/* Info slides (1–4) rendered in FlatList; goal slide rendered separately */}
       {!isGoalSlide ? (
         <FlatList
@@ -130,6 +149,13 @@ export default function Onboarding() {
       )}
 
       <View style={styles.footer}>
+        <MaestroAvatar
+          key={currentIndex}
+          size="sm"
+          message={SLIDE_MESSAGES[currentIndex]}
+          bounce={currentIndex === 0}
+          bubblePosition="above"
+        />
         <View style={styles.dots}>
           {Array.from({ length: TOTAL_SLIDES }).map((_, i) => (
             <View
@@ -138,20 +164,13 @@ export default function Onboarding() {
             />
           ))}
         </View>
+        <Text style={styles.dotCounter}>{currentIndex + 1} of {TOTAL_SLIDES}</Text>
 
-        <Button
-          label={isLast ? 'Get Started' : 'Next'}
+        <BigButton
+          label={isLast ? 'Get Started' : 'Continue'}
           onPress={advance}
-          size="lg"
-          fullWidth
           disabled={!canAdvance}
         />
-
-        {!isLast && (
-          <Pressable onPress={skip} style={styles.skipBtn}>
-            <Text style={styles.skipText}>Skip</Text>
-          </Pressable>
-        )}
       </View>
     </LinearGradient>
   );
@@ -181,9 +200,9 @@ function GoalPickerSlide({
           <Pressable
             key={goal.category}
             style={[styles.goalCard, isSelected && styles.goalCardSelected]}
-            onPress={() => onSelect(goal.category)}
+            onPress={() => { haptic.medium(); onSelect(goal.category); }}
           >
-            <Text style={styles.goalEmoji}>{goal.emoji}</Text>
+            <View style={styles.goalIconWrap}>{goal.icon}</View>
             <View style={styles.goalCardText}>
               <Text style={[styles.goalCardTitle, isSelected && styles.goalCardTitleSelected]}>
                 {goal.title}
@@ -192,7 +211,11 @@ function GoalPickerSlide({
                 {goal.description}
               </Text>
             </View>
-            {isSelected && <Text style={styles.goalCheckmark}>✓</Text>}
+            {isSelected && (
+              <View style={styles.goalCheckCircle}>
+                <Text style={styles.goalCheckmark}>✓</Text>
+              </View>
+            )}
           </Pressable>
         );
       })}
@@ -224,8 +247,9 @@ const styles = StyleSheet.create({
     width: 24,
     backgroundColor: '#fff',
   },
-  skipBtn: { marginTop: spacing.md, alignItems: 'center' },
+  skipBtnFixed: { position: 'absolute', top: 56, right: 20, zIndex: 10, padding: 8 },
   skipText: { color: 'rgba(255,255,255,0.65)', fontSize: 13 },
+  dotCounter: { textAlign: 'center', fontSize: 11, color: 'rgba(255,255,255,0.5)', marginTop: -spacing.sm, marginBottom: spacing.lg },
 
   // Goal picker
   goalSlide: {
@@ -262,8 +286,10 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(255,255,255,0.18)',
     borderColor: '#fff',
   },
-  goalEmoji: {
-    fontSize: 36,
+  goalIconWrap: {
+    width: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   goalCardText: {
     flex: 1,
@@ -285,9 +311,17 @@ const styles = StyleSheet.create({
   goalCardDescSelected: {
     color: 'rgba(255,255,255,0.8)',
   },
+  goalCheckCircle: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   goalCheckmark: {
-    fontSize: 20,
-    color: '#fff',
-    fontWeight: '700',
+    fontSize: 13,
+    color: colors.brand[600],
+    fontWeight: '800',
   },
 });

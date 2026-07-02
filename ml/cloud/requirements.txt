@@ -1,0 +1,7 @@
+# torch/torchvision are already installed on RunPod PyTorch templates — don't reinstall.
+transformers>=4.57.1
+accelerate
+gradio>=4.44
+pillow
+numpy
+opencv-python-headless

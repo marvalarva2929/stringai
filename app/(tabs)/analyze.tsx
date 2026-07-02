@@ -7,15 +7,17 @@ import {
   Pressable,
   Alert,
   ActivityIndicator,
+  Animated,
+  Easing,
   ScrollView,
   TextInput,
   KeyboardAvoidingView,
   Platform,
   useWindowDimensions,
-  Animated,
-  PanResponder,
-  Dimensions,
+  Modal,
 } from 'react-native';
+import RAnimated, { useSharedValue, useAnimatedStyle, withTiming, FadeInRight } from 'react-native-reanimated';
+import { Ionicons } from '@expo/vector-icons';
 import { CameraView, useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
 import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
@@ -30,18 +32,24 @@ import { runAudioAnalysis, runVideoAnalysis, computeOverallScore, saveSession, s
 import { AnalysisTimeline } from '../../src/components/analysis/AnalysisTimeline';
 import { CoachingReport } from '../../src/components/analysis/CoachingReport';
 import { InlineVideoPlayer } from '../../src/components/analysis/InlineVideoPlayer';
+import { ResultsCarousel } from '../../src/components/analysis/ResultsCarousel';
 import { Button } from '../../src/components/ui/Button';
+import { BigButton } from '../../src/components/ui/BigButton';
+import { MaestroAvatar } from '../../src/components/ui/MaestroAvatar';
+import { haptic } from '../../src/lib/haptics';
 import { colors, spacing, radius } from '../../src/constants/theme';
 import { AnalysisResult, MetricScore } from '../../src/types/analysis';
 import { buildSessionAssessment } from '../../src/lib/sessionAssessment';
 import { Piece } from '../../src/types/piece';
 import { INSTRUMENTS } from '../../src/constants/instruments';
 import { PoseSkeleton, PoseJoint, PoseJoints, HandLandmarks, LEFT_HAND_COLOR, RIGHT_HAND_COLOR } from '../../src/components/analysis/PoseSkeleton';
-import { startRecording as poseStartRecording, stopRecording as poseStopRecording, getPoseCameraView } from 'pose-camera';
+import { startRecording as poseStartRecording, stopRecording as poseStopRecording, getPoseCameraView, setHomeIndicatorHidden } from 'pose-camera';
 import { FrameKeypoints } from '../../src/lib/poseScoring';
 import { convertPoseFrame } from '../../src/services/videoAnalysis';
+import { RawBowFrame } from '../../src/types/signals';
 import { fuseSignals, debugLogNoteEvents, deriveIntonationAnalysis } from '../../src/lib/noteFusion';
-import Svg, { Circle, Line, G, Rect } from 'react-native-svg';
+import { classifyVibratoSegment } from '../../src/services/pitchContour';
+import Svg, { Circle, Line, G, Rect, Path, Polygon, Text as SvgText } from 'react-native-svg';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 // Positional thresholds (normalized 0–1 frame coordinates, y increases downward)
@@ -105,7 +113,9 @@ function emaJoint(prev: PoseJoint | undefined, next: PoseJoint, alpha: number): 
     x: prev.x * (1 - alpha) + next.x * alpha,
     y: prev.y * (1 - alpha) + next.y * alpha,
     confidence: next.confidence,
-    wx: next.wx, wy: next.wy, wz: next.wz,
+    wx: (prev.wx != null && next.wx != null) ? prev.wx * (1 - alpha) + next.wx * alpha : next.wx,
+    wy: (prev.wy != null && next.wy != null) ? prev.wy * (1 - alpha) + next.wy * alpha : next.wy,
+    wz: (prev.wz != null && next.wz != null) ? prev.wz * (1 - alpha) + next.wz * alpha : next.wz,
   };
 }
 
@@ -130,20 +140,65 @@ function emaHand(prev: HandLandmarks | null, next: HandLandmarks | null, alpha: 
   };
 }
 
-// Interior angle at the left wrist (elbow→wrist→indexMCP), aspect-ratio corrected.
+// Interior angle at the left wrist using Pose Landmarker world coords (body-global frame).
+// All three landmarks — elbow, wrist, indexTip — come from the same coordinate frame so
+// no palm gate is needed and the angle is camera-angle-independent.
+// Falls back to 2D image-space projection when world coords are absent.
 function liveWristAngle(
   joints: PoseJoints,
-  hand: HandLandmarks | null,
+  _hand: HandLandmarks | null,
 ): number | null {
-  const elbow = joints.leftElbow;
-  const wrist = hand?.wrist;
-  const mcp   = hand?.indexMCP;
-  if (!elbow || !wrist || !mcp) return null;
+  return liveWristDebugData(joints).angle;
+}
+
+type WristDebug = {
+  angle: number | null;
+  mode: '3D' | '2D' | 'nodata';
+  magF: number | null;   // forearm vector length (cm)
+  magH: number | null;   // hand vector length (cm)
+  cosA: number | null;   // dot/(|FA||H|) — cos of angle
+  tx: number | null; ty: number | null; tz: number | null; // indexTip world (cm)
+};
+
+function liveWristDebugData(joints: PoseJoints): WristDebug {
+  const none: WristDebug = { angle: null, mode: 'nodata', magF: null, magH: null, cosA: null, tx: null, ty: null, tz: null };
+  const elbow    = joints.leftElbow;
+  const wrist    = joints.leftWrist;
+  const indexTip = joints.leftIndexTip;
+  if (!elbow || !wrist || !indexTip) return none;
+
+  if (elbow.wx != null && wrist.wx != null && indexTip.wx != null) {
+    const fax = elbow.wx - wrist.wx, fay = (elbow.wy ?? 0) - (wrist.wy ?? 0), faz = (elbow.wz ?? 0) - (wrist.wz ?? 0);
+    const hx = indexTip.wx - wrist.wx, hy = (indexTip.wy ?? 0) - (wrist.wy ?? 0), hz = (indexTip.wz ?? 0) - (wrist.wz ?? 0);
+    const magF = Math.sqrt(fax * fax + fay * fay + faz * faz);
+    const magH = Math.sqrt(hx * hx + hy * hy + hz * hz);
+    if (magF < 0.0001 || magH < 0.0001) return none;
+    const cosA = Math.max(-1, Math.min(1, (fax * hx + fay * hy + faz * hz) / (magF * magH)));
+    return {
+      angle: (Math.acos(cosA) * 180) / Math.PI,
+      mode: '3D',
+      magF: Math.round(magF * 100),  // m → cm
+      magH: Math.round(magH * 100),
+      cosA: Math.round(cosA * 100) / 100,
+      tx: Math.round((indexTip.wx ?? 0) * 100),
+      ty: Math.round((indexTip.wy ?? 0) * 100),
+      tz: Math.round((indexTip.wz ?? 0) * 100),
+    };
+  }
+
+  // 2D fallback: aspect-ratio-corrected image-space angle.
   const abx = (elbow.x - wrist.x) * FRAME_ASPECT_RATIO, aby = elbow.y - wrist.y;
-  const cbx = (mcp.x   - wrist.x) * FRAME_ASPECT_RATIO, cby = mcp.y   - wrist.y;
+  const cbx = (indexTip.x - wrist.x) * FRAME_ASPECT_RATIO, cby = indexTip.y - wrist.y;
   const mag = Math.sqrt((abx * abx + aby * aby) * (cbx * cbx + cby * cby));
-  if (mag < 0.0001) return null;
-  return (Math.acos(Math.max(-1, Math.min(1, (abx * cbx + aby * cby) / mag))) * 180) / Math.PI;
+  if (mag < 0.0001) return none;
+  const cosA = Math.max(-1, Math.min(1, (abx * cbx + aby * cby) / mag));
+  return {
+    angle: (Math.acos(cosA) * 180) / Math.PI,
+    mode: '2D',
+    magF: null, magH: null,
+    cosA: Math.round(cosA * 100) / 100,
+    tx: null, ty: null, tz: null,
+  };
 }
 
 function evaluatePoseWarnings(
@@ -221,11 +276,7 @@ function computeDebugMetrics(
   };
 }
 
-// Bottom-drawer snap points (computed once from current screen dimensions)
-const _SCREEN_H = Dimensions.get('window').height;
-const DRAWER_DEFAULT_H = Math.round(_SCREEN_H * 0.55);
-const DRAWER_MAX_H    = Math.round(_SCREEN_H * 0.85);
-const DRAWER_MIN_H    = Math.round(_SCREEN_H * 0.25);
+// DRAWER_DEFAULT_H is computed inside the component from useWindowDimensions (see below)
 
 // ─── Audio quality heuristic ─────────────────────────────────────────────────
 // Uses three signals already present in rawSignals:
@@ -297,17 +348,270 @@ async function persistVideo(tempUri: string): Promise<string> {
 }
 
 const PHASE_LABELS: Record<string, string> = {
-  processing_audio: 'Analyzing pitch & tone…',
-  processing_video: 'Checking bow placement…',
-  uploading: 'Saving session…',
+  processing_audio: 'Analyzing pitch & tone',
+  processing_video: 'Checking bow placement',
+  uploading: 'Saving session',
 };
+
+const PROCESSING_PHASES = ['processing_audio', 'processing_video', 'uploading'] as const;
+const PHASE_DURATIONS: Record<string, number> = {
+  processing_audio: 15000,
+  processing_video: 15000,
+  uploading: 4000,
+};
+
+// ── Pitch graph helpers ──────────────────────────────────────────────────────
+
+const GRAPH_W = 440;
+const GRAPH_H = 110;
+const GRAPH_CENTS_RANGE = 60;  // ± cents shown (one semitone)
+
+function vibratoScoreFromPitchHistory(hz: number[]): number {
+  if (hz.length < 12) return 0;
+
+  // Segment on large pitch jumps (>100 cents) — same threshold as scoreVibrato in audioEngine
+  const segments: number[][] = [];
+  let cur: number[] = [hz[0]];
+  for (let i = 1; i < hz.length; i++) {
+    const jump = Math.abs(1200 * Math.log2(hz[i] / hz[i - 1]));
+    if (jump > 100) { segments.push(cur); cur = [hz[i]]; }
+    else cur.push(hz[i]);
+  }
+  segments.push(cur);
+
+  // Eligible: ≥ 6 points = ≥ 300ms at 20Hz
+  const eligible = segments.filter(s => s.length >= 6);
+  if (eligible.length === 0) return 0;
+
+  let vibratoCount = 0;
+  for (const seg of eligible) {
+    const sorted = [...seg].sort((a, b) => a - b);
+    const medianFreq = sorted[Math.floor(sorted.length / 2)];
+    const devs = seg.map(f => 1200 * Math.log2(f / medianFreq));
+    if (classifyVibratoSegment(devs, 20).isVibrato) vibratoCount++;
+  }
+
+  const ratio = vibratoCount / eligible.length;
+  return Math.round(ratio >= 0.6 ? 70 + ratio * 30 : ratio * 70);
+}
+
+function buildPitchPath(history: (number | null)[], w: number, h: number): string {
+  const nonNull = history.filter(v => v !== null) as number[];
+  if (nonNull.length < 3) return '';
+  const sorted = [...nonNull].sort((a, b) => a - b);
+  const base = sorted[Math.floor(sorted.length / 2)];
+  const PAD = 6;
+  const mh = h - PAD * 2;
+  const RANGE = GRAPH_CENTS_RANGE;
+  let d = '';
+  let pen = false;
+  history.forEach((hz, i) => {
+    const x = (i / Math.max(history.length - 1, 1)) * w;
+    if (!hz) { pen = false; return; }
+    const c = Math.max(-RANGE, Math.min(RANGE, 1200 * Math.log2(hz / base)));
+    const y = PAD + mh / 2 - (c / RANGE) * (mh / 2);
+    d += pen ? ` L${x.toFixed(1)} ${y.toFixed(1)}` : `M${x.toFixed(1)} ${y.toFixed(1)}`;
+    pen = true;
+  });
+  return d;
+}
+
+function PitchGraph({ history }: { history: (number | null)[] }) {
+  const path = buildPitchPath(history, GRAPH_W, GRAPH_H);
+  const cy = GRAPH_H / 2;
+  const PAD = 6;
+  const mh = GRAPH_H - PAD * 2;
+  const y25 = PAD + mh / 2 - (25 / GRAPH_CENTS_RANGE) * (mh / 2);
+  const yn25 = PAD + mh / 2 + (25 / GRAPH_CENTS_RANGE) * (mh / 2);
+  return (
+    <Svg width={GRAPH_W} height={GRAPH_H}>
+      <Line x1={0} y1={y25}  x2={GRAPH_W} y2={y25}  stroke="rgba(255,255,255,0.12)" strokeWidth={1} />
+      <Line x1={0} y1={cy}   x2={GRAPH_W} y2={cy}   stroke="rgba(255,255,255,0.28)" strokeWidth={1} />
+      <Line x1={0} y1={yn25} x2={GRAPH_W} y2={yn25} stroke="rgba(255,255,255,0.12)" strokeWidth={1} />
+      {path ? <Path d={path} stroke="rgba(100,210,255,0.92)" strokeWidth={2.5} fill="none" strokeLinejoin="round" strokeLinecap="round" /> : null}
+    </Svg>
+  );
+}
+
+const METRIC_LABELS: Record<string, string> = {
+  pitchAccuracy: 'Pitch Accuracy', intonationStability: 'Intonation Stability',
+  toneQuality: 'Tone Quality', bowSmoothness: 'Bow Smoothness',
+  vibrato: 'Vibrato', rhythmAccuracy: 'Rhythm', dynamicControl: 'Dynamics',
+  bowPlacement: 'Bow Placement', bowAngle: 'Bow Angle',
+  bowArmLevel: 'Bow Arm Level', bowDistribution: 'Bow Distribution',
+  leftHandWrist: 'Left Hand Wrist', posture: 'Posture',
+};
+
+// ── Radar chart ─────────────────────────────────────────────────────────────
+
+const RADAR_CATS = [
+  { label: 'Intonation', keys: ['pitchAccuracy', 'intonationStability'] },
+  { label: 'Bow',        keys: ['bowSmoothness', 'bowPlacement', 'bowAngle', 'bowDistribution'] },
+  { label: 'Posture',    keys: ['posture', 'leftHandWrist', 'bowArmLevel'] },
+  { label: 'Rhythm',     keys: ['rhythmAccuracy'] },
+  { label: 'Tone',       keys: ['toneQuality', 'dynamicControl'] },
+  { label: 'Vibrato',    keys: ['vibrato'] },
+] as const;
+
+function RadarChart({ metrics }: { metrics: import('../../src/types/analysis').MetricScore[] }) {
+  const N = RADAR_CATS.length;
+  const CX = 100, CY = 100, R = 74;
+  const LABEL_R = R + 26;
+
+  const metricsMap: Record<string, number> = {};
+  for (const m of metrics) metricsMap[m.key] = m.score;
+
+  const scores = RADAR_CATS.map(cat => {
+    const vals = cat.keys.map(k => metricsMap[k]).filter((v): v is number => v !== undefined);
+    return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
+  });
+
+  const angleAt = (i: number) => -Math.PI / 2 + (i / N) * 2 * Math.PI;
+
+  const outerPt = (i: number) => ({
+    x: CX + R * Math.cos(angleAt(i)),
+    y: CY + R * Math.sin(angleAt(i)),
+  });
+
+  const scorePt = (i: number) => {
+    const frac = Math.max(0.05, scores[i] / 100); // min sliver so shape is always visible
+    return {
+      x: CX + frac * R * Math.cos(angleAt(i)),
+      y: CY + frac * R * Math.sin(angleAt(i)),
+    };
+  };
+
+  const ringPoints = (frac: number) =>
+    Array.from({ length: N }, (_, i) => {
+      const a = angleAt(i);
+      return `${CX + frac * R * Math.cos(a)},${CY + frac * R * Math.sin(a)}`;
+    }).join(' ');
+
+  const scorePoints = Array.from({ length: N }, (_, i) => {
+    const p = scorePt(i);
+    return `${p.x},${p.y}`;
+  }).join(' ');
+
+  const textAnchor = (i: number) => {
+    const x = Math.cos(angleAt(i));
+    return x > 0.3 ? 'start' : x < -0.3 ? 'end' : 'middle';
+  };
+
+  const labelDy = (i: number) => {
+    const s = Math.sin(angleAt(i));
+    return s < -0.4 ? '-0.2em' : s > 0.4 ? '1em' : '0.35em';
+  };
+
+  return (
+    <Svg width={220} height={220} viewBox="-30 -30 260 260">
+      {/* Web rings */}
+      {[0.33, 0.66, 1].map(f => (
+        <Polygon key={f} points={ringPoints(f)} fill="none"
+          stroke="rgba(255,255,255,0.12)" strokeWidth={1} />
+      ))}
+
+      {/* Radii */}
+      {Array.from({ length: N }, (_, i) => {
+        const p = outerPt(i);
+        return <Line key={i} x1={CX} y1={CY} x2={p.x} y2={p.y}
+          stroke="rgba(255,255,255,0.12)" strokeWidth={1} />;
+      })}
+
+      {/* Score polygon */}
+      <Polygon points={scorePoints} fill="rgba(56,189,248,0.2)"
+        stroke="#38bdf8" strokeWidth={2} strokeLinejoin="round" />
+
+      {/* Outer ring dots */}
+      {Array.from({ length: N }, (_, i) => {
+        const p = outerPt(i);
+        return <Circle key={i} cx={p.x} cy={p.y} r={3}
+          fill="rgba(255,255,255,0.25)" />;
+      })}
+
+      {/* Score dots */}
+      {Array.from({ length: N }, (_, i) => {
+        const p = scorePt(i);
+        return <Circle key={i} cx={p.x} cy={p.y} r={4.5}
+          fill="#38bdf8" stroke="#fff" strokeWidth={1.5} />;
+      })}
+
+      {/* Labels */}
+      {RADAR_CATS.map((cat, i) => {
+        const a = angleAt(i);
+        const lx = CX + LABEL_R * Math.cos(a);
+        const ly = CY + LABEL_R * Math.sin(a);
+        return (
+          <SvgText key={cat.label} x={lx} y={ly} dy={labelDy(i)}
+            fontSize={11} fontWeight="600"
+            fill="rgba(255,255,255,0.75)"
+            textAnchor={textAnchor(i)}>
+            {cat.label}
+          </SvgText>
+        );
+      })}
+    </Svg>
+  );
+}
+
+const UPLOAD_TIPS = [
+  'Ensure the entire violin — from scroll to tailpiece — remains fully visible throughout the recording.',
+  'Keep your left wrist in frame at all times to allow accurate technique analysis.',
+  'Maintain the bow within the frame for the majority of your bow strokes.',
+  'Remain in a consistent position and orientation throughout the recording.',
+  'Record in a quiet environment with minimal background noise for optimal pitch analysis.',
+  'Ensure the violin is clearly and consistently audible in the recording.',
+];
+
+const METHOD_DEPTH = 5;
+const METHOD_H = 80;
+
+function MethodButton({
+  onPress,
+  iconName,
+  iconBg,
+  iconColor,
+  title,
+  subtitle,
+}: {
+  onPress: () => void;
+  iconName: React.ComponentProps<typeof Ionicons>['name'];
+  iconBg: string;
+  iconColor: string;
+  title: string;
+  subtitle: string;
+}) {
+  const offset = useSharedValue(0);
+  const surfaceStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: offset.value }],
+  }));
+  return (
+    <Pressable
+      onPressIn={() => { offset.value = withTiming(METHOD_DEPTH, { duration: 60 }); }}
+      onPressOut={() => { offset.value = withTiming(0, { duration: 100 }); }}
+      onPress={onPress}
+      style={styles.methodBtnOuter}
+    >
+      <View style={styles.methodBtnBase} />
+      <RAnimated.View style={[styles.methodBtnSurface, surfaceStyle]}>
+        <View style={[styles.methodBtnIconWrap, { backgroundColor: iconBg }]}>
+          <Ionicons name={iconName} size={26} color={iconColor} />
+        </View>
+        <View style={styles.methodBtnText}>
+          <Text style={styles.methodBtnTitle}>{title}</Text>
+          <Text style={styles.methodBtnSub}>{subtitle}</Text>
+        </View>
+        <Ionicons name="chevron-forward" size={18} color={colors.text.muted} />
+      </RAnimated.View>
+    </Pressable>
+  );
+}
 
 export default function AnalyzeScreen() {
   const {
     phase, selectedPiece, currentResult, error, sessionHistory,
     metricHistory, sessionResultCache,
     setPhase, setSelectedPiece, setRecordingUri, setResult, setError, reset,
-    addToHistory, addToMetricHistory, cacheSessionResult,
+    addToHistory, addToMetricHistory, cacheSessionResult, continueWithPiece,
   } = useAnalysisStore();
   const { profile } = useUserStore();
   const { isAuthenticated, playerCategory } = useAuthStore();
@@ -316,94 +620,29 @@ export default function AnalyzeScreen() {
   const [seekVersion, setSeekVersion] = useState(0);
   const [seekSeconds, setSeekSeconds] = useState(0);
 
-  // Bottom drawer state for results screen
-  const drawerHeightRef = useRef(DRAWER_DEFAULT_H);
-  const gestureStartHRef = useRef(DRAWER_DEFAULT_H);
-  const drawerAnim = useRef(new Animated.Value(DRAWER_DEFAULT_H)).current;
-  // Tracks whether the active card's content is scrolled to top / bottom
-  const cardScrollAtTopRef = useRef(true);
-  const cardScrollAtBottomRef = useRef(false);
-  // When drawer is at minimum, disable card ScrollViews so vertical swipes reach the drawer.
-  // A native ScrollView that claims the responder on touch-start can't be overridden by any
-  // parent PanResponder on move — the only reliable way is to prevent it from claiming at all.
-  const [cardsScrollEnabled, setCardsScrollEnabled] = useState(true);
+  // Processing screen progress animation
+  const processingProgress = useRef(new Animated.Value(0)).current;
+  const processingAnimRef = useRef<Animated.CompositeAnimation | null>(null);
 
-  // Stable move/release logic shared by both PanResponders.
-  // setCardsScrollEnabled is a stable React setter — safe to close over in useRef.
-  const drawerGestureRef = useRef({
-    onGrant: () => { gestureStartHRef.current = drawerHeightRef.current; },
-    onMove: (dy: number) => {
-      const newH = Math.max(DRAWER_MIN_H, Math.min(DRAWER_MAX_H, gestureStartHRef.current - dy));
-      drawerAnim.setValue(newH);
-    },
-    onRelease: (dy: number, vy: number) => {
-      const finalH = Math.max(DRAWER_MIN_H, Math.min(DRAWER_MAX_H, gestureStartHRef.current - dy));
-      let target: number;
-      if (vy > 0.5 || finalH < (DRAWER_DEFAULT_H + DRAWER_MIN_H) / 2) {
-        target = DRAWER_MIN_H;
-      } else if (vy < -0.5 || finalH > (DRAWER_DEFAULT_H + DRAWER_MAX_H) / 2) {
-        target = DRAWER_MAX_H;
-      } else {
-        target = DRAWER_DEFAULT_H;
-      }
-      drawerHeightRef.current = target;
-      setCardsScrollEnabled(target !== DRAWER_MIN_H);
-      Animated.spring(drawerAnim, { toValue: target, useNativeDriver: false, bounciness: 0 }).start();
-    },
-  });
 
-  // Handle PanResponder — always active on the drag pill; handles full expand/collapse
-  const handlePanResponder = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onPanResponderGrant: () => drawerGestureRef.current.onGrant(),
-      onPanResponderMove: (_, gs) => drawerGestureRef.current.onMove(gs.dy),
-      onPanResponderRelease: (_, gs) => drawerGestureRef.current.onRelease(gs.dy, gs.vy),
-    })
-  ).current;
-
-  // Shared condition logic for the content pan responder (move events only)
-  const contentShouldClaim = (gs: { dy: number; dx: number }) => {
-    if (Math.abs(gs.dy) < 2) return false;           // low threshold — responsive feel
-    if (Math.abs(gs.dx) >= Math.abs(gs.dy)) return false;
-    if (gs.dy > 0 && cardScrollAtTopRef.current) return true;
-    if (gs.dy < 0 && drawerHeightRef.current <= DRAWER_MIN_H + 10) return true;
-    if (gs.dy < 0 && cardScrollAtBottomRef.current &&
-        drawerHeightRef.current < DRAWER_MAX_H - 10) return true;
-    return false;
-  };
-
-  // Content PanResponder — three hooks for reliability across iOS responder phases:
-  //  1. onStartShouldSetPanResponder  — claims at touch-start only when drawer is fully
-  //     collapsed (any touch should start expanding). At other heights we skip start-phase
-  //     claiming so the horizontal FlatList can receive swipe touches before direction is known.
-  //  2. onMoveShouldSetPanResponderCapture — steals from a child that holds the responder
-  //  3. onMoveShouldSetPanResponder   — claims once a child voluntarily releases
-  const contentPanResponder = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () =>
-        drawerHeightRef.current <= DRAWER_MIN_H + 10,
-      onMoveShouldSetPanResponderCapture: (_, gs) => contentShouldClaim(gs),
-      onMoveShouldSetPanResponder: (_, gs) => contentShouldClaim(gs),
-      onPanResponderGrant: () => drawerGestureRef.current.onGrant(),
-      onPanResponderMove: (_, gs) => drawerGestureRef.current.onMove(gs.dy),
-      onPanResponderRelease: (_, gs) => drawerGestureRef.current.onRelease(gs.dy, gs.vy),
-    })
-  ).current;
-
-  const collapseDrawer = () => {
-    drawerHeightRef.current = DRAWER_MIN_H;
-    setCardsScrollEnabled(false);
-    Animated.spring(drawerAnim, { toValue: DRAWER_MIN_H, useNativeDriver: false, bounciness: 0 }).start();
-  };
-
-  // Reset drawer and card scroll state each time results appear
   useEffect(() => {
-    if (phase === 'done') {
-      drawerHeightRef.current = DRAWER_DEFAULT_H;
-      drawerAnim.setValue(DRAWER_DEFAULT_H);
-      setCardsScrollEnabled(true);
-    }
+    const idx = PROCESSING_PHASES.indexOf(phase as typeof PROCESSING_PHASES[number]);
+    if (idx < 0) { processingProgress.setValue(0); return; }
+    const start = idx / PROCESSING_PHASES.length;
+    const end = (idx + 1) / PROCESSING_PHASES.length;
+    // Seed the first phase at 5% so the bar is immediately visible instead of
+    // starting from a zero-width sliver that looks like nothing is happening.
+    const seedValue = idx === 0 ? Math.max(0.05, start) : start;
+    processingAnimRef.current?.stop();
+    processingProgress.setValue(seedValue);
+    processingAnimRef.current = Animated.timing(processingProgress, {
+      toValue: end,
+      duration: PHASE_DURATIONS[phase] ?? 15000,
+      easing: Easing.linear,
+      useNativeDriver: false,
+    });
+    processingAnimRef.current.start();
+    return () => processingAnimRef.current?.stop();
   }, [phase]);
 
   const handleTimestampPress = (s: number) => {
@@ -412,11 +651,13 @@ export default function AnalyzeScreen() {
     // so this always lands inside the note regardless of its length.
     setSeekSeconds(s + 0.030);
     setSeekVersion((v) => v + 1);
-    collapseDrawer();
   };
 
   // Tuner
   const [tunerOpen, setTunerOpen] = useState(false);
+
+  // Upload tips drawer
+  const [showUploadTips, setShowUploadTips] = useState(false);
 
   // Step 1 form state
   const [songName, setSongName] = useState('');
@@ -449,8 +690,20 @@ export default function AnalyzeScreen() {
   const displayLeftHandRef  = useRef<HandLandmarks | null>(null);
   const displayRightHandRef = useRef<HandLandmarks | null>(null);
   const animFrameRef = useRef<number | null>(null);
-  // Accumulated pose frames for post-session scoring
+  // Accumulated pose + bow frames for post-session scoring
   const poseFramesRef = useRef<FrameKeypoints[]>([]);
+  const bowFramesRef  = useRef<RawBowFrame[]>([]);
+  // Live bow keypoints for overlay rendering (null = not detected this frame)
+  const [liveBowKps, setLiveBowKps] = useState<{
+    tip:        { x: number; y: number } | null;
+    frog:       { x: number; y: number } | null;
+    contact:    { x: number; y: number } | null;
+    box:        { x1: number; y1: number; x2: number; y2: number } | null;
+    confidence: number;
+  } | null>(null);
+  // 0=identity, 1=90°CW, 2=180°, 3=270°CW (default — matches Vision .down coordinate flip)
+  const [bowRotation, setBowRotation] = useState(3);
+  const [bowFlipped, setBowFlipped] = useState(false);
   const recordingStartTimeRef = useRef<number>(0);
   const poseCheckIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // Warnings surface after appearing in 2 consecutive 1s checks (2s debounce).
@@ -458,9 +711,14 @@ export default function AnalyzeScreen() {
   // Tracks whether we've received the first pose frame this recording session.
   const firstPoseRef = useRef(false);
   const [poseWarnings, setPoseWarnings] = useState<string[]>([]);
+  const [liveVibratoScore, setLiveVibratoScore] = useState<number | null>(null);
+  const pitchHistoryRef = useRef<(number | null)[]>([]);
+  const pitchTickRef = useRef(0);
+  const [pitchGraphData, setPitchGraphData] = useState<(number | null)[]>([]);
   const [debugMetrics, setDebugMetrics] = useState<DebugMetrics | null>(null);
   const [showDebug, setShowDebug] = useState(false);
   const { width: screenWidth, height: screenHeight } = useWindowDimensions();
+  const DRAWER_DEFAULT_H = Math.round(screenHeight * 0.55);
   const insets = useSafeAreaInsets();
   const navigation = useNavigation();
   const PoseCameraView = getPoseCameraView();
@@ -472,13 +730,13 @@ export default function AnalyzeScreen() {
   const instrument = 'violin';
   const instrumentConfig = INSTRUMENTS[instrument];
 
-  // Hide the tab bar during calibration and recording so it doesn't overlap the camera UI.
+  // Hide the tab bar during recording and results so it doesn't overlap the camera/results UI.
   useEffect(() => {
-    const hide = phase === 'recording';
+    const hide = phase === 'recording' || phase === 'done';
     navigation.setOptions({
       tabBarStyle: hide
         ? { display: 'none' }
-        : { borderTopColor: '#f0eeff', backgroundColor: '#fff', elevation: 8,
+        : { borderTopColor: '#e5e7eb', backgroundColor: '#fff', elevation: 8,
             shadowColor: '#000', shadowOpacity: 0.06,
             shadowOffset: { width: 0, height: -2 }, shadowRadius: 8 },
     });
@@ -524,6 +782,15 @@ export default function AnalyzeScreen() {
         poseCheckIntervalRef.current = null;
       }
     };
+  }, [phase]);
+
+  // Clear pitch history when recording starts/stops
+  useEffect(() => {
+    if (phase !== 'recording') {
+      pitchHistoryRef.current = [];
+      setPitchGraphData([]);
+      setLiveVibratoScore(null);
+    }
   }, [phase]);
 
   // Animation loop: lerps displayed skeleton toward the 15-fps target at ~60 fps
@@ -605,6 +872,7 @@ export default function AnalyzeScreen() {
     recordingStartTimeRef.current = Date.now();
     timerRef.current = setInterval(() => { elapsedRef.current++; setElapsed((s) => s + 1); }, 1000);
     await poseStartRecording();
+    setHomeIndicatorHidden(true);
   }, []);
 
   const startRecording = async () => {
@@ -623,7 +891,10 @@ export default function AnalyzeScreen() {
     prevWarningsRef.current       = new Set();
     firstPoseRef.current          = false;
     poseFramesRef.current         = [];
+    bowFramesRef.current          = [];
+    setLiveBowKps(null);
     recordingStartTimeRef.current = 0;
+    haptic.medium();
     setPhase('recording');
     if (cameraReadyRef.current) {
       await beginRecording();
@@ -645,6 +916,7 @@ export default function AnalyzeScreen() {
   // Called when the native module finishes writing the video file
   const onPoseRecordingFinished = useCallback(async (e: any) => {
     recordingActiveRef.current = false;
+    setHomeIndicatorHidden(false);
     if (timerRef.current) clearInterval(timerRef.current);
     const { uri, error } = e.nativeEvent ?? e;
     if (error || !uri) {
@@ -656,7 +928,28 @@ export default function AnalyzeScreen() {
   }, []);
 
   const handleStopPoseRecording = useCallback(async () => {
+    haptic.medium();
     await poseStopRecording();
+  }, []);
+
+  const PITCH_HISTORY_SIZE = 80;  // 80 × 50ms = 4 seconds
+
+  const onPitchEvent = useCallback((e: any) => {
+    const hz: number | null = e.nativeEvent?.frequency ?? null;
+    const history = pitchHistoryRef.current;
+    history.push(hz && hz > 60 && hz < 1600 ? hz : null);
+    if (history.length > PITCH_HISTORY_SIZE) history.shift();
+
+    // Update graph + vibrato score every 3 events (~150ms)
+    pitchTickRef.current += 1;
+    if (pitchTickRef.current % 3 === 0) {
+      const snapshot = [...history];
+      setPitchGraphData(snapshot);
+      const detected = snapshot.filter(v => v !== null) as number[];
+      if (detected.length >= 15) {
+        setLiveVibratoScore(vibratoScoreFromPitchHistory(detected));
+      }
+    }
   }, []);
 
   // Fallback: expo-camera path (used when PoseCameraView native module is unavailable)
@@ -678,7 +971,7 @@ export default function AnalyzeScreen() {
     }
   };
 
-  const stopRecording = () => { cameraRef.current?.stopRecording(); };
+  const stopRecording = () => { haptic.medium(); cameraRef.current?.stopRecording(); };
 
   // ── Upload from camera roll ────────────────────────────────
 
@@ -728,7 +1021,7 @@ export default function AnalyzeScreen() {
 
       setPhase('processing_video');
       const videoMetrics: MetricScore[] = isVideo
-        ? await runVideoAnalysis(uri, instrument, poseFrames, durationSec)
+        ? await runVideoAnalysis(uri, instrument, poseFrames, durationSec, bowFramesRef.current)
         : [];
 
       // Fuse audio signals + pose frames into per-note events (single source of truth)
@@ -774,12 +1067,17 @@ export default function AnalyzeScreen() {
             .map(n => ({ startSeconds: n.startSeconds, endSeconds: n.endSeconds, note: n.noteName }));
           return { ...m, flaggedTimestamps: outOfTune };
         }
+        // dynamicControl timestamps contain descriptive coaching text — don't snap to note boundaries
+        if (m.key === 'dynamicControl') return m;
         return { ...m, flaggedTimestamps: m.flaggedTimestamps.map(ts => snapToNote(ts.startSeconds)) };
       });
 
       const skillLevel = profile?.skillLevel ?? 'beginner';
       const weights = instrumentConfig.skillWeights[skillLevel];
-      const overallScore = computeOverallScore(audioMetricsFinal, videoMetrics, weights as any);
+      // Bow and posture scoring is hidden until reliable — exclude their keys from the overall score.
+      const HIDDEN_SCORE_KEYS = new Set(['bowSmoothness', 'bowPlacement', 'bowAngle', 'bowDistribution', 'posture', 'leftHandWrist', 'bowArmLevel']);
+      const activeWeights = Object.fromEntries(Object.entries(weights).filter(([k]) => !HIDDEN_SCORE_KEYS.has(k)));
+      const overallScore = computeOverallScore(audioMetricsFinal, videoMetrics, activeWeights as any);
 
       // Rolling delta: new score vs. average of the 3 most recent sessions
       const recentScores = sessionHistory.slice(0, 3).map((s) => s.overallScore);
@@ -820,15 +1118,28 @@ export default function AnalyzeScreen() {
         sessionAssessment,
         llmFeedback,
         intonationAnalysis,
+        intonationStabilityAnalysis: audioOutput?.intonationStabilityAnalysis,
+        vibratoAnalysis: audioOutput?.vibratoAnalysis,
+        rhythmAnalysis: audioOutput?.rhythmAnalysis,
         audioQualityWarning,
         videoUri,
         noteEvents,
       };
 
+      // Write wrist debug data to a file so it can be pulled via xcrun devicectl.
+      const wristDbg = videoMetrics.find(m => m.key === 'leftHandWrist')?.debugSeries;
+      if (wristDbg && FileSystem.documentDirectory) {
+        FileSystem.writeAsStringAsync(
+          FileSystem.documentDirectory + 'wrist_debug.json',
+          JSON.stringify(wristDbg),
+        ).catch(() => {});
+      }
+
       if (isAuthenticated && profile?.id) await saveSession(result);
       addToHistory(sessionToSummary(result));
       addToMetricHistory({ sessionId, recordedAt, scores: allMetrics });
       cacheSessionResult(result);
+
       setResult(result);
     } catch (err: any) {
       setError(err.message ?? 'Analysis failed');
@@ -839,128 +1150,223 @@ export default function AnalyzeScreen() {
 
   // ── Step 1: Piece input ────────────────────────────────────
   if (phase === 'piece_input') {
+    const query = songName.trim().toLowerCase();
+    const filteredSessions = sessionHistory.filter((s) => {
+      if (!query) return true;
+      const title = (s.piece?.title ?? '').toLowerCase();
+      return title.includes(query);
+    });
+    const hasSessions = sessionHistory.length > 0;
+
+    // Group sessions by piece title
+    const sessionGroups: { title: string; composer?: string; sessions: typeof filteredSessions }[] = [];
+    const titleMap = new Map<string, number>();
+    for (const s of filteredSessions) {
+      const key = s.piece?.title ?? '';
+      const displayTitle = s.piece?.title ?? 'Untitled Session';
+      if (titleMap.has(key)) {
+        sessionGroups[titleMap.get(key)!].sessions.push(s);
+      } else {
+        titleMap.set(key, sessionGroups.length);
+        sessionGroups.push({ title: displayTitle, composer: s.piece?.composer, sessions: [s] });
+      }
+    }
+
     return (
-      <SafeAreaView style={styles.safe}>
-        <LinearGradient colors={[colors.brand[900], colors.brand[800]]} style={styles.header}>
-          <Text style={styles.headerTitle}>Start New Session</Text>
-          <Text style={styles.headerSub}>Name the piece you're practicing</Text>
-        </LinearGradient>
-
-        <KeyboardAvoidingView
-          style={{ flex: 1 }}
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        >
-          <ScrollView
-            style={styles.inputContent}
-            contentContainerStyle={styles.inputContentInner}
-            keyboardShouldPersistTaps="handled"
+      <RAnimated.View entering={FadeInRight.duration(220)} style={{ flex: 1 }}>
+        <SafeAreaView style={styles.setupSafe}>
+          <KeyboardAvoidingView
+            style={{ flex: 1 }}
+            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           >
-            <TextInput
-              style={styles.songInput}
-              placeholder="e.g. G major scale, Vivaldi"
-              placeholderTextColor={colors.text.muted}
-              value={songName}
-              onChangeText={setSongName}
-              returnKeyType="next"
-              autoCorrect={false}
-              autoCapitalize="words"
-              autoFocus
-            />
+            <View style={{ flex: 1 }}>
+              <ScrollView
+                style={styles.inputContent}
+                contentContainerStyle={styles.setupContentInner}
+                keyboardShouldPersistTaps="handled"
+                showsVerticalScrollIndicator={false}
+              >
+                {/* Title */}
+                <Text style={styles.setupTitle}>Start New{'\n'}Session</Text>
 
-            {/* Sheet music upload */}
-            {sheetMusicUri ? (
-              <View style={styles.sheetMusicAttached}>
-                <Text style={styles.sheetMusicIcon}>📄</Text>
-                <Text style={styles.sheetMusicFilename} numberOfLines={1}>{sheetMusicName}</Text>
-                <Pressable onPress={handleRemoveSheetMusic} style={styles.sheetMusicRemove}>
-                  <Text style={styles.sheetMusicRemoveText}>✕</Text>
+                {/* Search box */}
+                <View style={styles.searchBox}>
+                  <Ionicons name="search" size={20} color={colors.text.muted} style={styles.searchIcon} />
+                  <TextInput
+                    style={styles.searchInput}
+                    placeholder="Search or name a piece…"
+                    placeholderTextColor={colors.text.muted}
+                    value={songName}
+                    onChangeText={setSongName}
+                    returnKeyType="next"
+                    autoCorrect={false}
+                    autoCapitalize="words"
+                  />
+                  {songName.length > 0 && (
+                    <Pressable onPress={() => setSongName('')} hitSlop={8}>
+                      <Ionicons name="close-circle" size={18} color={colors.text.muted} />
+                    </Pressable>
+                  )}
+                </View>
+
+                {/* Sheet music */}
+                {sheetMusicUri ? (
+                  <View style={styles.sheetMusicAttached}>
+                    <Ionicons name="document-text" size={20} color="#166534" />
+                    <Text style={styles.sheetMusicFilename} numberOfLines={1}>{sheetMusicName}</Text>
+                    <Pressable onPress={handleRemoveSheetMusic} style={styles.sheetMusicRemove}>
+                      <Ionicons name="close" size={16} color="#dc2626" />
+                    </Pressable>
+                  </View>
+                ) : (
+                  <Pressable style={styles.sheetMusicBtn} onPress={handleUploadSheetMusic}>
+                    <Ionicons name="document-text-outline" size={22} color={colors.text.muted} />
+                    <View>
+                      <Text style={styles.sheetMusicBtnTitle}>Add Sheet Music</Text>
+                      <Text style={styles.sheetMusicBtnSub}>Optional — upload a PDF for better analysis</Text>
+                    </View>
+                  </Pressable>
+                )}
+
+                {/* Previous sessions — grouped by piece */}
+                {hasSessions && (
+                  <>
+                    <Text style={styles.prevSessionsLabel}>or continue a previous session</Text>
+                    {sessionGroups.map(({ title, composer, sessions: group }) => (
+                      <View key={title} style={styles.sessionGroup}>
+                        <View style={styles.sessionGroupHeader}>
+                          <Ionicons name="musical-note" size={14} color={colors.brand[600]} />
+                          <Text style={styles.sessionGroupTitle} numberOfLines={1}>{title}</Text>
+                          {composer && <Text style={styles.sessionGroupComposer} numberOfLines={1}>{composer}</Text>}
+                        </View>
+                        {group.map((s) => {
+                          const dateStr = new Date(s.recordedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                          return (
+                            <Pressable
+                              key={s.id}
+                              style={({ pressed }) => [styles.prevCard, pressed && { opacity: 0.85 }]}
+                              onPress={() => {
+                                haptic.light();
+                                continueWithPiece(s.piece ? { ...s.piece, source: 'manual' as const } : null);
+                              }}
+                            >
+                              <View style={styles.prevCardText}>
+                                <Text style={styles.prevCardTitle}>{dateStr}</Text>
+                              </View>
+                              <Text style={styles.prevCardScore}>{s.overallScore}</Text>
+                              <Ionicons name="chevron-forward" size={16} color={colors.text.muted} />
+                            </Pressable>
+                          );
+                        })}
+                      </View>
+                    ))}
+                    {sessionGroups.length === 0 && query.length > 0 && (
+                      <Text style={styles.noResultsText}>No previous sessions match — tap Next to start a new one.</Text>
+                    )}
+                  </>
+                )}
+              </ScrollView>
+
+              {/* Bottom: Next + Skip */}
+              <View style={styles.setupBottom}>
+                <BigButton label="Next →" onPress={handleNext} />
+                <Pressable style={styles.skipBtn} onPress={handleSkip}>
+                  <Text style={styles.skipLabel}>Skip — practice without naming</Text>
                 </Pressable>
               </View>
-            ) : (
-              <Pressable style={styles.sheetMusicBtn} onPress={handleUploadSheetMusic}>
-                <Text style={styles.sheetMusicBtnIcon}>📄</Text>
-                <View>
-                  <Text style={styles.sheetMusicBtnTitle}>Add Sheet Music</Text>
-                  <Text style={styles.sheetMusicBtnSub}>Optional — upload a PDF for better analysis</Text>
-                </View>
-              </Pressable>
-            )}
-
-            <Button
-              label="Next"
-              onPress={handleNext}
-              size="lg"
-              fullWidth
-            />
-
-            <Pressable style={styles.skipBtn} onPress={handleSkip}>
-              <Text style={styles.skipLabel}>Skip — practice without naming</Text>
-            </Pressable>
-          </ScrollView>
-        </KeyboardAvoidingView>
-      </SafeAreaView>
+            </View>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </RAnimated.View>
     );
   }
 
   // ── Step 2: Recording method ───────────────────────────────
   if (phase === 'method_select') {
     return (
-      <SafeAreaView style={styles.safe}>
-        <TunerModal visible={tunerOpen} onClose={() => setTunerOpen(false)} />
-        <LinearGradient colors={[colors.brand[900], colors.brand[800]]} style={styles.header}>
-          <Text style={styles.headerTitle}>How do you want to record?</Text>
-          {selectedPiece && (
-            <View style={styles.pieceChip}>
-              <Text style={styles.pieceChipText} numberOfLines={1}>
-                {selectedPiece.title}
-              </Text>
-            </View>
-          )}
-        </LinearGradient>
+      <RAnimated.View entering={FadeInRight.duration(220)} style={{ flex: 1 }}>
+        <SafeAreaView style={styles.setupSafe}>
+          <TunerModal visible={tunerOpen} onClose={() => setTunerOpen(false)} />
 
-        <View style={styles.methodContent}>
-          <Pressable style={styles.methodCard} onPress={() => setPhase('camera_tip')}>
-            <View style={[styles.methodIcon, { backgroundColor: colors.brand[100] }]}>
-              <Text style={styles.methodIconText}>📹</Text>
-            </View>
-            <View style={styles.methodText}>
-              <Text style={styles.methodTitle}>Record In-App</Text>
-              <Text style={styles.methodSub}>Live camera view with real-time feedback</Text>
-            </View>
-            <Text style={styles.methodArrow}>›</Text>
-          </Pressable>
+          {/* Upload tips drawer */}
+          <Modal
+            visible={showUploadTips}
+            transparent
+            animationType="slide"
+            onRequestClose={() => setShowUploadTips(false)}
+          >
+            <Pressable style={styles.drawerOverlay} onPress={() => setShowUploadTips(false)}>
+              <Pressable style={styles.tipsDrawer} onPress={() => {}}>
+                <View style={styles.tipsDrawerHandle} />
+                <Text style={styles.tipsDrawerTitle}>Tips for an Accurate Analysis</Text>
+                {UPLOAD_TIPS.map((tip, i) => (
+                  <View key={i} style={styles.tipRow}>
+                    <View style={styles.tipBullet}>
+                      <Text style={styles.tipBulletText}>{i + 1}</Text>
+                    </View>
+                    <Text style={styles.tipText}>{tip}</Text>
+                  </View>
+                ))}
+                <BigButton
+                  label="Continue — Select Video"
+                  onPress={() => { setShowUploadTips(false); uploadVideoFromLibrary(); }}
+                />
+              </Pressable>
+            </Pressable>
+          </Modal>
 
-          <View style={styles.dividerRow}>
-            <View style={styles.dividerLine} />
-            <Text style={styles.dividerLabel}>or</Text>
-            <View style={styles.dividerLine} />
+          <View style={styles.methodOuter}>
+            {/* Title + piece label */}
+            <View style={styles.methodHeader}>
+              <Text style={styles.setupTitle}>How do you{'\n'}want to record?</Text>
+              {selectedPiece && (
+                <View style={styles.methodPieceRow}>
+                  <Ionicons name="musical-note" size={14} color={colors.brand[600]} />
+                  <Text style={styles.methodPieceText} numberOfLines={1}>{selectedPiece.title}</Text>
+                </View>
+              )}
+            </View>
+
+            {/* Popout method buttons */}
+            <View style={styles.methodCards}>
+              <MethodButton
+                onPress={() => { haptic.medium(); setPhase('camera_tip'); }}
+                iconName="videocam"
+                iconBg={colors.brand[50]}
+                iconColor={colors.brand[600]}
+                title="Record In-App"
+                subtitle="Live camera with real-time feedback"
+              />
+
+              <View style={styles.dividerRow}>
+                <View style={styles.dividerLine} />
+                <Text style={styles.dividerLabel}>or</Text>
+                <View style={styles.dividerLine} />
+              </View>
+
+              <MethodButton
+                onPress={() => { haptic.medium(); setShowUploadTips(true); }}
+                iconName="film"
+                iconBg="#fef9c3"
+                iconColor="#a16207"
+                title="Upload a Video"
+                subtitle="Pick a recording from your camera roll"
+              />
+            </View>
+
+            {/* Bottom actions */}
+            <View style={styles.methodBottom}>
+              <Pressable style={styles.tuneLink} onPress={() => { haptic.light(); setTunerOpen(true); }}>
+                <Ionicons name="musical-notes-outline" size={16} color={colors.brand[600]} />
+                <Text style={styles.tuneLinkText}>Tune strings first</Text>
+              </Pressable>
+              <Pressable style={styles.backBtn} onPress={handleBackToInput}>
+                <Text style={styles.backLabel}>← Back</Text>
+              </Pressable>
+            </View>
           </View>
-
-          <Pressable style={styles.methodCard} onPress={uploadVideoFromLibrary}>
-            <View style={[styles.methodIcon, { backgroundColor: '#fef3c7' }]}>
-              <Text style={styles.methodIconText}>🎬</Text>
-            </View>
-            <View style={styles.methodText}>
-              <Text style={styles.methodTitle}>Upload a Video</Text>
-              <Text style={styles.methodSub}>Pick a recording from your camera roll</Text>
-            </View>
-            <Text style={styles.methodArrow}>›</Text>
-          </Pressable>
-          <View style={styles.uploadTip}>
-            <Text style={styles.uploadTipText}>
-              Tip: videos work best when both elbows and your upper body are fully visible
-            </Text>
-          </View>
-
-          <Pressable style={styles.tuneLink} onPress={() => setTunerOpen(true)}>
-            <Text style={styles.tuneLinkText}>♩  Tune strings first</Text>
-          </Pressable>
-
-          <Pressable style={styles.backBtn} onPress={handleBackToInput}>
-            <Text style={styles.backLabel}>← Back</Text>
-          </Pressable>
-        </View>
-      </SafeAreaView>
+        </SafeAreaView>
+      </RAnimated.View>
     );
   }
 
@@ -977,6 +1383,18 @@ export default function AnalyzeScreen() {
       // portrait-bottom (home indicator) maps to local-right after -90° rotation
       paddingRight: insets.bottom,
     };
+
+    // Map normalized model coords → screen center point, applying flip then rotation.
+    const bowCenter = (px: number, py: number): { x: number; y: number } => {
+      const fx = bowFlipped ? 1 - px : px;
+      switch (bowRotation) {
+        case 0: return { x: fx * screenWidth,        y: py * screenHeight };
+        case 1: return { x: (1 - py) * screenWidth,  y: fx * screenHeight };
+        case 2: return { x: (1 - fx) * screenWidth,  y: (1 - py) * screenHeight };
+        case 3: return { x: py * screenWidth,         y: (1 - fx) * screenHeight };
+        default: return { x: fx * screenWidth,        y: py * screenHeight };
+      }
+    };
     return (
       <View style={styles.recordingScreen}>
 
@@ -985,6 +1403,7 @@ export default function AnalyzeScreen() {
         {usingPoseCamera && (
           <PoseCameraView
             style={StyleSheet.absoluteFillObject}
+            useMpPose={true}
             onCameraReady={onPoseCameraReady}
             onPose={(e: any) => {
               const ev = e.nativeEvent ?? e;
@@ -1000,11 +1419,38 @@ export default function AnalyzeScreen() {
               targetLeftHandRef.current  = lh;
               targetRightHandRef.current = rh;
               setDebugMetrics(computeDebugMetrics(joints, lh, rh));
+
+              // Bow keypoints — present only on ~10fps bow-inference frames.
+              const bowTip     = ev.bowTip     ?? null;
+              const bowFrog    = ev.bowFrog    ?? null;
+              const bowContact = ev.bowContact ?? null;
+              const bowConf    = ev.bowConfidence ?? 0;
+              if (bowTip && bowFrog && bowContact) {
+                const bowBox = ev.bowBox ?? null;
+                setLiveBowKps({
+                  tip:        bowTip.visible     ? { x: bowTip.x,     y: bowTip.y     } : null,
+                  frog:       bowFrog.visible    ? { x: bowFrog.x,    y: bowFrog.y    } : null,
+                  contact:    bowContact.visible ? { x: bowContact.x, y: bowContact.y } : null,
+                  box:        bowBox ? { x1: bowBox.x1, y1: bowBox.y1, x2: bowBox.x2, y2: bowBox.y2 } : null,
+                  confidence: bowConf,
+                });
+              }
+
               if (recordingActiveRef.current) {
                 const ts = recordingStartTimeRef.current > 0
                   ? (Date.now() - recordingStartTimeRef.current) / 1000
                   : elapsedRef.current;
                 poseFramesRef.current.push(convertPoseFrame(joints, lh, rh, ts));
+                // Collect bow frames when the model fires.
+                if (bowTip && bowFrog && bowContact) {
+                  bowFramesRef.current.push({
+                    timestamp:      ts,
+                    tipX: bowTip.x,     tipY: bowTip.y,     tipVisible:     !!bowTip.visible,
+                    frogX: bowFrog.x,   frogY: bowFrog.y,   frogVisible:    !!bowFrog.visible,
+                    contactX: bowContact.x, contactY: bowContact.y, contactVisible: !!bowContact.visible,
+                    confidence: bowConf,
+                  });
+                }
                 if (!firstPoseRef.current) {
                   firstPoseRef.current = true;
                   prevWarningsRef.current = new Set(evaluatePoseWarnings(joints, lh, rh));
@@ -1012,6 +1458,7 @@ export default function AnalyzeScreen() {
               }
             }}
             onRecordingFinished={onPoseRecordingFinished}
+            onPitch={onPitchEvent}
           />
         )}
 
@@ -1144,8 +1591,8 @@ export default function AnalyzeScreen() {
           />
         )}
 
-        {/* Arm skeleton overlay */}
-        {isRecording && usingPoseCamera && Object.keys(poseJoints).length > 0 && (
+        {/* Arm skeleton overlay — temporarily hidden for bow detection testing */}
+        {false && isRecording && usingPoseCamera && Object.keys(poseJoints).length > 0 && (
           <PoseSkeleton
             joints={poseJoints}
             leftHand={leftHand}
@@ -1156,15 +1603,101 @@ export default function AnalyzeScreen() {
           />
         )}
 
-        {/* Recording HUD — wrist angle + stop button only */}
+        {/* Bow keypoint overlay — dots + labels + model bounding box */}
+        {isRecording && usingPoseCamera && liveBowKps && (() => {
+          const tip     = liveBowKps.tip     ? bowCenter(liveBowKps.tip.x,     liveBowKps.tip.y)     : null;
+          const frog    = liveBowKps.frog    ? bowCenter(liveBowKps.frog.x,    liveBowKps.frog.y)    : null;
+          const contact = liveBowKps.contact ? bowCenter(liveBowKps.contact.x, liveBowKps.contact.y) : null;
+          // Transform the two model bbox corners through the same flip+rotation as keypoints
+          const box = liveBowKps.box ? (() => {
+            const c1 = bowCenter(liveBowKps.box!.x1, liveBowKps.box!.y1);
+            const c2 = bowCenter(liveBowKps.box!.x2, liveBowKps.box!.y2);
+            return {
+              x: Math.min(c1.x, c2.x), y: Math.min(c1.y, c2.y),
+              w: Math.abs(c1.x - c2.x), h: Math.abs(c1.y - c2.y),
+            };
+          })() : null;
+          return (
+            <Svg style={StyleSheet.absoluteFillObject} width={screenWidth} height={screenHeight} pointerEvents="none">
+              {box && (
+                <G>
+                  <Rect x={box.x} y={box.y} width={box.w} height={box.h}
+                    fill="none" stroke="#f59e0b" strokeWidth={2.5} rx={4} />
+                  <Rect x={box.x} y={box.y - 18} width={52} height={18}
+                    fill="rgba(0,0,0,0.55)" rx={3} />
+                  <SvgText x={box.x + 4} y={box.y - 5} fontSize={11} fontWeight="700" fill="#f59e0b">
+                    {`bow ${Math.round(liveBowKps.confidence * 100)}%`}
+                  </SvgText>
+                </G>
+              )}
+              {tip && (
+                <G>
+                  <Circle cx={tip.x} cy={tip.y} r={7} fill="#f59e0b" fillOpacity={0.92} stroke="rgba(0,0,0,0.5)" strokeWidth={2} />
+                  <SvgText x={tip.x + 11} y={tip.y + 4} fontSize={12} fontWeight="700" fill="#f59e0b">tip</SvgText>
+                </G>
+              )}
+              {frog && (
+                <G>
+                  <Circle cx={frog.x} cy={frog.y} r={7} fill="#8b5cf6" fillOpacity={0.92} stroke="rgba(0,0,0,0.5)" strokeWidth={2} />
+                  <SvgText x={frog.x + 11} y={frog.y + 4} fontSize={12} fontWeight="700" fill="#8b5cf6">frog</SvgText>
+                </G>
+              )}
+              {contact && (
+                <G>
+                  <Circle cx={contact.x} cy={contact.y} r={7} fill="#10b981" fillOpacity={0.92} stroke="rgba(0,0,0,0.5)" strokeWidth={2} />
+                  <SvgText x={contact.x + 11} y={contact.y + 4} fontSize={12} fontWeight="700" fill="#10b981">contact</SvgText>
+                </G>
+              )}
+            </Svg>
+          );
+        })()}
+
+        {/* Recording HUD — pitch graph + wrist angle + vibrato badge + stop button */}
         {isRecording && (
           <View style={lsContainer} pointerEvents="box-none">
-            {usingPoseCamera && (
-              <Text style={styles.recWristAngle} pointerEvents="none">
-                {(() => { const wa = liveWristAngle(poseJoints, leftHand); return wa !== null ? `${Math.round(wa)}°` : ''; })()}
-              </Text>
+            {/* Pitch graph — temporarily hidden for bow detection testing */}
+            {false && usingPoseCamera && (
+              <View style={styles.recGraphOuter} pointerEvents="none">
+                <View style={styles.recGraphBg}>
+                  <PitchGraph history={pitchGraphData} />
+                  <View style={styles.recGraphLabels}>
+                    <Text style={styles.recGraphCentsLabel}>+{GRAPH_CENTS_RANGE}¢</Text>
+                    <Text style={styles.recGraphCentsLabel}>0¢</Text>
+                    <Text style={styles.recGraphCentsLabel}>−{GRAPH_CENTS_RANGE}¢</Text>
+                  </View>
+                </View>
+              </View>
             )}
-            <View style={styles.recStopCorner} pointerEvents="box-none">
+            {/* Wrist angle + debug panel — top right */}
+            {usingPoseCamera && (() => {
+              const dbg = liveWristDebugData(poseJoints);
+              return (
+                <View style={styles.wristDebugBlock} pointerEvents="none">
+                  <Text style={styles.recWristAngle}>
+                    {dbg.angle !== null ? `${Math.round(dbg.angle)}°` : ''}
+                  </Text>
+                  <View style={styles.wristDebugPanel}>
+                    <Text style={styles.wristDbgRow}>mode  <Text style={styles.wristDbgVal}>{dbg.mode}</Text></Text>
+                    <Text style={styles.wristDbgRow}>cos   <Text style={[styles.wristDbgVal, dbg.cosA !== null && Math.abs(dbg.cosA) < 0.2 ? styles.wristDbgWarn : null]}>{dbg.cosA ?? '—'}</Text></Text>
+                    {dbg.mode === '3D' && <>
+                      <Text style={styles.wristDbgRow}>|FA|  <Text style={styles.wristDbgVal}>{dbg.magF}cm</Text></Text>
+                      <Text style={styles.wristDbgRow}>|H|   <Text style={[styles.wristDbgVal, dbg.magH !== null && dbg.magH < 3 ? styles.wristDbgWarn : null]}>{dbg.magH}cm</Text></Text>
+                      <Text style={styles.wristDbgRow}>tip.x <Text style={styles.wristDbgVal}>{dbg.tx}cm</Text></Text>
+                      <Text style={styles.wristDbgRow}>tip.y <Text style={styles.wristDbgVal}>{dbg.ty}cm</Text></Text>
+                      <Text style={styles.wristDbgRow}>tip.z <Text style={styles.wristDbgVal}>{dbg.tz}cm</Text></Text>
+                    </>}
+                  </View>
+                </View>
+              );
+            })()}
+            {/* Vibrato score — top left */}
+            {usingPoseCamera && liveVibratoScore !== null && (
+              <View style={styles.recVibratoBadge} pointerEvents="none">
+                <Text style={styles.recVibratoLabel}>VIB</Text>
+                <Text style={styles.recVibratoScore}>{liveVibratoScore}</Text>
+              </View>
+            )}
+            <View style={[styles.recStopCorner, { bottom: insets.bottom + 14 }]} pointerEvents="box-none">
               <Pressable
                 style={styles.stopButton}
                 onPress={usingPoseCamera ? handleStopPoseRecording : stopRecording}
@@ -1173,6 +1706,16 @@ export default function AnalyzeScreen() {
                 <View style={styles.stopButtonInner} />
               </Pressable>
             </View>
+            {usingPoseCamera && liveBowKps && (
+              <View style={[styles.bowBtnRow, { bottom: insets.bottom + 14 }]} pointerEvents="box-none">
+                <Pressable style={styles.bowRotateBtn} onPress={() => setBowFlipped(f => !f)} pointerEvents="auto">
+                  <Text style={styles.bowRotateBtnText}>⇆</Text>
+                </Pressable>
+                <Pressable style={styles.bowRotateBtn} onPress={() => setBowRotation(r => (r + 1) % 4)} pointerEvents="auto">
+                  <Text style={styles.bowRotateBtnText}>↻</Text>
+                </Pressable>
+              </View>
+            )}
           </View>
         )}
 
@@ -1182,12 +1725,60 @@ export default function AnalyzeScreen() {
 
   // ── Processing ─────────────────────────────────────────────
   if (['processing_audio', 'processing_video', 'uploading'].includes(phase)) {
+    const currentIdx = PROCESSING_PHASES.indexOf(phase as typeof PROCESSING_PHASES[number]);
+    const barWidth = processingProgress.interpolate({
+      inputRange: [0, 1],
+      outputRange: ['0%', '100%'],
+    });
+
     return (
-      <View style={[styles.fullScreen, { backgroundColor: colors.brand[900] }]}>
-        <ActivityIndicator size="large" color="#fff" />
-        <Text style={styles.processingLabel}>{PHASE_LABELS[phase]}</Text>
-        <Text style={styles.processingSubLabel}>This takes about 15 seconds</Text>
-      </View>
+      <LinearGradient
+        colors={[colors.brand[900], colors.brand[800]]}
+        style={styles.processingScreen}
+      >
+        <View style={styles.processingContent}>
+          <Text style={styles.processingPhaseLabel}>
+            {PHASE_LABELS[phase]}
+          </Text>
+
+          {/* Progress bar */}
+          <View style={styles.processingBarTrack}>
+            <Animated.View style={[styles.processingBarFill, { width: barWidth }]} />
+          </View>
+
+          <Text style={styles.processingTimeHint}>This usually takes about 30 seconds</Text>
+
+          {/* Step list */}
+          <View style={styles.processingSteps}>
+            {PROCESSING_PHASES.map((p, i) => {
+              const done = i < currentIdx;
+              const active = i === currentIdx;
+              return (
+                <View key={p} style={styles.processingStep}>
+                  <View style={[
+                    styles.processingDot,
+                    done && styles.processingDotDone,
+                    active && styles.processingDotActive,
+                  ]}>
+                    <Text style={[
+                      styles.processingDotText,
+                      active && styles.processingDotTextActive,
+                    ]}>
+                      {done ? '✓' : String(i + 1)}
+                    </Text>
+                  </View>
+                  <Text style={[
+                    styles.processingStepLabel,
+                    active && styles.processingStepLabelActive,
+                  ]}>
+                    {PHASE_LABELS[p]}
+                  </Text>
+                </View>
+              );
+            })}
+          </View>
+        </View>
+      </LinearGradient>
     );
   }
 
@@ -1204,69 +1795,13 @@ export default function AnalyzeScreen() {
     );
   }
 
-  // ── Results ────────────────────────────────────────────────
+  // ── Results carousel ───────────────────────────────────────
   if (phase === 'done' && currentResult) {
-    const prevResultForTrend = sessionResultCache[sessionHistory[1]?.id ?? ''];
-    const prevIntonationAnalysis = prevResultForTrend?.intonationAnalysis;
-    const assessment = currentResult.sessionAssessment;
-
     return (
-      <SafeAreaView style={styles.resultsSafe}>
-        {/* Video occupies only the visible area above the drawer */}
-        <Animated.View style={[styles.resultsVideoLayer, { bottom: drawerAnim }]}>
-          {currentResult.videoUri ? (
-            <InlineVideoPlayer
-              uri={currentResult.videoUri}
-              seekVersion={seekVersion}
-              seekSeconds={seekSeconds}
-              fullScreen
-              noteEvents={currentResult.noteEvents}
-              durationSeconds={currentResult.durationSeconds}
-              onMarkerPress={handleTimestampPress}
-            />
-          ) : null}
-        </Animated.View>
-
-        {/* Swipeable bottom drawer */}
-        <Animated.View style={[styles.resultsDrawer, { height: drawerAnim }]}>
-          {/* Drag handle — always responds to vertical swipes */}
-          <View style={styles.drawerHandleArea} {...handlePanResponder.panHandlers}>
-            <View style={styles.drawerHandlePill} />
-          </View>
-
-          {/* Content area — steals vertical scrolls at card top/bottom boundaries */}
-          <View style={styles.drawerContent} {...contentPanResponder.panHandlers}>
-            {currentResult.audioQualityWarning && (
-              <View style={styles.audioWarningBanner}>
-                <Text style={styles.audioWarningIcon}>⚠</Text>
-                <Text style={styles.audioWarningText}>{currentResult.audioQualityWarning}</Text>
-              </View>
-            )}
-            {currentResult.llmFeedback && (
-              <CoachingReport
-                llmFeedback={currentResult.llmFeedback}
-                assessment={assessment}
-                intonationAnalysis={currentResult.intonationAnalysis}
-                prevIntonationAnalysis={prevIntonationAnalysis}
-                videoUri={currentResult.videoUri}
-                metrics={currentResult.metrics}
-                durationSeconds={currentResult.durationSeconds}
-                onTimestampPress={handleTimestampPress}
-                cardScrollEnabled={cardsScrollEnabled}
-                onCardScrollPosition={(atTop, atBottom) => {
-                  cardScrollAtTopRef.current = atTop;
-                  cardScrollAtBottomRef.current = atBottom;
-                }}
-              />
-            )}
-          </View>
-
-          {/* Action button */}
-          <View style={styles.resultsDrawerActions}>
-            <Button label="New Session" onPress={reset} variant="primary" fullWidth size="md" />
-          </View>
-        </Animated.View>
-      </SafeAreaView>
+      <ResultsCarousel
+        result={currentResult}
+        onDone={() => { reset(); router.push('/(tabs)/home'); }}
+      />
     );
   }
 
@@ -1275,6 +1810,7 @@ export default function AnalyzeScreen() {
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.background },
+  setupSafe: { flex: 1, backgroundColor: '#fff' },
   fullScreen: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: spacing.md },
   header: { paddingTop: 20, paddingBottom: spacing.xl, paddingHorizontal: spacing.xl },
   headerTitle: { fontSize: 24, fontWeight: '700', color: '#fff' },
@@ -1292,21 +1828,80 @@ const styles = StyleSheet.create({
   },
   pieceChipText: { color: '#fff', fontSize: 13, fontWeight: '600' },
 
-  // Step 1 — piece input
+  // Step 1 — piece input (setup)
   inputContent: { flex: 1 },
-  inputContentInner: {
-    padding: spacing.lg,
+  setupContentInner: {
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.xl,
+    paddingBottom: spacing.md,
     gap: spacing.md,
   },
-  songInput: {
-    backgroundColor: '#fff',
+  setupTitle: {
+    fontSize: 38,
+    fontWeight: '900',
+    color: colors.text.primary,
+    lineHeight: 44,
+    marginBottom: spacing.xs,
+  },
+  searchBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#f3f4f6',
     borderRadius: radius.lg,
     paddingHorizontal: spacing.md,
-    paddingVertical: 14,
-    fontSize: 17,
+    paddingVertical: 12,
+    gap: spacing.sm,
+  },
+  searchIcon: { flexShrink: 0 },
+  searchInput: {
+    flex: 1,
+    fontSize: 18,
     color: colors.text.primary,
+  },
+  prevSessionsLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: colors.text.muted,
+    textTransform: 'uppercase',
+    letterSpacing: 0.8,
+    marginTop: spacing.xs,
+  },
+  prevCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#fff',
+    borderRadius: 14,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 14,
+    gap: spacing.sm,
     borderWidth: 1.5,
-    borderColor: colors.brand[200],
+    borderColor: '#e5e7eb',
+    borderBottomWidth: 4,
+    borderBottomColor: '#d1d5db',
+  },
+  prevCardLeft: {
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    backgroundColor: colors.brand[50],
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  prevCardText: { flex: 1 },
+  prevCardTitle: { fontSize: 15, fontWeight: '700', color: colors.text.primary },
+  prevCardSub: { fontSize: 12, color: colors.text.muted, marginTop: 1 },
+  prevCardMeta: { alignItems: 'flex-end', gap: 2 },
+  prevCardScore: { fontSize: 15, fontWeight: '800', color: colors.brand[600] },
+  prevCardDate: { fontSize: 11, color: colors.text.muted },
+  noResultsText: { fontSize: 13, color: colors.text.muted, textAlign: 'center', paddingVertical: spacing.sm },
+  setupBottom: {
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.sm,
+    paddingBottom: spacing.md,
+    gap: spacing.sm,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: '#e5e7eb',
+    backgroundColor: '#fff',
   },
   sheetMusicBtn: {
     flexDirection: 'row',
@@ -1319,7 +1914,6 @@ const styles = StyleSheet.create({
     borderColor: '#e5e7eb',
     borderStyle: 'dashed',
   },
-  sheetMusicBtnIcon: { fontSize: 22 },
   sheetMusicBtnTitle: { fontSize: 14, fontWeight: '600', color: colors.text.primary },
   sheetMusicBtnSub: { fontSize: 12, color: colors.text.muted, marginTop: 2 },
   sheetMusicAttached: {
@@ -1332,49 +1926,122 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#86efac',
   },
-  sheetMusicIcon: { fontSize: 20 },
   sheetMusicFilename: { flex: 1, fontSize: 13, fontWeight: '600', color: '#166534' },
   sheetMusicRemove: { padding: 4 },
-  sheetMusicRemoveText: { fontSize: 14, color: '#dc2626', fontWeight: '700' },
-  skipBtn: { alignItems: 'center', paddingVertical: spacing.md },
+  skipBtn: { alignItems: 'center', paddingVertical: spacing.sm },
   skipLabel: { fontSize: 14, color: colors.text.muted, textDecorationLine: 'underline' },
 
   // Step 2 — method select
+  methodOuter: { flex: 1, paddingHorizontal: spacing.lg, paddingTop: spacing.xl, gap: spacing.lg },
+  methodHeader: { gap: spacing.xs },
+  methodPieceRow: { flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 6 },
+  methodPieceText: { fontSize: 13, fontWeight: '600', color: colors.brand[600] },
+  methodCards: { gap: spacing.md },
+  methodBottom: { flex: 1, justifyContent: 'flex-end', paddingBottom: spacing.lg, gap: spacing.sm },
   methodContent: { flex: 1, padding: spacing.lg, justifyContent: 'center', gap: spacing.md },
-  methodCard: {
+  // Popout method buttons
+  methodBtnOuter: {
+    height: METHOD_H + METHOD_DEPTH,
+    borderRadius: 16,
+    overflow: 'hidden',
+  },
+  methodBtnBase: {
+    position: 'absolute',
+    bottom: 0, left: 0, right: 0,
+    height: METHOD_H,
+    borderRadius: 16,
+    backgroundColor: '#c7cad1',
+  },
+  methodBtnSurface: {
+    position: 'absolute',
+    top: 0, left: 0, right: 0,
+    height: METHOD_H,
+    borderRadius: 16,
+    backgroundColor: '#fff',
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#fff',
-    borderRadius: radius.lg,
-    padding: spacing.md,
+    paddingHorizontal: spacing.md,
     gap: spacing.md,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.07,
-    shadowRadius: 8,
-    elevation: 3,
+    borderWidth: 1.5,
+    borderColor: '#e5e7eb',
   },
-  methodIcon: { width: 52, height: 52, borderRadius: 26, alignItems: 'center', justifyContent: 'center' },
-  methodIconText: { fontSize: 24 },
-  methodText: { flex: 1 },
-  methodTitle: { fontSize: 16, fontWeight: '700', color: colors.text.primary },
-  methodSub: { fontSize: 12, color: colors.text.muted, marginTop: 2, lineHeight: 17 },
-  methodArrow: { fontSize: 22, color: colors.text.muted, fontWeight: '300' },
+  methodBtnIconWrap: { width: 52, height: 52, borderRadius: 26, alignItems: 'center', justifyContent: 'center' },
+  methodBtnText: { flex: 1 },
+  methodBtnTitle: { fontSize: 16, fontWeight: '700', color: colors.text.primary },
+  methodBtnSub: { fontSize: 12, color: colors.text.muted, marginTop: 2, lineHeight: 17 },
   dividerRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   dividerLine: { flex: 1, height: 1, backgroundColor: '#e5e7eb' },
   dividerLabel: { fontSize: 13, color: colors.text.muted, fontWeight: '500' },
-  tuneLink: { alignItems: 'center', paddingVertical: spacing.sm },
+  tuneLink: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, paddingVertical: spacing.sm },
   tuneLinkText: { fontSize: 14, color: colors.brand[600], fontWeight: '600' },
-  backBtn: { alignItems: 'center', paddingVertical: spacing.md },
-  backLabel: { fontSize: 14, color: colors.brand[600], fontWeight: '600' },
-  uploadTip: {
-    backgroundColor: '#fef3c7',
-    borderRadius: 8,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.sm,
-    marginTop: -spacing.xs,
+  backBtn: { alignItems: 'center', paddingVertical: spacing.sm },
+  backLabel: { fontSize: 14, color: colors.text.muted, fontWeight: '500' },
+  // Upload tips drawer
+  drawerOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    justifyContent: 'flex-end',
   },
-  uploadTipText: { fontSize: 12, color: '#92400e', lineHeight: 17 },
+  tipsDrawer: {
+    backgroundColor: colors.brand[700],
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.sm,
+    paddingBottom: 40,
+    gap: spacing.md,
+  },
+  tipsDrawerHandle: {
+    width: 36,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: 'rgba(255,255,255,0.3)',
+    alignSelf: 'center',
+    marginBottom: spacing.xs,
+  },
+  tipsDrawerTitle: {
+    fontSize: 20,
+    fontWeight: '800',
+    color: '#fff',
+  },
+  tipRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: spacing.sm,
+  },
+  tipBullet: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+    marginTop: 1,
+  },
+  tipBulletText: { fontSize: 11, fontWeight: '700', color: '#fff' },
+  tipText: { flex: 1, fontSize: 14, color: 'rgba(255,255,255,0.9)', lineHeight: 20 },
+  // Grouped sessions (piece_input)
+  sessionGroup: {
+    gap: 6,
+  },
+  sessionGroupHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 4,
+    paddingTop: spacing.xs,
+  },
+  sessionGroupTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: colors.text.primary,
+    flex: 1,
+  },
+  sessionGroupComposer: {
+    fontSize: 12,
+    color: colors.text.muted,
+  },
 
   // Camera position guide
   cameraTipContent: {
@@ -1489,8 +2156,92 @@ const styles = StyleSheet.create({
   legendText: { color: '#fff', fontSize: 11, fontWeight: '600' },
 
   // Processing
-  processingLabel: { fontSize: 18, color: '#fff', fontWeight: '600' },
-  processingSubLabel: { fontSize: 13, color: 'rgba(255,255,255,0.6)' },
+  processingScreen: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  processingContent: { width: '82%', alignItems: 'center', gap: spacing.xl },
+  processingPhaseLabel: {
+    fontSize: 26, fontWeight: '700', color: '#fff', textAlign: 'center', lineHeight: 34,
+  },
+  processingBarTrack: {
+    width: '100%', height: 6, borderRadius: 3,
+    backgroundColor: 'rgba(255,255,255,0.12)', overflow: 'hidden',
+  },
+  processingBarFill: {
+    height: '100%', borderRadius: 3, backgroundColor: colors.brand[400],
+  },
+  processingTimeHint: {
+    fontSize: 12, color: 'rgba(255,255,255,0.45)', marginTop: 4,
+  },
+  processingSteps: { width: '100%', gap: spacing.md },
+  processingStep: { flexDirection: 'row', alignItems: 'center', gap: spacing.md },
+  processingDot: {
+    width: 30, height: 30, borderRadius: 15,
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  processingDotDone: { backgroundColor: 'rgba(255,255,255,0.25)' },
+  processingDotActive: { backgroundColor: colors.brand[400] },
+  processingDotText: { fontSize: 12, fontWeight: '700', color: 'rgba(255,255,255,0.5)' },
+  processingDotTextActive: { color: '#fff' },
+  processingStepLabel: { fontSize: 14, color: 'rgba(255,255,255,0.4)', fontWeight: '500' },
+  processingStepLabelActive: { color: '#fff', fontWeight: '700' },
+
+  // Celebration
+  celebrationInner: {
+    flex: 1,
+    paddingHorizontal: spacing.lg,
+  },
+  celebrationTitle: {
+    fontSize: 28,
+    fontWeight: '800',
+    color: '#fff',
+    marginBottom: spacing.sm,
+  },
+  celebrationCenter: {
+    alignItems: 'center',
+    gap: spacing.sm,
+  },
+  celebrationScore: { alignItems: 'center', gap: 4 },
+  celebrationScoreNum: {
+    fontSize: 56, fontWeight: '800', color: '#fff', lineHeight: 64,
+  },
+  celebrationScoreLabel: {
+    fontSize: 12, fontWeight: '600', color: 'rgba(255,255,255,0.55)',
+    letterSpacing: 1.5, textTransform: 'uppercase',
+  },
+  celebrationIssues: {
+    gap: spacing.sm,
+    marginTop: spacing.md,
+  },
+  celebrationIssuesLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: 'rgba(255,255,255,0.5)',
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+    marginBottom: 2,
+  },
+  celebrationIssueCard: {
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    borderRadius: 14,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.12)',
+  },
+  celebrationIssueTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#fff',
+    marginBottom: 3,
+  },
+  celebrationIssueBody: {
+    fontSize: 12,
+    color: 'rgba(255,255,255,0.65)',
+    lineHeight: 17,
+  },
+  celebrationFooter: {
+    marginTop: spacing.md,
+  },
 
   // Error
   errorEmoji: { fontSize: 48 },
@@ -1582,8 +2333,7 @@ const styles = StyleSheet.create({
   },
 
   // Results — full-screen video + swipeable drawer
-  resultsSafe: { flex: 1, backgroundColor: '#1a0a2e' },
-  // bottom is set inline as an Animated.Value so the video shrinks as the drawer grows
+  resultsSafe: { flex: 1, backgroundColor: colors.brand[900] },
   resultsVideoLayer: { position: 'absolute', top: 0, left: 0, right: 0 },
   resultsDrawer: {
     position: 'absolute',
@@ -1591,13 +2341,13 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     backgroundColor: '#fff',
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
+    borderTopLeftRadius: 10,
+    borderTopRightRadius: 10,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: -6 },
-    shadowOpacity: 0.22,
-    shadowRadius: 20,
-    elevation: 20,
+    shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.12,
+    shadowRadius: 12,
+    elevation: 16,
   },
   drawerHandleArea: {
     alignItems: 'center',
@@ -1628,24 +2378,135 @@ const styles = StyleSheet.create({
     backgroundColor: '#d1d5db',
   },
   resultsDrawerActions: {
-    padding: spacing.md,
-    paddingBottom: 24,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingHorizontal: spacing.lg,
+    paddingVertical: 10,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: '#e5e7eb',
+  },
+  actionLink: {
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+  },
+  actionLinkText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: colors.text.muted,
+  },
+  actionLinkPrimary: {
+    color: colors.brand[600],
   },
 
   // ── Recording HUD (minimal) ────────────────────────────────────────────────
-  recWristAngle: {
+  wristDebugBlock: {
     position: 'absolute',
     top: 14,
     right: 16,
+    alignItems: 'flex-end',
+  },
+  recWristAngle: {
     fontSize: 28,
     fontWeight: '700',
     color: 'rgba(255,255,255,0.9)',
+    fontVariant: ['tabular-nums'] as any,
+  },
+  wristDebugPanel: {
+    marginTop: 4,
+    backgroundColor: 'rgba(0,0,0,0.65)',
+    borderRadius: 7,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    minWidth: 130,
+  },
+  wristDbgRow: {
+    color: 'rgba(255,255,255,0.45)',
+    fontSize: 14,
+    fontVariant: ['tabular-nums'] as any,
+    fontFamily: 'monospace',
+    lineHeight: 22,
+  },
+  wristDbgVal: {
+    color: '#fff',
+    fontWeight: '700',
+    fontSize: 14,
+  },
+  wristDbgWarn: {
+    color: '#f87171',
+  },
+  recVibratoBadge: {
+    position: 'absolute',
+    top: 14,
+    left: 16,
+    alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  recVibratoLabel: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: 'rgba(255,255,255,0.6)',
+    letterSpacing: 1,
+  },
+  recVibratoScore: {
+    fontSize: 26,
+    fontWeight: '700',
+    color: 'rgba(255,255,255,0.95)',
+    fontVariant: ['tabular-nums'],
+    lineHeight: 30,
+  },
+  recGraphOuter: {
+    position: 'absolute',
+    top: 0, left: 0, right: 0, bottom: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  recGraphBg: {
+    backgroundColor: 'rgba(0,0,0,0.52)',
+    borderRadius: 10,
+    padding: 6,
+    flexDirection: 'row',
+    alignItems: 'stretch',
+    gap: 4,
+  },
+  recGraphLabels: {
+    justifyContent: 'space-between',
+    paddingVertical: 2,
+  },
+  recGraphCentsLabel: {
+    fontSize: 9,
+    color: 'rgba(255,255,255,0.4)',
     fontVariant: ['tabular-nums'],
   },
   recStopCorner: {
     position: 'absolute',
-    bottom: 14,
+    bottom: 0,
     left: 16,
+  },
+
+  bowBtnRow: {
+    position: 'absolute',
+    right: 16,
+    flexDirection: 'row',
+    gap: 10,
+  },
+
+  bowRotateBtn: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    borderWidth: 1.5,
+    borderColor: 'rgba(255,255,255,0.25)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  bowRotateBtnText: {
+    fontSize: 30,
+    color: '#fff',
+    lineHeight: 36,
   },
 
 });

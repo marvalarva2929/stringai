@@ -1,0 +1,18 @@
+# YOLOv8 Pose dataset config — StringAI bow keypoint detector
+#
+# 3 keypoints per bow:
+#   KP0 — Tip:     the very end of the bow head (thin end, away from player's hand)
+#   KP1 — Frog:    heel of the frog, where thumb contacts the stick (NOT the end button)
+#   KP2 — Contact: where bow hair ribbon crosses the string (the sounding point)
+#
+# flip_idx: on horizontal flip, tip and frog swap positions but contact stays contact.
+
+path: data                 # dataset root (relative to this file)
+train: images/train
+val:   images/val
+
+nc: 1
+names: ['bow']
+
+kpt_shape: [3, 3]          # 3 keypoints x (x, y, visibility)
+flip_idx: [1, 0, 2]        # tip(0) <-> frog(1) on H-flip; contact(2) stays

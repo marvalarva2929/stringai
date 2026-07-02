@@ -3,6 +3,7 @@ import { preparePoseFramesForScoring } from '../lib/poseFramePrep';
 import { MetricScore, MeasurementQuality } from '../types/analysis';
 import { PoseJoints, HandLandmarks, PoseJoint } from '../components/analysis/PoseSkeleton';
 import { InstrumentId } from '../types/instrument';
+import { RawBowFrame } from '../types/signals';
 import { analyzeVideo } from 'pose-camera';
 
 // Minimum shoulder width in raw screen coordinates (0-1) for reliable measurement.
@@ -41,6 +42,8 @@ export function convertPoseFrame(
     if (joints.rightElbow)    pose[POSE.RIGHT_ELBOW]    = toL(joints.rightElbow);
     if (joints.leftWrist)     pose[POSE.LEFT_WRIST]     = toL(joints.leftWrist);
     if (joints.rightWrist)    pose[POSE.RIGHT_WRIST]    = toL(joints.rightWrist);
+    if (joints.leftIndexTip)  pose[POSE.LEFT_INDEX_TIP] = toL(joints.leftIndexTip);
+    if (joints.leftPinkyTip)  pose[POSE.LEFT_PINKY_TIP] = toL(joints.leftPinkyTip);
     // Vision provides neck, not nose — map neck to POSE.NOSE for head-tilt scoring.
     if (joints.neck)          pose[POSE.NOSE]           = toL(joints.neck);
     poseLandmarks = pose;
@@ -86,16 +89,29 @@ function assessFrameQuality(frames: FrameKeypoints[]): MeasurementQuality {
   return goodFrames / frames.length >= 0.4 ? 'high' : 'low';
 }
 
+/** Parse bow keypoints from a raw native frame dict into RawBowFrame, or null. */
+function parseBowFrame(f: any): RawBowFrame | null {
+  if (!f.bowTip || !f.bowFrog || !f.bowContact) return null;
+  return {
+    timestamp:      f.timestamp ?? 0,
+    tipX:           f.bowTip.x,     tipY:     f.bowTip.y,     tipVisible:     !!f.bowTip.visible,
+    frogX:          f.bowFrog.x,    frogY:    f.bowFrog.y,    frogVisible:    !!f.bowFrog.visible,
+    contactX:       f.bowContact.x, contactY: f.bowContact.y, contactVisible: !!f.bowContact.visible,
+    confidence:     f.bowConfidence ?? 0,
+  };
+}
+
 export function scorePoseFrames(
   frames: FrameKeypoints[],
   instrument: InstrumentId,
   durationSeconds: number,
+  bowFrames: RawBowFrame[] = [],
 ): MetricScore[] {
   if (frames.length < 5) return [];
   const quality = assessFrameQuality(frames);
   const prepared = preparePoseFramesForScoring(frames);
   if (prepared.length < 5) return [];
-  const metrics = scorePoseMetrics(prepared, [], instrument, durationSeconds);
+  const metrics = scorePoseMetrics(prepared, bowFrames, instrument, durationSeconds);
   if (quality === 'low') {
     return metrics.map((m) =>
       m.measurementQuality === 'unavailable' ? m : { ...m, measurementQuality: 'low' as MeasurementQuality },
@@ -105,14 +121,22 @@ export function scorePoseFrames(
 }
 
 /**
- * Extract pose frames from an existing video file by running Apple Vision at 5 fps.
- * Used for the uploaded-video path where no live onPose events were collected.
- * Returns [] on Android or when the module is unavailable.
+ * Extract pose + bow frames from an existing video file via Apple Vision and
+ * the CoreML bow detector. Used for the uploaded-video path.
+ * Returns empty arrays on Android or when the module is unavailable.
  */
-export async function extractVideoFrames(videoUri: string): Promise<FrameKeypoints[]> {
+export async function extractVideoFrames(
+  videoUri: string,
+): Promise<{ poseFrames: FrameKeypoints[]; bowFrames: RawBowFrame[] }> {
   const rawFrames: any[] = await analyzeVideo(videoUri);
-  if (!rawFrames || rawFrames.length === 0) return [];
-  return rawFrames.map((f) =>
+  if (!rawFrames || rawFrames.length === 0) return { poseFrames: [], bowFrames: [] };
+
+  const poseFrames = rawFrames.map((f) =>
     convertPoseFrame(f.joints ?? {}, f.leftHand ?? null, f.rightHand ?? null, f.timestamp ?? 0),
   );
+  const bowFrames = rawFrames
+    .map(parseBowFrame)
+    .filter((f): f is RawBowFrame => f !== null);
+
+  return { poseFrames, bowFrames };
 }

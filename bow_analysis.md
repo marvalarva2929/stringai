@@ -11,6 +11,10 @@ The pipeline also introduces `SessionSignals` — a time-series data contract th
 ## Architecture
 
 ```
+Pre-recording calibration (3 tap-to-capture poses)
+       │
+       │  BowCalibration
+       ▼
 Raw video (mp4/mov)
        │
        ▼
@@ -24,7 +28,7 @@ Raw video (mp4/mov)
        ▼
 ┌──────────────────────┐
 │  buildSessionSignals │  src/lib/sessionSignals.ts  (NEW)
-│                      │  Audio + pose + bow → SessionSignals
+│                      │  Audio + pose + bow + calibration → SessionSignals
 └──────────────────────┘
        │
        │  SessionSignals
@@ -38,6 +42,20 @@ Raw video (mp4/mov)
        ▼
   MetricScore[]  +  StatisticalFinding[]
 ```
+
+---
+
+## No Calibration
+
+The model outputs three keypoints — tip, frog, and the string contact point — directly in frame coordinates. No per-session camera calibration is needed. The bow usage metric (0=frog, 1=tip) is computed by projecting the contact point onto the frog→tip line:
+
+```typescript
+t = dot(contact − frog, tip − frog) / |tip − frog|²
+```
+
+This is robust across all camera angles and positions.
+
+**Bow zone (bridge vs. fingerboard) is a future feature.** Detecting bridge vs. fingerboard position from the camera requires knowing the camera's relationship to the violin body, which varies per session. For MVP, only the frog→tip contact point is tracked.
 
 ---
 
@@ -62,11 +80,9 @@ interface TimeSeries<T> {
 }
 ```
 
-### `SessionSignals` — `src/types/signals.ts` (NEW)
+### `SessionSignals` — `src/types/signals.ts`
 
 ```typescript
-type BowZone = 'sul_ponticello' | 'normal' | 'sul_tasto';
-
 interface SessionSignals {
   durationSeconds: number;
 
@@ -80,27 +96,27 @@ interface SessionSignals {
   rightElbowY:      TimeSeries<number | null>;   // normalized y, bow arm
   shoulderDiff:     TimeSeries<number | null>;   // |leftShoulder.y - rightShoulder.y|
 
-  // ── Sparse bow (10 fps, filtered to high-confidence frames) ─
-  bowContactPoint:  TimeSeries<number | null>;   // 0=frog … 1=tip
-  bowAngle:         TimeSeries<number | null>;   // degrees from perpendicular to strings
+  // ── Sparse bow (10 fps, high-confidence frames only) ────────
+  bowContactPoint:  TimeSeries<number | null>;   // 0=frog … 1=tip (projection formula)
+  bowAngle:         TimeSeries<number | null>;   // degrees from horizontal
   bowSpeed:         TimeSeries<number | null>;   // normalized tip pixels/sec (frame width = 1)
-  bowZone:          TimeSeries<BowZone | null>;  // derived from bowContactPoint
 
   // ── Segmentation index (derived from audio) ─────────────────
-  noteEvents: NoteEvent[];  // lean: audio fields only, no bow/pose fields
+  noteEvents: NoteEvent[];
 }
 ```
 
-### `RawBowFrame` — `src/types/signals.ts` (NEW)
+### `RawBowFrame` — `src/types/signals.ts`
 
-What the Swift module returns per frame. Coordinates are normalized 0-1 in the original video frame (landscape, correct orientation after `appliesPreferredTrackTransform`).
+Three keypoints: tip, frog, and the string contact point. All coordinates normalized 0-1 in the original video frame.
 
 ```typescript
 interface RawBowFrame {
   timestamp: number;
-  tipX: number;  tipY: number;  tipVisible: boolean;
-  frogX: number; frogY: number; frogVisible: boolean;
-  confidence: number;  // YOLO detection confidence
+  tipX: number;     tipY: number;     tipVisible: boolean;
+  frogX: number;    frogY: number;    frogVisible: boolean;
+  contactX: number; contactY: number; contactVisible: boolean;
+  confidence: number;
 }
 ```
 
@@ -278,8 +294,9 @@ The existing function already samples at 10fps, runs Vision pose + hands, and re
 if let detector = BowDetector.shared,
    let detection = detector.detect(in: image),
    detection.confidence >= 0.4 {
-    payload["bowTip"]        = ["x": detection.tipX,  "y": detection.tipY,  "visible": detection.tipVisible]
-    payload["bowFrog"]       = ["x": detection.frogX, "y": detection.frogY, "visible": detection.frogVisible]
+    payload["bowTip"]        = ["x": detection.tipX,     "y": detection.tipY,     "visible": detection.tipVisible]
+    payload["bowFrog"]       = ["x": detection.frogX,    "y": detection.frogY,    "visible": detection.frogVisible]
+    payload["bowContact"]    = ["x": detection.contactX, "y": detection.contactY, "visible": detection.contactVisible]
     payload["bowConfidence"] = detection.confidence
 }
 ```
@@ -294,68 +311,33 @@ The `processFrame` method in `PoseCameraView.swift` already runs at 15fps. Once 
 
 ## Phase 4 — Bow Signal Processing
 
-**New file:** `src/lib/bowAnalysis.ts`
+**File:** `src/lib/bowAnalysis.ts`
 
-Converts `RawBowFrame[]` from the native bridge into typed bow time series.
+Converts `RawBowFrame[]` into typed bow time series. No calibration needed.
 
-### 4a. `bowContactPoint` derivation
+### `bowContactPoint` derivation
 
-The contact point (0=frog, 1=tip) is where on the bow stick the string is currently crossed. We compute it by finding where the bow stick line intersects an estimated string Y coordinate.
-
-```
-String Y estimation (without bridge detector):
-  Use leftWrist.y from the pose frame nearest in time.
-  The violin strings run roughly parallel to the instrument body;
-  their midpoint is approximately at the left wrist height.
-  This is a proxy — bridge detector (Phase 18 in plan.md) will replace it.
-```
-
-Given tip `(tx, ty)` and frog `(fx, fy)` in normalized frame coordinates:
+Projects the model-detected contact point onto the frog→tip bow stick line:
 
 ```typescript
-function bowContactPoint(tip: Point, frog: Point, stringY: number): number | null {
+function computeContactPoint(tip: Point, frog: Point, contact: Point): number | null {
+  const dx = tip.x - frog.x;
   const dy = tip.y - frog.y;
-  if (Math.abs(dy) < 0.01) return null;  // bow nearly horizontal — unstable
-  const t = (stringY - frog.y) / dy;    // parametric t along frog→tip line
+  const len2 = dx * dx + dy * dy;
+  if (len2 < 0.0001) return null;   // tip and frog overlap — degenerate frame
+  const t = ((contact.x - frog.x) * dx + (contact.y - frog.y) * dy) / len2;
   return Math.max(0, Math.min(1, t));
 }
 ```
 
-### 4b. `bowAngle` derivation
+Requires all three keypoints visible. Frames where `contactVisible = false` produce a null contact point for that timestamp.
 
-Angle of the bow stick relative to the horizontal. Zero = perfectly perpendicular to the strings (ideal). Positive = tip-high, negative = tip-low.
+### `deriveBowTimeSeries(frames: RawBowFrame[]): BowTimeSeries`
 
-```typescript
-function bowAngle(tip: Point, frog: Point): number {
-  return Math.atan2(tip.y - frog.y, tip.x - frog.x) * (180 / Math.PI);
-}
-```
-
-### 4c. `bowSpeed` derivation
-
-Tip velocity between consecutive frames, normalized by frame width (so it's aspect-ratio-independent and resolution-independent).
-
-```typescript
-function bowSpeed(curr: RawBowFrame, prev: RawBowFrame): number | null {
-  if (!curr.tipVisible || !prev.tipVisible) return null;
-  const dt = curr.timestamp - prev.timestamp;
-  if (dt < 0.01) return null;
-  const dx = curr.tipX - prev.tipX;
-  const dy = curr.tipY - prev.tipY;
-  return Math.sqrt(dx * dx + dy * dy) / dt;
-}
-```
-
-### 4d. Smoothing and outlier rejection
-
-Before building time series:
+Returns `bowContactPoint`, `bowAngle`, `bowSpeed` time series. Filter steps:
 1. Drop frames where `confidence < 0.4`
-2. Drop frames where both endpoints are invisible
-3. Single-frame outliers: if a frame's `bowContactPoint` is > 0.4 away from both neighbors, replace with linear interpolation of neighbors
-
-### 4e. `deriveBowTimeSeries(frames: RawBowFrame[], poseFrames): BowTimeSeries`
-
-Returns the bow-specific signals to merge into `SessionSignals`.
+2. Drop frames where both tip and frog are invisible
+3. Spike rejection: drop a frame whose `tip.y` differs from both neighbors by > 0.15 while the neighbors agree within 0.08 (single-frame detection glitch)
 
 ---
 
@@ -367,18 +349,19 @@ Returns the bow-specific signals to merge into `SessionSignals`.
 
 ```typescript
 function buildSessionSignals(
-  audioOutput: AudioAnalysisOutput,   // from audioEngine.ts
-  rawFrames: RawVideoFrame[],          // from analyzeVideoFrames (native bridge)
+  audioOutput:     AudioAnalysisOutput,
+  poseFrames:      FrameKeypoints[],
+  bowFrames:       RawBowFrame[],
+  noteEvents:      NoteEvent[],
   durationSeconds: number,
 ): SessionSignals
 ```
 
 Steps:
-1. Build audio time series from `audioOutput.rawSignals` (pitchFrames, rmsFrames, toneFrames)
-2. Extract pose frames from `rawFrames` using `convertPoseFrame` (already in `videoAnalysis.ts`)
-3. Extract `RawBowFrame[]` from `rawFrames` (new — parse `bowTip`, `bowFrog`, `bowConfidence` fields)
-4. Build pose time series: `leftWristAngle`, `rightElbowY`, `shoulderDiff` from `FrameKeypoints[]`
-5. Call `deriveBowTimeSeries` to get bow time series
+1. Build audio time series from `audioOutput.rawSignals`
+2. Build pose time series: `leftWristAngle`, `rightElbowY`, `shoulderDiff` from `FrameKeypoints[]`
+3. Call `deriveBowTimeSeries(bowFrames)` — no calibration param needed
+4. Assemble into `SessionSignals`
 6. Assemble into `SessionSignals`
 
 ### `NoteEvent` stays lean
@@ -528,13 +511,14 @@ Audio-only tests (Phase 7) and `SessionSignals` / `TimeSeries` types (Phase 5) h
 | File | What it does |
 |---|---|
 | `bow_analysis.md` | This document |
+| `bow_model.md` | ML model training guide (3-keypoint: tip, frog, contact) |
 | `ml/extract_frames.py` | Frame extraction from video files |
 | `ml/train.py` | YOLOv8n-pose training |
 | `ml/evaluate.py` | OKS evaluation + visualization |
 | `ml/data.yaml` | Dataset config |
 | `modules/pose-camera/ios/BowDetector.swift` | CoreML bow model wrapper |
 | `src/types/signals.ts` | `TimeSeries`, `SessionSignals`, `RawBowFrame` types |
-| `src/lib/bowAnalysis.ts` | `RawBowFrame[]` → bow time series |
+| `src/lib/bowAnalysis.ts` | `RawBowFrame[]` → bow time series (projection formula) |
 | `src/lib/sessionSignals.ts` | `buildSessionSignals` — assembles full `SessionSignals` |
 | `src/lib/patternDetection.ts` | Statistical tests → `StatisticalFinding[]` |
 
@@ -546,20 +530,51 @@ Audio-only tests (Phase 7) and `SessionSignals` / `TimeSeries` types (Phase 5) h
 | `src/lib/poseScoring.ts` | Replace stubs; scoring fns take `SessionSignals` |
 | `src/services/videoAnalysis.ts` | Wire `buildSessionSignals`; call real scoring |
 | `src/types/analysis.ts` | Add `sessionSignals?: SessionSignals` to `AnalysisResult` |
-| `app/(tabs)/analyze.tsx` | Call `buildSessionSignals` in `processMedia` |
+| `app/(tabs)/analyze.tsx` | Add `bow_calibration` phase; pass `BowCalibration` through pipeline |
 
 ---
 
-## What to Build First
+## Build Progress
 
-The ML training data is the critical-path dependency for bow metrics. Everything else can be written and tested with stub/null bow data immediately.
+| Step | File(s) | Status |
+|---|---|---|
+| 1 | `src/types/signals.ts` | ✅ Done |
+| 2 | `src/lib/bowAnalysis.ts` | ✅ Done |
+| 3 | `src/lib/sessionSignals.ts` | ✅ Done |
+| 4 | `src/lib/patternDetection.ts` | ✅ Done |
+| 5 | `bow_model.md` | ✅ Done |
+| 6 | `ml/extract_frames.py` + labeling | ⏳ Pending (parallel track) |
+| 7 | `ml/train.py` | ⏳ Pending (needs ~3,000 labeled frames) |
+| 8 | `modules/pose-camera/ios/BowDetector.swift` + `PoseCameraModule.swift` | ⏳ Pending (needs trained model) |
+| 9 | `src/lib/poseScoring.ts` + `src/services/videoAnalysis.ts` | ⏳ Pending (needs step 8) |
+| 10 | `app/(tabs)/analyze.tsx` | ⏳ Pending (final wiring) |
 
-**Recommended order:**
-1. `src/types/signals.ts` — define the data contract everything else references
-2. `src/lib/sessionSignals.ts` + `bowAnalysis.ts` — signal assembly (testable with mock data)
-3. `src/lib/patternDetection.ts` — audio-only tests first (no model needed)
-4. `ml/extract_frames.py` + labeling — start collecting data in parallel
-5. `ml/train.py` — once ~500 labeled frames exist, train a first-pass model
-6. `modules/pose-camera/ios/BowDetector.swift` + `PoseCameraModule.swift` — once model exists
-7. `src/lib/poseScoring.ts` + `src/services/videoAnalysis.ts` — wire real bow scoring
-8. `app/(tabs)/analyze.tsx` — final wiring
+### Step 1–4 notes (2026-06-16)
+
+- `TimeSeries<T>` uses binary search for `sample()` and `window()` — efficient even at 3,000 pts/signal.
+- `bowContactPoint` formula gracefully degrades: uses calibrated `stringY` when available, `leftWrist.y` fallback otherwise.
+- `bowZone` returns null throughout when calibration was skipped — statistical tests gate on this.
+- `buildSessionSignals` accepts `FrameKeypoints[]` (already converted) + `RawBowFrame[]` separately — keeps conversion logic in the caller (`analyze.tsx`).
+- All new files type-check clean; pre-existing TS errors in `analyze.tsx` and `piece/[id].tsx` are unrelated.
+
+### Calibration redesign (2026-06-17)
+
+Reduced from 3 poses to 2 after user feedback:
+- **Old scheme**: Pose A (frog at bridge) + Pose B (tip at bridge) + Pose C (bow near fingerboard)
+- **New scheme**: Pose A (frog at bridge, sul ponticello) + Pose B (tip at fingerboard, sul tasto)
+
+Each pose now simultaneously calibrates both axes. Pose B ("tip at bridge") was awkward and unnatural. The new Pose B captures the real opposite extreme of bow movement. `BowCalibration.stringY` is now `avg(frogAtBridge.frogY, tipAtFingerboard.tipY)` — an approximation rather than exact, but the string height difference across the playing range is small in normalized frame coords and acceptable for the contact-point formula.
+
+### Redesign (2026-06-17)
+
+Framework redesigned to remove all camera calibration:
+- **Old approach**: model detected tip + frog only; string Y estimated from wrist position or per-session calibration poses. Calibration UI built (BowCalibrationFlow.tsx) then deleted.
+- **New approach**: model detects 3 keypoints — tip, frog, and the string contact point directly. Project contact onto the frog→tip line for the 0-1 metric. No calibration, no fallback proxy.
+- `bowZone` (bridge vs. fingerboard) deferred to a future phase — requires knowing camera relationship to violin body.
+- Deleted: `bowCalibration.ts`, `BowCalibrationFlow.tsx`, `BowCalibration` type, `CalibratedBowPose` type.
+- `patternDetection.ts`: Three audio-only tests (`intonation_fatigue`, `finger_accuracy_gap`, `pitch_tendency`). `runPatternDetection()` returns only fired findings with confidence ≥ 0.4.
+- All files type-check clean (only pre-existing errors in `analyze.tsx` and `piece/[id].tsx` remain).
+
+### What to Build Next (step 6)
+
+`BowCalibrationFlow.tsx` — 3-step tap-to-capture calibration UI inserted between `camera_tip` and `recording` phases. Can be built and tested now against stub bow detection (just return hardcoded `CalibratedBowPose` for each step until the CoreML model exists).

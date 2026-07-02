@@ -49,6 +49,13 @@ export async function updateProfileFields(
   if (error) throw error;
 }
 
+export async function resetPassword(email: string): Promise<void> {
+  const { error } = await supabase.auth.resetPasswordForEmail(email, {
+    redirectTo: 'stringai://reset',
+  });
+  if (error) throw error;
+}
+
 export async function incrementFreeAnalysesInDb(userId: string): Promise<void> {
   const { error } = await supabase.rpc('increment_free_analyses', { p_user_id: userId });
   if (error) throw error;

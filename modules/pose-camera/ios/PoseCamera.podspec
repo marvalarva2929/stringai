@@ -10,7 +10,7 @@ Pod::Spec.new do |s|
   s.dependency     'ExpoModulesCore'
   s.dependency     'MediaPipeTasksVision', '~> 0.10'
   s.source_files   = '*.swift'
-  s.resources      = ['hand_landmarker.task']
+  s.resources      = ['hand_landmarker.task', 'pose_landmarker_full.task', 'bow_detector.mlmodelc']
   s.frameworks     = 'AVFoundation', 'Vision', 'Photos'
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',

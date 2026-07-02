@@ -28,6 +28,17 @@ export function analyzeVideo(videoUri) {
   return getModule()?.analyzeVideo(videoUri) ?? Promise.resolve([]);
 }
 
+// Returns a base64-encoded PCM16 WAV string of the last `windowSeconds` seconds
+// of audio captured during the live session. Returns null if the ring buffer
+// hasn't filled yet or the module is unavailable.
+export function getRecentAudioWav(windowSeconds) {
+  return getModule()?.getRecentAudioWav(windowSeconds) ?? Promise.resolve(null);
+}
+
+export function setHomeIndicatorHidden(hidden) {
+  getModule()?.setHomeIndicatorHidden(hidden);
+}
+
 let _NativeView = null;
 export function getPoseCameraView() {
   if (_NativeView) return _NativeView;

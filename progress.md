@@ -1,8 +1,12 @@
 # StringAI — Progress & Codebase Reference
 
-## Current Status: Signal Fusion Built — Video Features Polish Next
+## Current Status: Bow ML Pipeline — Critical Path to Full L1-L10 Analysis
 
-Audio DSP, signal fusion (`noteFusion.ts` → `NoteEvent[]`), video replay with frame-accurate seeking, note-marker scrubber, speed controls, and octave-aware intonation analysis are all in place. State persists across app restarts via Zustand + AsyncStorage. User's current focus: finish remaining video features. Next after that: calibration clips, Supabase wiring, MediaPipe.
+**As of Jun 18, 2026.** The audio analysis pipeline (L1 audio, L2 note fusion, L3 signals, L4 basic pattern detection) is fully implemented in TypeScript and working on-device. The bow detector ML model is the critical missing piece: all four bow metrics return "unavailable," and L5 (slur detection), L7 (phrase features), and several L8 pattern tests are blocked until the bow detector provides real bow position/speed/angle data.
+
+**Active sprint (Jun 18–23):** Build the Python bow ML pipeline (Wed), collect/label training data (Thu), train and export CoreML model (Fri), wire into app + implement real bow scoring (Fri-Sat), calibrate all L1 thresholds (Sat), implement L2–L5 improvements (Sat-Sun), implement L6–L7 phrase analysis (Mon), wire Supabase + LLM Edge Function (Mon).
+
+**Philosophy adopted:** Layer-by-layer, bottom-up. Do not build L2 improvements on top of L1 proxy data. Do not validate L5-L10 until L1 bow data is real.
 
 ---
 
@@ -17,7 +21,81 @@ Audio DSP, signal fusion (`noteFusion.ts` → `NoteEvent[]`), video replay with 
 | Payments | RevenueCat — wired, paywall commented out |
 | Audio DSP | Custom on-device pipeline in `audioEngine.ts` |
 | Video | Native iOS `VideoAudioExtractor` module (AVFoundation) |
-| CV / Pose | MediaPipe — planned (Phase 7) |
+| CV / Pose | Apple Vision (in `PoseCameraModule.swift`) — working for pose; bow detector pending |
+| Bow ML | YOLOv8n-pose → CoreML INT8 (~2 MB) — training in progress |
+| ML Training | Python: Ultralytics YOLOv8, OpenCV — lives in `ml/` directory |
+| Labeling | Roboflow (3-keypoint: tip, frog, contact) |
+| LLM Coaching | Claude Haiku via Supabase Edge Function — planned Jun 23 |
+
+---
+
+## Layer Status (L1–L10)
+
+| Layer | Name | Status | Blocker |
+|---|---|---|---|
+| **L1 Audio** | Signal Extraction (audio) | ✅ Complete | — |
+| **L1 Vision** | Signal Extraction (pose) | ⚠️ Partial | `FrameKeypoints[]` not yet wired into post-hoc `processMedia()` scoring path |
+| **L1 Bow** | Signal Extraction (bow) | ❌ Blocked | ML model not yet trained; Python pipeline being built Jun 18 |
+| **L2** | Onset + Note Detection | ✅ Audio-only complete | Hybrid onset (+ bow speed) planned Jun 21 |
+| **L3** | Time-Synced Feature Engine | ⚠️ Schema done | Vibrato series (zero-crossing only now), timbre missing; planned Jun 21-22 |
+| **L4** | Event Detection | ⚠️ Partial | 3 audio tests in `patternDetection.ts`; bow events blocked on L1 bow |
+| **L5** | Note Grouping (Slurs) | ❌ Not built | Needs bow direction from L1 bow |
+| **L6** | Phrase Segmentation | ⚠️ Basic only | RMS-based only; composite energy improvement planned Jun 23 |
+| **L7** | Phrase Feature Engine | ❌ Not built | `phraseFeatures.ts` planned Jun 23 |
+| **L8** | Statistical Relationships | ⚠️ Partial | `patternDetection.ts` has 3 tests; bow-dependent tests blocked |
+| **L9** | Musical Interpretation | ⚠️ Partial | `sessionAssessment.ts` works; phrase-level interpretation missing |
+| **L10** | LLM Teacher | ⚠️ Stub | `llmFeedback.ts` uses static templates; Edge Function planned Jun 23 |
+
+---
+
+## Current Sprint Checklist (Jun 18–23)
+
+### Wednesday Jun 18 — Python Pipeline
+- [ ] Create `ml/` directory
+- [ ] `ml/extract_frames.py` — 10fps extraction, near-duplicate deduplication, manifest.csv output
+- [ ] `ml/data.yaml` — YOLOv8 pose config, `kpt_shape: [3,3]`, `flip_idx: [1,0,2]`
+- [ ] `ml/train.py` — YOLOv8n-pose training script
+- [ ] `ml/export_coreml.py` — CoreML INT8 export
+- [ ] `ml/evaluate.py` — OKS evaluation with per-keypoint and per-zone breakdown
+- [ ] `ml/requirements.txt`
+- [ ] `modules/pose-camera/ios/BowDetector.swift` — CoreML wrapper (can write against spec before model exists)
+
+### Thursday Jun 19 — Data Collection (User leads)
+- [ ] Record violin videos (all bow zones, both strings, slow + fast)
+- [ ] Run `extract_frames.py` on recordings
+- [ ] Upload to Roboflow, label 500–1,000 frames (tip, frog, contact keypoints)
+- [ ] `modules/pose-camera/ios/PoseCameraModule.swift` — extend `analyzeVideoFrames` with bow detection
+- [ ] `src/services/videoAnalysis.ts` — parse bow keys → `RawBowFrame[]`
+
+### Friday Jun 20 — Training + L1 Wiring
+- [ ] Train model (`python ml/train.py`)
+- [ ] Evaluate OKS (contact point > 0.75 required)
+- [ ] Export + copy `best.mlpackage` to `modules/pose-camera/ios/`
+- [ ] `app/(tabs)/analyze.tsx` — wire real pose + bow into `processMedia()`
+- [ ] `src/lib/poseScoring.ts` — replace 4 stub bow scoring functions with real implementations
+
+### Saturday Jun 21 — Calibration + L2 Improvements
+- [ ] L1 calibration: tune bow angle threshold, bow distribution range, wrist collapse angle
+- [ ] Audio calibration: tune `YIN_THRESHOLD`, `IN_TUNE_CENTS`, tone quality thresholds
+- [ ] `src/services/audioEngine.ts` — reduce YIN hop 50ms → 25ms
+- [ ] `src/services/audioEngine.ts` — vibrato fix (band-pass pitch contour, per-note rate/depth)
+- [ ] `src/lib/noteFusion.ts` — hybrid onset function (bow speed derivative)
+
+### Sunday Jun 22 — L3-L5 + Pattern Validation
+- [ ] `src/services/audioEngine.ts` — spectral centroid + brightness (timbre proxies)
+- [ ] `src/lib/sessionSignals.ts` — populate vibrato and timbre time series
+- [ ] Wire L4 bow events (angle deviation) into `flaggedTimestamps`
+- [ ] `src/lib/noteGrouping.ts` (NEW) — L5 slur/bow grouping
+- [ ] `src/lib/patternDetection.ts` — add `bow_distribution_narrow` test; validate all 4 tests fire on real data
+
+### Monday Jun 23 — L6-L10 + Backend
+- [ ] `src/lib/noteFusion.ts` — improve L6 phrase segmentation (composite energy)
+- [ ] `src/lib/phraseFeatures.ts` (NEW) — L7 phrase feature engine
+- [ ] Fill `.env` with Supabase keys
+- [ ] Run `supabase/migrations/001_initial_schema.sql`
+- [ ] `supabase/functions/analyze-feedback/index.ts` (NEW) — L10 Edge Function → Claude Haiku
+- [ ] `src/services/llmFeedback.ts` — replace stub with Edge Function call
+- [ ] End-to-end test: record → all 13 real metrics → real LLM coaching → save to Supabase → reload in history
 
 ---
 
@@ -31,6 +109,7 @@ Audio DSP, signal fusion (`noteFusion.ts` → `NoteEvent[]`), video replay with 
 - [x] Core UI components: Button, Card, ScoreGauge, MetricCard, AnalysisTimeline
 - [x] Instrument config system — violin defined, viola/cello stubs in place
 - [x] `scripts/run.sh` + `scripts/build.sh`, `.env.example`
+- [x] Git repo initialized, remote: `git@github-personal:marvalarva2929/stringai.git` (SSH alias for multi-account GitHub setup — intentional, don't change)
 
 ### Home Tab
 - [x] Analytics strip — sessions count, avg score, trend (last 3 vs previous 3), streak
@@ -54,26 +133,33 @@ Audio DSP, signal fusion (`noteFusion.ts` → `NoteEvent[]`), video replay with 
 ### Audio Analysis Engine
 - [x] `src/services/audioEngine.ts` — full on-device DSP pipeline:
   - WAV parser (handles 8/16/32-bit PCM, any channel count)
-  - YIN pitch detection (1024-sample window ~23ms, **50ms hop** — reduce to 20ms is a planned improvement)
+  - YIN pitch detection (1024-sample window ~23ms, **50ms hop** — reduce to 25ms is planned Jun 21)
   - Cooley-Tukey in-place FFT + Hann window
   - RMS envelope + onset detection
   - 7 scored metrics: pitchAccuracy, intonationStability, toneQuality, bowSmoothness, rhythmAccuracy, dynamicControl, vibrato
   - Each scoring fn returns `MetricScore` with `events`, `occurrenceRate`, `observationSummary`, `flaggedTimestamps`
 - [x] `modules/video-audio-extractor/` — native iOS module (AVFoundation); extracts PCM from any video URI (`ph://`, `file://`) and writes a WAV file
 
-### Signal Fusion Layer
+### Signal Fusion Layer (L1-L2 TypeScript Infrastructure)
 - [x] `src/lib/noteFusion.ts` — audio-only `NoteEvent[]` pipeline:
   - `segmentByPitch()`: pitch-class-transition segmentation (`MIN_DURATION_S=0.05`, `HOP_S=0.025`, `MAX_NULL_GAP=4`)
   - `filterArtifacts()`: removes short notes with neighbor-similarity guard (`SHORT_S=0.15`, `MAX_PASSES=6`)
   - `deriveIntonationAnalysis()`: groups by full note name incl. octave (B4/B5 are separate; was stripping octave — caused B4/B5 to merge)
-- [x] `NoteEvent` carries: `startSeconds`, `endSeconds`, `noteName`, `pitchHz`, `centsDeviation`, `inTune`, `midiNote`; video/pose fields (string, finger, wristCollapsed, bowContactPoint) planned after MediaPipe
-- [x] `PitchClassIssue.pitchClass` holds full note name incl. octave (e.g. "B4", "F#5"); `representativeMidi` provided so reference note lookups remain correct
+- [x] `src/types/signals.ts` — `TimeSeries<T>`, `SessionSignals`, `RawBowFrame` types; binary search for `sample()` and `window()` queries
+- [x] `src/lib/bowAnalysis.ts` — `RawBowFrame[]` → `BowTimeSeries`:
+  - Projection formula: `t = dot(contact − frog, tip − frog) / |tip − frog|²` (no calibration needed)
+  - Spike rejection on single-frame tip.y outliers
+  - `deriveBowTimeSeries()` filters low-confidence frames and spike outliers
+- [x] `src/lib/sessionSignals.ts` — `buildSessionSignals()` assembles all 4 streams into `SessionSignals`
+- [x] `src/lib/patternDetection.ts` — 3 statistical tests: `intonation_fatigue` (OLS regression), `finger_accuracy_gap` (group comparison), `pitch_tendency` (schema ready); min n=8 samples; confidence from effect size + sample size
+- [x] `NoteEvent` carries: `startSeconds`, `endSeconds`, `noteName`, `pitchHz`, `centsDeviation`, `inTune`, `midiNote`; bow/pose fields all null (pending bow detector + pose wiring)
+- [x] `PitchClassIssue.pitchClass` holds full note name incl. octave (e.g. "B4", "F#5"); `representativeMidi` for reference note lookups
 
 ### Video Replay Feature
 - [x] `src/types/analysis.ts` — `videoUri?` and `noteEvents?` added to `AnalysisResult`; `exampleTimestamps?` added to `PitchClassIssue`
 - [x] `src/lib/intonationAnalysis.ts` — surfaces up to 3 out-of-tune example timestamps per `PitchClassIssue`
 - [x] `src/services/llmFeedback.ts` — deduplicates items by metricKey (pitchAccuracy + intonationStability → single intonation coaching card)
-- [x] `src/components/analysis/VideoReplayModal.tsx` — full-screen slide-up modal player (used by standalone AnalysisTimeline)
+- [x] `src/components/analysis/VideoReplayModal.tsx` — full-screen slide-up modal player
 - [x] `src/components/analysis/InlineVideoPlayer.tsx` — always-open compact player:
   - Props: `uri`, `seekVersion`, `seekSeconds`, `noteEvents`, `durationSeconds`, `onMarkerPress`, `fullScreen`
   - Speed controls: 0.25×/0.5×/1.0× with pitch correction (`setRateAsync(rate, true)`)
@@ -88,9 +174,10 @@ Audio DSP, signal fusion (`noteFusion.ts` → `NoteEvent[]`), video replay with 
 - [x] `app/session/[id].tsx` — same split layout; passes `noteEvents`, `durationSeconds`, `onMarkerPress` to InlineVideoPlayer so markers appear when viewing session history
 - [x] `app/(tabs)/home.tsx` — piece group cards navigate to `/session/[latestSessionId]`
 
-### Video Analysis Stub
-- [x] `runVideoAnalysis` — returns 4 mock video metrics with realistic structure; replaced by real scoring once MediaPipe is integrated
-- [x] `src/lib/poseScoring.ts` — complete rule-based pose scoring: `FrameKeypoints` type, MediaPipe landmark index constants, 6 scoring functions (bowPlacement, bowAngle, bowArmLevel, bowDistribution, leftHandWrist, posture), `scorePoseMetrics()` entry point. No MediaPipe dependency — pure functions on landmark arrays.
+### Pose Scoring Logic
+- [x] `src/lib/poseScoring.ts` — complete rule-based pose scoring: `FrameKeypoints` type, MediaPipe landmark index constants, 6 scoring functions (bowPlacement, bowAngle, bowArmLevel, bowDistribution, leftHandWrist, posture), `scorePoseMetrics()` entry point. Pure functions on landmark arrays — no native dependency.
+- [x] `src/lib/poseFramePrep.ts` — downsampling to 10fps, EMA smoothing (α=0.35), shoulder-midpoint normalization
+- [x] `runVideoAnalysis` stub — returns 4 mock video metrics; replaced by real scoring in Jun 20 sprint
 
 ### Metric Detail Screen
 - [x] `app/metric/[key].tsx` — full-screen metric detail: score gauge + severity badge + delta, filtered timeline, flagged timestamp list, MetricSparkline (shown when ≥2 sessions), "How to Fix" drill card
@@ -175,23 +262,33 @@ src/
                           segmentation + artifact filtering
                           deriveIntonationAnalysis(): octave-aware intonation grouping
     poseScoring.ts        6 video scoring functions → MetricScore[]
-                          Pure functions on FrameKeypoints[]; no MediaPipe dependency
+                          Pure functions on FrameKeypoints[]; no native dependency
+                          4 bow functions are stubs (unavailableMetric) pending bow detector
+    bowAnalysis.ts        RawBowFrame[] → BowTimeSeries
+                          Projection formula: contact onto frog→tip line → bow_position_u
+                          Spike rejection, confidence filtering
+    sessionSignals.ts     buildSessionSignals() — assembles SessionSignals from all 4 streams
+    patternDetection.ts   3 statistical tests on NoteEvent[]; runPatternDetection() entry point
     sessionAssessment.ts  Classifies player as foundation|refinement from metrics
     intonationAnalysis.ts analyzeIntonation(PitchFrame[]) → IntonationAnalysis
                           Surfaces exampleTimestamps (up to 3) per PitchClassIssue
+    poseFramePrep.ts      Downsampling, EMA smoothing, shoulder normalization
     practicePlan.ts       Computes practice plan from MetricHistoryEntry[]
+    noteGrouping.ts       [PLANNED Jun 22] L5 slur/bow grouping → NoteGroup[]
+    phraseFeatures.ts     [PLANNED Jun 23] L7 phrase feature extraction → PhraseFeatures[]
   services/
     audioEngine.ts        On-device DSP (~750 lines)
                           analyzeMediaFile(uri) → AudioAnalysisOutput
                           YIN pitch, FFT tone, RMS, onset, vibrato → 7 MetricScores
                           analyzeMediaFileWithDebug() → AudioDebugInfo (raw intermediates)
     analysis.ts           Pipeline orchestration + Supabase persistence
-                          runAudioAnalysis() / runVideoAnalysis() (STUB)
+                          runAudioAnalysis() / runVideoAnalysis() (STUB — replaced Jun 20)
                           buildSessionFeedback() / saveSession() / fetchSessionHistory()
-    llmFeedback.ts        buildSessionFeedback() — local stub returning coaching text
-                          Deduplicates by metricKey (pitch + stability → single card)
+    llmFeedback.ts        buildSessionFeedback() — local stub returning static tips
+                          WILL BE REPLACED with Edge Function call Jun 23
     auth.ts               Supabase auth helpers
     videoAudioExtractor.ts Native iOS module wrapper (AVFoundation)
+    videoAnalysis.ts      [NEEDS WORK] Frame extraction + bow key parsing → {poseFrames, bowFrames}
   store/
     useAnalysisStore.ts   Phase state machine + session/metric history + sessionResultCache
                           Zustand persist middleware (AsyncStorage)
@@ -199,10 +296,29 @@ src/
     useUserStore.ts       UserProfile (instrument, skillLevel, playerCategory)
   types/
     analysis.ts           All analysis types (see Key Types below)
+    signals.ts            TimeSeries<T>, SessionSignals, RawBowFrame
 
 modules/
-  video-audio-extractor/ Native iOS AVFoundation module: extractAudioFromVideo() → wavUri
-pose-camera/             Native module: getPoseCameraView(), startRecording(), stopRecording()
+  video-audio-extractor/  Native iOS AVFoundation module: extractAudioFromVideo() → wavUri
+  pose-camera/ios/
+    PoseCameraModule.swift   10fps pose+hands inference; WILL BE EXTENDED with bow detection Jun 19
+    BowDetector.swift        [PLANNED Jun 18-19] CoreML wrapper for bow keypoint model
+
+ml/                       [PLANNED Jun 18] Python bow ML training pipeline
+  extract_frames.py       10fps frame extraction + near-duplicate filtering
+  data.yaml               YOLOv8 pose config (kpt_shape:[3,3], flip_idx:[1,0,2])
+  train.py                YOLOv8n-pose training (150 epochs, AdamW)
+  export_coreml.py        INT8 CoreML export → best.mlpackage
+  evaluate.py             OKS evaluation (target: overall>0.82, contact>0.75)
+  requirements.txt        ultralytics, opencv-python
+  data/raw_frames/        Frame extraction output (not committed)
+  runs/                   Training output (not committed)
+
+supabase/
+  migrations/
+    001_initial_schema.sql  All tables, RLS, profile trigger — ready to deploy
+  functions/
+    analyze-feedback/     [PLANNED Jun 23] Edge Function → Claude Haiku coaching
 ```
 
 ### Key Types
@@ -217,6 +333,7 @@ interface MetricScore {
   events: TechniqueEvent[];
   occurrenceRate: number;           // 0-1 fraction of session with issue
   observationSummary: string;       // "Left wrist collapsed 7 times"
+  measurementQuality?: 'unavailable' | 'low' | 'normal';  // 'unavailable' excludes from overall score
 }
 
 interface NoteEvent {
@@ -227,11 +344,12 @@ interface NoteEvent {
   centsDeviation: number;  // signed: + sharp, − flat
   inTune: boolean;         // |centsDeviation| ≤ 25
   midiNote: number;
-  // Video/pose fields: null until MediaPipe integrated
+  // All null until L1 bow detector + pose wiring complete:
   wristCollapsed: boolean | null;
   shoulderRaised: boolean | null;
-  bowContactPoint: number | null;  // 0=frog, 1=tip
-  // etc. — see architecture.md for full planned schema
+  bowContactPoint: number | null;  // 0=frog, 1=tip (projection formula)
+  bowAngle: number | null;
+  bowZone: 'sul_ponticello' | 'normal' | 'sul_tasto' | null;  // future (needs bridge detector)
 }
 
 interface PitchClassIssue {
@@ -243,6 +361,42 @@ interface PitchClassIssue {
   tendency: 'flat' | 'sharp' | 'mixed';
   exampleTimestamps?: { startSeconds: number; endSeconds: number }[];  // up to 3
   representativeMidi?: number;
+}
+
+interface RawBowFrame {
+  timestamp: number;
+  tipX: number;     tipY: number;     tipVisible: boolean;
+  frogX: number;    frogY: number;    frogVisible: boolean;
+  contactX: number; contactY: number; contactVisible: boolean;
+  confidence: number;
+}
+
+interface SessionSignals {
+  durationSeconds: number;
+  // Dense audio (~40 Hz, 25ms hop):
+  pitch:            TimeSeries<number | null>;   // Hz; null = unvoiced
+  rms:              TimeSeries<number>;
+  fundamentalRatio: TimeSeries<number>;
+  // Sparse pose (10 fps):
+  leftWristAngle:   TimeSeries<number | null>;
+  rightElbowY:      TimeSeries<number | null>;
+  shoulderDiff:     TimeSeries<number | null>;
+  // Sparse bow (10 fps, high-confidence frames only):
+  bowContactPoint:  TimeSeries<number | null>;   // 0=frog … 1=tip
+  bowAngle:         TimeSeries<number | null>;
+  bowSpeed:         TimeSeries<number | null>;   // norm coords/sec (tip velocity)
+  // Segmentation:
+  noteEvents: NoteEvent[];
+}
+
+interface NoteGroup {
+  // [PLANNED L5 - Jun 22]
+  id: number;
+  type: 'slur' | 'detache' | 'other';
+  noteIds: number[];
+  start_t: number;
+  end_t: number;
+  confidence: number;
 }
 
 interface AnalysisResult {
@@ -261,35 +415,43 @@ interface AnalysisResult {
   llmFeedback?: LLMFeedback;
   intonationAnalysis?: IntonationAnalysis;
   videoUri?: string;           // local file:// or ph:// path
-  noteEvents?: NoteEvent[];    // per-note fusion output; drives scrubber markers + intonation
+  noteEvents?: NoteEvent[];    // powers scrubber markers + intonation replay chips
+  sessionSignals?: SessionSignals;  // in-memory only, not persisted (too large)
 }
 ```
 
 ### Analysis Pipeline (`analyze.tsx: processMedia`)
 
+**Current (stub for video):**
 ```
 processMedia(uri, durationSec, isVideo)
-  │
   ├─ persistVideo(uri) → videoUri
-  │    file:// → copies to documentDirectory/sessions/ (10-session retention)
-  │    ph://   → returned as-is (Photos library, directly playable)
-  │    failure → falls back to original uri
-  │
   ├─ runAudioAnalysis(uri) → AudioAnalysisOutput
   │    └─ analyzeMediaFile → analyzeWavFile
   │         ├─ detectPitches() → PitchFrame[]
   │         ├─ noteFusion.segmentByPitch + filterArtifacts → NoteEvent[]
-  │         ├─ 7 scoring fns → MetricScore[] (events/occurrenceRate/summary)
+  │         ├─ 7 scoring fns → MetricScore[]
   │         └─ deriveIntonationAnalysis(noteEvents) → IntonationAnalysis
-  │              groups by full note name incl. octave; up to 3 exampleTimestamps each
-  │
   ├─ runVideoAnalysis(uri) → MetricScore[]  ← STUB (mock data)
-  │
   ├─ computeOverallScore(audio, video, weights)
   ├─ buildSessionAssessment(videoMetrics, userCategory) → SessionAssessment
-  ├─ buildSessionFeedback(allMetrics, category, piece, prev, intonation) → LLMFeedback
-  │
-  └─ AnalysisResult { videoUri, noteEvents, ... } → Supabase + store cache
+  ├─ buildSessionFeedback(allMetrics, ...) → LLMFeedback  ← STUB (static templates)
+  └─ AnalysisResult { videoUri, noteEvents } → Zustand + store cache
+```
+
+**Target (after Jun 20 wiring):**
+```
+processMedia(uri, durationSec, isVideo)
+  ├─ persistVideo(uri) → videoUri
+  ├─ runAudioAnalysis(uri) → AudioAnalysisOutput
+  ├─ analyzeVideoFrames(uri) → { poseFrames: FrameKeypoints[], bowFrames: RawBowFrame[] }
+  ├─ buildSessionSignals(audioOutput, poseFrames, bowFrames, noteEvents, duration) → SessionSignals
+  ├─ scorePoseMetrics(signals, instrument) → MetricScore[]  (real bow + pose scores)
+  ├─ runPatternDetection(signals, noteEvents) → StatisticalFinding[]
+  ├─ computeOverallScore(audio, video, weights)
+  ├─ buildSessionAssessment(videoMetrics, userCategory) → SessionAssessment
+  ├─ buildSessionFeedback(metrics, findings, phraseFeatures, ...) → calls Edge Function → LLMFeedback
+  └─ AnalysisResult { videoUri, noteEvents, sessionSignals } → Supabase + store cache
 ```
 
 ### Video Replay Architecture
@@ -325,13 +487,33 @@ Results screen (analyze.tsx or session/[id].tsx)
 - Copy failure falls back to original URI so player always has something to show
 
 ### What Is NOT Yet Implemented
-- MediaPipe pose detection (`runVideoAnalysis` is a stub returning mock MetricScores)
-- Supabase project (migrations written, `.env` empty)
+
+**Blocked on bow detector (ML model not yet trained):**
+- All 4 bow metrics: `bowPlacement`, `bowAngle`, `bowArmLevel`, `bowDistribution` (return `unavailableMetric()`)
+- L5 slur/bow grouping (`noteGrouping.ts`)
+- L8 tests: `bow_distribution_narrow`, `upper_bow_tone_degradation`, `tip_dynamic_ceiling`, `sul_tasto_drift`, `phrase_end_pressure`
+- Bow speed as hybrid onset signal
+
+**In current sprint (Jun 18-23):**
+- `ml/` Python pipeline (Wed Jun 18)
+- `BowDetector.swift` CoreML wrapper (Wed-Thu Jun 18-19)
+- Bow training data labeling (Thu Jun 19 — user task)
+- Real pose + bow scoring wiring into `processMedia` (Fri Jun 20)
+- Vibrato fix (band-pass, per-note) (Sat Jun 21)
+- Timbre proxies (spectral centroid, brightness) (Sun Jun 22)
+- `noteGrouping.ts` L5 slur detection (Sun Jun 22)
+- `phraseFeatures.ts` L7 phrase engine (Mon Jun 23)
+- Supabase `.env` + migration deployment (Mon Jun 23)
+- Edge Function + real LLM coaching (Mon Jun 23)
+
+**Deferred post-MVP:**
+- MediaPipe library (using Apple Vision native module instead — already working)
+- Bridge detector (Canny + Hough) for bow zone (sul tasto / sul ponticello) detection — needs camera-to-violin relationship
+- Real-time feedback overlay during recording (Phase 10)
+- Session chat with tool-use (Phase 16)
+- Android audio extraction
 - RevenueCat paywall (commented out)
-- LLM Edge Function (`buildSessionFeedback` uses local templates)
-- Android audio extraction (iOS native module only)
-- YIN hop size reduction in `audioEngine.ts` (still 50ms; `noteFusion.ts` uses 25ms for segmentation timestamps, but YIN detection hop is unchanged)
-- `NoteEvent` video/pose fields: `wristCollapsed`, `bowContactPoint`, etc. (all null until MediaPipe)
+- YIN hop size 50ms → 25ms (planned Jun 21 alongside other audio improvements)
 - `sessionResultCache` for sessions from previous app runs (clears on restart; Supabase backfill will fix this)
 
 ---
@@ -341,18 +523,24 @@ Results screen (analyze.tsx or session/[id].tsx)
 | Decision | Rationale |
 |---|---|
 | No raw video to backend | Only keypoint JSON (~5 KB). Keeps per-analysis cost ~$0. |
-| MediaPipe on-device | Privacy-first, no per-frame API cost. |
+| Apple Vision, not MediaPipe SDK | `pose-camera` native module already uses Vision framework; works, no reinstall needed |
+| No wrist proxy for bow tracking | Wrist position cannot distinguish tip vs. frog; calibrating L2-L10 against proxy data would embed errors into all higher layers. Go straight to bow ML. |
+| Layer-by-layer, bottom-up | Can't assess quality of L2+ without real data from L1. Validate each layer before building the next. |
+| Bow ML over wrist proxy | Adds ~1 week but produces real bow_position_u (0=frog, 1=tip) via contact point projection — no calibration needed. |
+| 3 keypoints: tip + frog + contact | Contact point detected directly by model. `t = dot(contact − frog, tip − frog) / |tip − frog|²` — no per-session calibration. Older design (2 keypoints + calibration UI) was deleted. |
 | Free tier = 2 lifetime analyses | Simple to enforce; never resets. |
 | LLM tips via Edge Function | API key stays off client; easy to swap models. |
 | Static tips as fallback | Results always show something even if LLM call fails. |
-| 2 fps video sampling | Enough for bow tracking, keeps processing load light. |
-| `poseScoring.ts` has no MediaPipe dependency | Pure functions on landmark arrays — unit-testable, swappable between MediaPipe versions. |
-| `noteFusion.ts` audio-only first | NoteEvent[] pipeline delivers value (intonation, markers) before MediaPipe is integrated. |
+| 10 fps video sampling | Enough for bow tracking, keeps processing load light. (Was 2fps in earlier plans — increased.) |
+| `poseScoring.ts` has no native dependency | Pure functions on landmark arrays — unit-testable, swappable between Vision/MediaPipe versions. |
+| `noteFusion.ts` audio-only first | NoteEvent[] pipeline delivers value (intonation, markers) before bow detector is integrated. |
 | `sessionResultCache` in-memory only | Full results needed for session detail. Supabase will backfill on load once wired. |
 | Zustand persist skips `sessionResultCache` | Cache can be large; `currentResult` alone is sufficient to show results on relaunch. |
 | Frame-accurate seeks only on chip press | Drag-scrub uses fast/tolerant mode for UX; chip presses use `toleranceMillisBefore/After: 0` for precision. |
 | +30ms seek offset on timestamp press | YIN detection latency: flagged `startSeconds` is mid-note, not the actual attack. +30ms puts the video at the note onset. |
 | Octave-aware intonation grouping | B4 and B5 have different pitch issues; grouping by pitch class (stripping octave) merged them incorrectly. |
+| patternDetection.ts uses pre-specified tests | No unsupervised correlation search — avoid spurious correlations from small samples. All tests pre-specified; gate on n ≥ 8 + confidence ≥ 0.4. |
+| SSH alias for git remote | Multiple GitHub accounts require SSH alias `github-personal` in remote URL. This is intentional. Tools needing standard URL: add `git remote add github https://github.com/marvalarva2929/stringai.git` as a second remote. |
 
 ---
 
@@ -370,3 +558,11 @@ EXPO_PUBLIC_REVENUECAT_API_KEY_ANDROID=
 - [ ] Supabase project created at supabase.com (run `001_initial_schema.sql`)
 - [ ] RevenueCat project + products configured in App Store Connect / Google Play Console
 - [ ] EAS account linked (`eas login`)
+- [ ] Roboflow project: 3-keypoint bow detector (`bow` class, kpt: tip/frog/contact) — for bow ML labeling
+- [ ] Ultralytics account / local GPU for YOLOv8n-pose training
+
+## Git Repository
+
+- Remote: `git@github-personal:marvalarva2929/stringai.git`
+- SSH alias `github-personal` is intentional (multi-account GitHub setup). Do not change.
+- HTTPS equivalent: `https://github.com/marvalarva2929/stringai.git` (for tools that need it)

@@ -1,147 +1,76 @@
-import React, { useMemo, useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
-  ScrollView,
   View,
   Text,
   StyleSheet,
   Pressable,
+  ScrollView,
   SafeAreaView,
 } from 'react-native';
+import Animated, { useSharedValue, useAnimatedStyle } from 'react-native-reanimated';
+import { Ionicons, FontAwesome6, Octicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { useUserStore } from '../../src/store/useUserStore';
 import { useAuthStore } from '../../src/store/useAuthStore';
+import { useUserStore } from '../../src/store/useUserStore';
 import { useAnalysisStore } from '../../src/store/useAnalysisStore';
-import { Button } from '../../src/components/ui/Button';
 import { TunerModal } from '../../src/components/tuner/TunerModal';
+import { haptic } from '../../src/lib/haptics';
 import { colors, spacing, radius } from '../../src/constants/theme';
-import { MetricKey, SessionSummary } from '../../src/types/analysis';
-import { Piece } from '../../src/types/piece';
-import { METRIC_META } from '../../src/constants/metricMeta';
 
-const FREE_LIMIT = 2;
+const PLAN_DEPTH = 5;
+const FAB_SIZE = 60;
+const FAB_DEPTH = 5;
 
-// ── Helpers ───────────────────────────────────────────────────
+const PRACTICE_CATEGORIES: Array<{
+  id: string;
+  iconName: React.ComponentProps<typeof Ionicons>['name'] | string;
+  iconLib: 'Ionicons' | 'FontAwesome6';
+  label: string;
+  count: number;
+}> = [
+  { id: 'bow',        iconLib: 'Ionicons',     iconName: 'musical-notes', label: 'Bow Technique',   count: 8 },
+  { id: 'intonation', iconLib: 'Ionicons',     iconName: 'ear',           label: 'Intonation',      count: 6 },
+  { id: 'tone',       iconLib: 'Ionicons',     iconName: 'volume-high',   label: 'Tone Quality',    count: 5 },
+  { id: 'rhythm',     iconLib: 'FontAwesome6', iconName: 'drum',          label: 'Rhythm & Timing', count: 7 },
+  { id: 'posture',    iconLib: 'Ionicons',     iconName: 'person',        label: 'Posture & Form',  count: 4 },
+];
 
-function computeStreak(sessions: SessionSummary[]): number {
-  if (sessions.length === 0) return 0;
-  const DAY = 86_400_000;
-  const today = new Date(); today.setHours(0, 0, 0, 0);
-  const dates = new Set(sessions.map((s) => {
-    const d = new Date(s.recordedAt); d.setHours(0, 0, 0, 0); return d.getTime();
-  }));
-  let check = today.getTime();
-  if (!dates.has(check)) { check -= DAY; if (!dates.has(check)) return 0; }
-  let streak = 0;
-  while (dates.has(check)) { streak++; check -= DAY; }
-  return streak;
+function CatIcon({ lib, name, size, color }: { lib: string; name: string; size: number; color: string }) {
+  if (lib === 'FontAwesome6') return <FontAwesome6 name={name as any} size={size} color={color} />;
+  return <Ionicons name={name as any} size={size} color={color} />;
 }
-
-function topFocusMetric(sessions: SessionSummary[]): MetricKey | null {
-  const recent = sessions.slice(0, 5).map((s) => s.topIssue).filter(Boolean) as MetricKey[];
-  if (recent.length === 0) return null;
-  const freq = new Map<MetricKey, number>();
-  for (const m of recent) freq.set(m, (freq.get(m) ?? 0) + 1);
-  let best: MetricKey | null = null, max = 0;
-  for (const [m, n] of freq) { if (n > max) { max = n; best = m; } }
-  return best;
-}
-
-// ── Mini sparkline ────────────────────────────────────────────
-
-function Sparkline({ scores }: { scores: number[] }) {
-  if (scores.length < 2) return null;
-  return (
-    <View style={spark.row}>
-      {scores.map((score, i) => (
-        <View key={i} style={[spark.bar, {
-          height: Math.max(3, Math.round((score / 100) * 28)),
-          backgroundColor: score >= 70 ? colors.score.excellent : score >= 50 ? '#f59e0b' : colors.score.critical,
-        }]} />
-      ))}
-    </View>
-  );
-}
-const spark = StyleSheet.create({
-  row: { flexDirection: 'row', alignItems: 'flex-end', height: 28, gap: 3 },
-  bar: { width: 8, borderRadius: 2 },
-});
-
-// ── Piece group type ──────────────────────────────────────────
-
-interface PieceGroup {
-  pieceId: string | null;
-  piece: { id: string; title: string; composer?: string } | null;
-  sessions: SessionSummary[];
-  sessionCount: number;
-  latestScore: number;
-  improvement: number | null;
-  scoreHistory: number[];
-  latestDate: string;
-}
-
-// ── Main screen ───────────────────────────────────────────────
 
 export default function HomeScreen() {
   const [tunerOpen, setTunerOpen] = useState(false);
+
   const { profile } = useUserStore();
   const { isAuthenticated, guestAnalysesUsed, canAnalyzeAsGuest } = useAuthStore();
-  const { sessionHistory, reset, continueWithPiece } = useAnalysisStore();
+  const { reset, sessionHistory } = useAnalysisStore();
 
-  const isSubscribed = profile?.subscriptionTier === 'monthly' || profile?.subscriptionTier === 'annual';
-  const freeUsed = isAuthenticated ? (profile?.freeAnalysesUsed ?? 0) : guestAnalysesUsed;
-  const canAnalyze = isSubscribed || (!isAuthenticated && canAnalyzeAsGuest()) || (isAuthenticated && (profile?.freeAnalysesUsed ?? 0) < 2);
-
-  // ── Analytics ──────────────────────────────────────────────
-  const analytics = useMemo(() => {
+  const stats = useMemo(() => {
     if (sessionHistory.length === 0) return null;
+    const scores = sessionHistory.map((s) => s.overallScore);
+    const avg = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
 
-    const sorted = [...sessionHistory].sort((a, b) => a.recordedAt.localeCompare(b.recordedAt));
-    const scores = sorted.map((s) => s.overallScore);
-    const avgScore = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
-
-    // Trend: avg of newest 3 vs avg of 3 before that
-    const recent = scores.slice(-3);
-    const prev = scores.slice(-6, -3);
-    const recentAvg = recent.reduce((a, b) => a + b, 0) / recent.length;
-    const prevAvg = prev.length ? prev.reduce((a, b) => a + b, 0) / prev.length : null;
-    const trend = prevAvg != null ? Math.round(recentAvg - prevAvg) : null;
-
-    // Sparkline: last 8 sessions chronologically
-    const sparkScores = scores.slice(-8);
-
-    const streak = computeStreak(sessionHistory);
-    const focusMetric = topFocusMetric(sessionHistory);
-
-    return { avgScore, trend, sparkScores, streak, totalSessions: sessionHistory.length, focusMetric };
+    const DAY = 86_400_000;
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const dates = new Set(sessionHistory.map((s) => {
+      const d = new Date(s.recordedAt); d.setHours(0, 0, 0, 0); return d.getTime();
+    }));
+    let check = today.getTime();
+    if (!dates.has(check)) { check -= DAY; if (!dates.has(check)) return { avg, streak: 0 }; }
+    let streak = 0;
+    while (dates.has(check)) { streak++; check -= DAY; }
+    return { avg, streak };
   }, [sessionHistory]);
 
-  // ── Piece groups ───────────────────────────────────────────
-  const pieceGroups = useMemo<PieceGroup[]>(() => {
-    const map = new Map<string | null, SessionSummary[]>();
-    for (const s of sessionHistory) {
-      const key = s.piece?.id ?? null;
-      if (!map.has(key)) map.set(key, []);
-      map.get(key)!.push(s);
-    }
-    const groups: PieceGroup[] = [];
-    for (const [pieceId, sessions] of map.entries()) {
-      const sorted = [...sessions].sort((a, b) => a.recordedAt.localeCompare(b.recordedAt));
-      const sc = sorted.map((s) => s.overallScore);
-      groups.push({
-        pieceId,
-        piece: sorted[0].piece ?? null,
-        sessions: sorted,
-        sessionCount: sorted.length,
-        latestScore: sc[sc.length - 1],
-        improvement: sc.length >= 2 ? sc[sc.length - 1] - sc[0] : null,
-        scoreHistory: sc,
-        latestDate: sorted[sorted.length - 1].recordedAt,
-      });
-    }
-    return groups
-      .sort((a, b) => b.latestDate.localeCompare(a.latestDate))
-      .sort((a, b) => (a.pieceId === null ? 1 : 0) - (b.pieceId === null ? 1 : 0));
-  }, [sessionHistory]);
+  const isSubscribed =
+    profile?.subscriptionTier === 'monthly' || profile?.subscriptionTier === 'annual';
+  const freeUsed = isAuthenticated ? (profile?.freeAnalysesUsed ?? 0) : guestAnalysesUsed;
+  const canAnalyze =
+    isSubscribed ||
+    (!isAuthenticated && canAnalyzeAsGuest()) ||
+    (isAuthenticated && (profile?.freeAnalysesUsed ?? 0) < 2);
 
   const handleNewAnalysis = () => {
     if (!canAnalyze) { router.push('/paywall'); return; }
@@ -149,361 +78,328 @@ export default function HomeScreen() {
     router.push('/(tabs)/analyze');
   };
 
-  const handleContinue = (group: PieceGroup) => {
-    if (!canAnalyze) { router.push('/paywall'); return; }
-    const piece: Piece | null = group.piece
-      ? { id: group.piece.id, title: group.piece.title, composer: group.piece.composer, source: 'manual' }
-      : null;
-    continueWithPiece(piece);
-    router.push('/(tabs)/analyze');
-  };
+  // Plan card depth animation
+  const planOffset = useSharedValue(0);
+  const planSurfaceStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: planOffset.value }],
+  }));
+
+  // FAB depth animation
+  const fabOffset = useSharedValue(0);
+  const fabSurfaceStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: fabOffset.value }],
+  }));
+
+  const fabBottom = spacing.lg;
 
   return (
-    <SafeAreaView style={styles.safe}>
+    <SafeAreaView style={s.safe}>
       <TunerModal visible={tunerOpen} onClose={() => setTunerOpen(false)} />
-      <View style={styles.titleBar}>
-        <Text style={styles.titleText}>String AI</Text>
-        <Pressable style={styles.tunerBtn} onPress={() => setTunerOpen(true)}>
-          <Text style={styles.tunerBtnText}>♩ Tune</Text>
+
+
+      <ScrollView
+        contentContainerStyle={[s.scroll, { paddingBottom: fabBottom + FAB_SIZE + FAB_DEPTH + 24 }]}
+        showsVerticalScrollIndicator={false}
+      >
+        {/* ── Daily Practice Plan card ─────────────────── */}
+        <Pressable
+          onPressIn={() => { planOffset.value = PLAN_DEPTH; haptic.medium(); }}
+          onPressOut={() => { planOffset.value = 0; }}
+          onPress={() => router.push('/tips')}
+          style={s.planCardOuter}
+        >
+          <View style={s.planCardBase} />
+          <Animated.View style={[s.planCardSurface, planSurfaceStyle]}>
+            <View style={s.planCardRow}>
+              <View style={s.planCardTextWrap}>
+                <Text style={s.planCardTitle}>Daily Practice Plan</Text>
+                <Text style={s.planCardSub}>Personalized mix of exercises</Text>
+              </View>
+              <FontAwesome6 name="bullseye" size={30} color="rgba(255,255,255,0.9)" />
+            </View>
+            <View style={s.planCardMeta}>
+              <Text style={s.planCardMetaText}>30 exercises  ·  ~25 min</Text>
+              <Text style={s.planCardStart}>Start →</Text>
+            </View>
+          </Animated.View>
         </Pressable>
-      </View>
-      <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}>
 
-        <View style={styles.content}>
-
-
-          {/* ── Analytics ──────────────────────────────────── */}
-          {analytics && (
-            <>
-              {/* Stats strip */}
-              <View style={styles.statsStrip}>
-                <StatBox label="Sessions" value={String(analytics.totalSessions)} />
-                <View style={styles.statsDivider} />
-                <StatBox label="Avg Score" value={String(analytics.avgScore)} />
-                <View style={styles.statsDivider} />
-                <StatBox
-                  label="Trend"
-                  value={analytics.trend != null ? `${analytics.trend >= 0 ? '+' : ''}${analytics.trend}` : '—'}
-                  valueColor={analytics.trend != null ? (analytics.trend >= 0 ? colors.score.excellent : colors.score.critical) : undefined}
-                />
-                <View style={styles.statsDivider} />
-                <StatBox
-                  label="Streak"
-                  value={analytics.streak > 0 ? `${analytics.streak}🔥` : '0'}
-                />
-              </View>
-
-              {/* Score trend card */}
-              {analytics.sparkScores.length >= 2 && (
-                <View style={styles.trendCard}>
-                  <Text style={styles.cardLabel}>Score Trend</Text>
-                  <Sparkline scores={analytics.sparkScores} />
-                  {analytics.trend != null && (
-                    <Text style={[
-                      styles.trendCaption,
-                      { color: analytics.trend >= 0 ? colors.score.excellent : colors.score.critical },
-                    ]}>
-                      {analytics.trend >= 0 ? '▲' : '▼'} {Math.abs(analytics.trend)} pts over last 3 sessions
-                    </Text>
-                  )}
-                </View>
-              )}
-
-              {/* Focus / exercise tip */}
-              {analytics.focusMetric && METRIC_META[analytics.focusMetric] && (
-                <Pressable style={styles.focusCard} onPress={() => router.push('/tips')}>
-                  <View style={styles.focusHeader}>
-                    <Text style={styles.focusIcon}>{METRIC_META[analytics.focusMetric].icon}</Text>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.focusLabel}>Focus This Week</Text>
-                      <Text style={styles.focusMetric}>{METRIC_META[analytics.focusMetric].label}</Text>
-                    </View>
-                    <Text style={styles.focusArrow}>›</Text>
-                  </View>
-                  <Text style={styles.focusTip}>
-                    {METRIC_META[analytics.focusMetric].tips.needs_attention}
-                  </Text>
-                  <Text style={styles.focusPlanLink}>See full practice plan →</Text>
+        {/* ── Stats + Tune row ─────────────────────────── */}
+        <View style={s.subRow}>
+          <View style={s.statCards}>
+            {stats && (
+              <>
+                <Pressable style={s.statCard}>
+                  <FontAwesome6 name="fire" size={28} color="#f97316" />
+                  <Text style={s.statCardNum}>{stats.streak}</Text>
                 </Pressable>
-              )}
-
-              {/* Practice plan link when no focus metric yet */}
-              {!analytics.focusMetric && (
-                <Pressable style={styles.tipsCard} onPress={() => router.push('/tips')}>
-                  <Text style={styles.tipsCardIcon}>📋</Text>
-                  <View style={styles.tipsCardText}>
-                    <Text style={styles.tipsCardTitle}>Exercise Library</Text>
-                    <Text style={styles.tipsCardSub}>Browse all technique exercises</Text>
-                  </View>
-                  <Text style={styles.tipsCardArrow}>›</Text>
+                <Pressable style={s.statCard}>
+                  <Octicons name="star-fill" size={28} color="#f59e0b" />
+                  <Text style={s.statCardNum}>{stats.avg}</Text>
                 </Pressable>
-              )}
-            </>
-          )}
+              </>
+            )}
+          </View>
+          <Pressable style={s.tunerBtn} onPress={() => setTunerOpen(true)}>
+            <Text style={s.tunerBtnText}>♩ Tune</Text>
+          </Pressable>
+        </View>
 
-          {/* ── Piece groups ────────────────────────────────── */}
-          {pieceGroups.length > 0 ? (
-            <>
-              <Text style={styles.sectionHeading}>Your Pieces</Text>
-              {pieceGroups.map((group) => {
-                return (
-                  <PieceGroupCard
-                    key={group.pieceId ?? 'general'}
-                    group={group}
-                    onPress={() =>
-                      group.pieceId
-                        ? router.push(`/piece/${group.pieceId}`)
-                        : router.push('/(tabs)/progress')
-                    }
-                    onContinue={() => handleContinue(group)}
-                  />
-                );
-              })}
-            </>
-          ) : (
-            <>
-              <View style={styles.emptyCard}>
-                <Text style={styles.emptyEmoji}>🎻</Text>
-                <Text style={styles.emptyTitle}>No sessions yet</Text>
-                <Text style={styles.emptyBody}>
-                  Tap New Analysis, name the piece you're working on, and record your first session.
-                </Text>
-              </View>
-              <Pressable style={styles.tipsCard} onPress={() => router.push('/tips')}>
-                <Text style={styles.tipsCardIcon}>📋</Text>
-                <View style={styles.tipsCardText}>
-                  <Text style={styles.tipsCardTitle}>Browse Exercises</Text>
-                  <Text style={styles.tipsCardSub}>Explore 50+ technique exercises while you wait</Text>
+        {/* ── Divider label ────────────────────────────── */}
+        <Text style={s.orLabel}>Or, choose what to work on yourself</Text>
+
+        {/* ── Category list ────────────────────────────── */}
+        <View style={s.categoryBlock}>
+          {PRACTICE_CATEGORIES.map((cat, i) => (
+            <View key={cat.id}>
+              {i > 0 && <View style={s.divider} />}
+              <Pressable
+                style={({ pressed }) => [s.categoryRow, pressed && s.categoryRowPressed]}
+                onPress={() => { haptic.light(); router.push('/tips'); }}
+              >
+                <View style={s.categoryIconWrap}>
+                  <CatIcon lib={cat.iconLib} name={cat.iconName} size={20} color={colors.brand[600]} />
                 </View>
-                <Text style={styles.tipsCardArrow}>›</Text>
+                <View style={s.categoryText}>
+                  <Text style={s.categoryLabel}>{cat.label}</Text>
+                  <Text style={s.categorySub}>{cat.count} exercises recommended</Text>
+                </View>
+                <Text style={s.categoryArrow}>›</Text>
               </Pressable>
-            </>
-          )}
-
-          {/* Upgrade prompt */}
-          {!isSubscribed && freeUsed >= FREE_LIMIT && (
-            <Pressable onPress={() => router.push('/paywall')} style={styles.upgradeCard}>
-              <Text style={styles.upgradeEmoji}>⭐</Text>
-              <View style={styles.upgradeText}>
-                <Text style={styles.upgradeTitle}>Unlock Unlimited Analyses</Text>
-                <Text style={styles.upgradeSubtitle}>From $9.99/mo — cancel anytime</Text>
-              </View>
-              <Text style={styles.upgradeArrow}>→</Text>
-            </Pressable>
-          )}
+            </View>
+          ))}
         </View>
       </ScrollView>
 
-      {/* Fixed bottom CTA */}
-      <View style={styles.bottomBar}>
-        {!isSubscribed && freeUsed < FREE_LIMIT && (
-          <Text style={styles.freeNotice}>
-            {Math.max(0, FREE_LIMIT - freeUsed)} free {FREE_LIMIT - freeUsed === 1 ? 'analysis' : 'analyses'} remaining
-          </Text>
-        )}
-        <Button label="New Analysis" onPress={handleNewAnalysis} size="lg" fullWidth />
+      {/* ── FAB ──────────────────────────────────────────── */}
+      <View style={[s.fabRow, { bottom: fabBottom }]} pointerEvents="box-none">
+        <Text style={s.fabLabel}>Record new Session</Text>
+        <View style={s.fabContainer}>
+          <View style={s.fabBase} />
+          <Pressable
+            onPressIn={() => { fabOffset.value = FAB_DEPTH; haptic.medium(); }}
+            onPressOut={() => { fabOffset.value = 0; }}
+            onPress={handleNewAnalysis}
+          >
+            <Animated.View style={[s.fabSurface, fabSurfaceStyle]}>
+              <Text style={s.fabPlus}>+</Text>
+            </Animated.View>
+          </Pressable>
+        </View>
       </View>
     </SafeAreaView>
   );
 }
 
-// ── Piece group card ──────────────────────────────────────────
+const s = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: '#fff' },
 
-function PieceGroupCard({
-  group,
-  onPress,
-  onContinue,
-}: {
-  group: PieceGroup;
-  onPress?: () => void;
-  onContinue: () => void;
-}) {
-  const isGeneral = group.pieceId === null;
-  const title = isGeneral ? 'General Practice' : (group.piece?.title ?? 'Unknown Piece');
-  const sub = isGeneral
-    ? `${group.sessionCount} session${group.sessionCount === 1 ? '' : 's'}`
-    : [group.piece?.composer, `${group.sessionCount} session${group.sessionCount === 1 ? '' : 's'}`].filter(Boolean).join(' · ');
-  const lastPlayed = new Date(group.latestDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-
-  return (
-    <Pressable style={card.wrap} onPress={onPress}>
-      <View style={card.topRow}>
-        <View style={card.titleBlock}>
-          <Text style={card.title} numberOfLines={1}>{title}</Text>
-          <Text style={card.sub} numberOfLines={1}>{sub}</Text>
-        </View>
-        <View style={card.scoreBlock}>
-          <Text style={[card.score, { color: scoreColor(group.latestScore) }]}>{group.latestScore}</Text>
-          <Text style={card.scoreLabel}>latest</Text>
-        </View>
-        <Text style={card.cardArrow}>›</Text>
-      </View>
-      <View style={card.midRow}>
-        <Sparkline scores={group.scoreHistory} />
-        <View style={card.midStats}>
-          <Text style={card.lastPlayed}>Last played {lastPlayed}</Text>
-          {group.improvement !== null && (
-            <Text style={[card.delta, { color: group.improvement >= 0 ? colors.score.excellent : colors.score.critical }]}>
-              {group.improvement >= 0 ? '▲' : '▼'} {Math.abs(group.improvement)} pts overall
-            </Text>
-          )}
-        </View>
-      </View>
-      <Pressable style={card.continueBtn} onPress={onContinue}>
-        <Text style={card.continueBtnText}>Continue Session  →</Text>
-      </Pressable>
-    </Pressable>
-  );
-}
-
-function StatBox({ label, value, valueColor }: { label: string; value: string; valueColor?: string }) {
-  return (
-    <View style={styles.statBox}>
-      <Text style={[styles.statValue, valueColor ? { color: valueColor } : {}]}>{value}</Text>
-      <Text style={styles.statLabel}>{label}</Text>
-    </View>
-  );
-}
-
-function scoreColor(score: number): string {
-  if (score >= 90) return colors.score.excellent;
-  if (score >= 70) return '#16a34a';
-  if (score >= 50) return '#d97706';
-  return colors.score.critical;
-}
-
-// ── Styles ────────────────────────────────────────────────────
-
-const card = StyleSheet.create({
-  wrap: {
-    backgroundColor: '#fff', borderRadius: radius.lg, padding: spacing.md, gap: spacing.sm,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.07, shadowRadius: 8, elevation: 3,
-  },
-  topRow: { flexDirection: 'row', alignItems: 'flex-start', gap: spacing.sm },
-  titleBlock: { flex: 1 },
-  title: { fontSize: 16, fontWeight: '700', color: colors.text.primary },
-  sub: { fontSize: 12, color: colors.text.muted, marginTop: 2 },
-  scoreBlock: { alignItems: 'flex-end' },
-  score: { fontSize: 26, fontWeight: '800', lineHeight: 30 },
-  scoreLabel: { fontSize: 10, color: colors.text.muted, fontWeight: '600', textTransform: 'uppercase' },
-  midRow: { flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-between' },
-  midStats: { alignItems: 'flex-end', gap: 2 },
-  lastPlayed: { fontSize: 11, color: colors.text.muted },
-  delta: { fontSize: 12, fontWeight: '700' },
-  cardArrow: { fontSize: 22, color: colors.text.muted, fontWeight: '300', alignSelf: 'center', marginLeft: spacing.xs },
-  continueBtn: {
-    marginTop: spacing.xs, backgroundColor: colors.brand[50], borderRadius: radius.md,
-    paddingVertical: 10, alignItems: 'center', borderWidth: 1, borderColor: colors.brand[200],
-  },
-  continueBtnText: { fontSize: 14, fontWeight: '700', color: colors.brand[700] },
-});
-
-const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: colors.background },
-  titleBar: {
+  // Stats + Tune row (below plan card)
+  subRow: {
     flexDirection: 'row',
-    alignItems: 'center',
+    alignItems: 'flex-start',
     justifyContent: 'space-between',
+  },
+  statCards: {
+    flexDirection: 'row',
+    gap: spacing.sm,
+  },
+  statCard: {
+    width: 76,
+    height: 76,
+    backgroundColor: '#fff',
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    borderWidth: 1.5,
+    borderColor: '#e5e7eb',
+    borderBottomWidth: 4,
+    borderBottomColor: '#d1d5db',
+  },
+  statCardNum: {
+    fontSize: 22,
+    fontWeight: '800',
+    color: colors.text.primary,
+  },
+  // Tune button
+  tunerBtn: {
+    backgroundColor: colors.brand[600],
+    borderRadius: radius.full,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    shadowColor: colors.brand[800],
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 1,
+    shadowRadius: 0,
+    elevation: 4,
+  },
+  tunerBtnText: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#fff',
+  },
+
+  // Scroll
+  scroll: {
     paddingHorizontal: spacing.lg,
     paddingTop: spacing.md,
-    paddingBottom: spacing.md,
-    borderBottomWidth: 1,
-    borderBottomColor: '#ede9fe',
-    backgroundColor: colors.background,
+    gap: spacing.lg,
   },
-  titleText: { fontSize: 34, fontWeight: '800', color: colors.brand[700], letterSpacing: -1 },
-  tunerBtn: {
-    backgroundColor: colors.brand[50],
-    borderRadius: radius.full,
-    paddingHorizontal: spacing.md,
-    paddingVertical: 7,
-    borderWidth: 1,
-    borderColor: colors.brand[200],
+
+  // Plan card (depth effect: base + animated surface)
+  planCardOuter: {
+    height: 120 + PLAN_DEPTH,
+    borderRadius: 18,
   },
-  tunerBtnText: { fontSize: 14, fontWeight: '700', color: colors.brand[700] },
-  scroll: { flexGrow: 1 },
-  content: { padding: spacing.lg, paddingTop: spacing.lg, gap: spacing.md, paddingBottom: 110 },
-  bottomBar: {
+  planCardBase: {
     position: 'absolute',
     bottom: 0,
     left: 0,
     right: 0,
-    paddingHorizontal: spacing.lg,
-    paddingBottom: spacing.lg,
-    paddingTop: spacing.sm,
-    backgroundColor: colors.background,
-    borderTopWidth: 1,
-    borderTopColor: '#ede9fe',
-    gap: spacing.xs,
+    height: 120,
+    borderRadius: 18,
+    backgroundColor: colors.brand[800],
   },
-  freeNotice: { fontSize: 12, color: colors.text.muted, textAlign: 'center' },
-
-  // Stats strip
-  statsStrip: {
-    flexDirection: 'row', backgroundColor: '#fff', borderRadius: radius.lg,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 4, elevation: 2,
+  planCardSurface: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    height: 120,
+    borderRadius: 18,
+    backgroundColor: colors.brand[600],
+    padding: spacing.md,
+    justifyContent: 'space-between',
   },
-  statBox: { flex: 1, alignItems: 'center', paddingVertical: spacing.md },
-  statValue: { fontSize: 20, fontWeight: '800', color: colors.brand[700] },
-  statLabel: { fontSize: 10, color: colors.text.muted, fontWeight: '600', textTransform: 'uppercase', marginTop: 2 },
-  statsDivider: { width: 1, backgroundColor: '#f0f0f0', marginVertical: spacing.sm },
-
-  // Trend card
-  trendCard: {
-    backgroundColor: '#fff', borderRadius: radius.lg, padding: spacing.md, gap: spacing.sm,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 4, elevation: 2,
+  planCardRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
   },
-  cardLabel: { fontSize: 12, fontWeight: '700', color: colors.text.muted, textTransform: 'uppercase', letterSpacing: 0.5 },
-  trendCaption: { fontSize: 12, fontWeight: '600' },
-
-  // Focus card
-  focusCard: {
-    backgroundColor: colors.brand[50], borderRadius: radius.lg, padding: spacing.md, gap: spacing.sm,
-    borderWidth: 1, borderColor: colors.brand[200],
+  planCardTextWrap: { flex: 1 },
+  planCardTitle: {
+    fontSize: 20,
+    fontWeight: '800',
+    color: '#fff',
+    marginBottom: 4,
   },
-  focusHeader: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
-  focusIcon: { fontSize: 28 },
-  focusLabel: { fontSize: 10, fontWeight: '700', color: colors.brand[600], textTransform: 'uppercase', letterSpacing: 0.5 },
-  focusMetric: { fontSize: 15, fontWeight: '700', color: colors.brand[800] },
-  focusTip: { fontSize: 13, color: colors.brand[800], lineHeight: 19 },
-  focusArrow: { fontSize: 22, color: colors.brand[400], fontWeight: '300' },
-  focusPlanLink: { fontSize: 12, fontWeight: '700', color: colors.brand[600] },
-  // Tips entry point card (shown when no focus metric)
-  tipsCard: {
-    flexDirection: 'row', alignItems: 'center', gap: spacing.sm,
-    backgroundColor: '#fff', borderRadius: radius.lg, padding: spacing.md,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 4, elevation: 2,
+  planCardSub: {
+    fontSize: 13,
+    color: 'rgba(255,255,255,0.75)',
+    fontWeight: '500',
   },
-  tipsCardIcon: { fontSize: 24 },
-  tipsCardText: { flex: 1 },
-  tipsCardTitle: { fontSize: 15, fontWeight: '700', color: colors.text.primary },
-  tipsCardSub: { fontSize: 12, color: colors.text.muted, marginTop: 2 },
-  tipsCardArrow: { fontSize: 22, color: colors.text.muted, fontWeight: '300' },
-
-  // Section
-  sectionHeading: {
-    fontSize: 13, fontWeight: '700', color: colors.text.muted,
-    textTransform: 'uppercase', letterSpacing: 0.5, marginTop: spacing.xs,
+  planCardEmoji: { fontSize: 36 },
+  planCardMeta: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  planCardMetaText: {
+    fontSize: 12,
+    color: 'rgba(255,255,255,0.65)',
+    fontWeight: '600',
+  },
+  planCardStart: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: '#fff',
   },
 
-  // Empty state
-  emptyCard: {
-    alignItems: 'center', paddingVertical: spacing.xl, backgroundColor: '#fff',
-    borderRadius: radius.lg, gap: spacing.xs,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.04, shadowRadius: 4, elevation: 1,
+  // Or label
+  orLabel: {
+    fontSize: 13,
+    color: colors.text.muted,
+    fontWeight: '500',
+    textAlign: 'center',
+    marginVertical: -spacing.sm,
   },
-  emptyEmoji: { fontSize: 40, marginBottom: spacing.xs },
-  emptyTitle: { fontSize: 16, fontWeight: '700', color: colors.text.primary },
-  emptyBody: { fontSize: 13, color: colors.text.muted, textAlign: 'center', paddingHorizontal: spacing.lg, lineHeight: 20 },
 
-  // Upgrade
-  upgradeCard: {
-    flexDirection: 'row', alignItems: 'center', gap: spacing.sm,
-    backgroundColor: colors.brand[600], borderRadius: radius.lg, padding: spacing.md,
+  // Category list
+  categoryBlock: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: '#e5e7eb',
+    borderRadius: radius.xl,
+    overflow: 'hidden',
+    backgroundColor: '#fff',
   },
-  upgradeEmoji: { fontSize: 24 },
-  upgradeText: { flex: 1 },
-  upgradeTitle: { fontSize: 15, fontWeight: '700', color: '#fff' },
-  upgradeSubtitle: { fontSize: 12, color: 'rgba(255,255,255,0.8)', marginTop: 2 },
-  upgradeArrow: { fontSize: 18, color: '#fff', fontWeight: '700' },
+  divider: {
+    height: StyleSheet.hairlineWidth,
+    backgroundColor: '#e5e7eb',
+    marginLeft: 56,
+  },
+  categoryRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.md,
+    gap: spacing.sm,
+  },
+  categoryRowPressed: {
+    backgroundColor: '#f9fafb',
+  },
+  categoryIconWrap: { width: 32, alignItems: 'center' },
+  categoryText: { flex: 1 },
+  categoryLabel: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: colors.text.primary,
+    marginBottom: 2,
+  },
+  categorySub: {
+    fontSize: 12,
+    color: colors.text.muted,
+  },
+  categoryArrow: {
+    fontSize: 20,
+    color: colors.text.muted,
+    fontWeight: '300',
+  },
+
+  // FAB
+  fabRow: {
+    position: 'absolute',
+    right: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  fabLabel: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: colors.text.primary,
+  },
+  fabContainer: {
+    width: FAB_SIZE,
+    height: FAB_SIZE + FAB_DEPTH,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.18,
+    shadowRadius: 12,
+    elevation: 10,
+  },
+  fabBase: {
+    position: 'absolute',
+    bottom: 0,
+    width: FAB_SIZE,
+    height: FAB_SIZE,
+    borderRadius: FAB_SIZE / 2,
+    backgroundColor: colors.brand[800],
+  },
+  fabSurface: {
+    position: 'absolute',
+    top: 0,
+    width: FAB_SIZE,
+    height: FAB_SIZE,
+    borderRadius: FAB_SIZE / 2,
+    backgroundColor: colors.brand[600],
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  fabPlus: {
+    fontSize: 32,
+    fontWeight: '300',
+    color: '#fff',
+    lineHeight: 36,
+    marginTop: -2,
+  },
 });

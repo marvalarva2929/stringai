@@ -140,6 +140,12 @@ export default function MetricDetailScreen() {
         <SectionHeader label="How to Fix" />
         <View style={styles.drillCard}>
           <Text style={styles.drillText}>{meta.drill}</Text>
+          <Pressable
+            onPress={() => router.push({ pathname: '/tips', params: { focusMetric: metricKey } })}
+            style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
+          >
+            <Text style={styles.drillCTA}>Browse exercises for {meta.label} →</Text>
+          </Pressable>
         </View>
 
         <View style={styles.bottomPad} />
@@ -244,6 +250,7 @@ const styles = StyleSheet.create({
     borderLeftColor: colors.brand[400],
   },
   drillText: { fontSize: 14, color: colors.brand[900], lineHeight: 21 },
+  drillCTA: { fontSize: 13, fontWeight: '600', color: colors.brand[600], marginTop: spacing.sm },
 
   emptyState: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: spacing.xl },
   emptyText: { fontSize: 15, color: colors.text.secondary, textAlign: 'center' },

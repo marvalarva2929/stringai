@@ -12,7 +12,7 @@ import {
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { router } from 'expo-router';
-import { signIn, fetchProfile } from '../../src/services/auth';
+import { signIn, fetchProfile, resetPassword } from '../../src/services/auth';
 import { useAuthStore } from '../../src/store/useAuthStore';
 import { useUserStore } from '../../src/store/useUserStore';
 import { Button } from '../../src/components/ui/Button';
@@ -22,6 +22,21 @@ export default function Login() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
+  const [emailFocused, setEmailFocused] = useState(false);
+  const [passwordFocused, setPasswordFocused] = useState(false);
+
+  const handleForgotPassword = async () => {
+    if (!email.trim()) {
+      Alert.alert('Enter your email', 'Type your email address above, then tap Forgot password.');
+      return;
+    }
+    try {
+      await resetPassword(email.trim());
+      Alert.alert('Email sent', `Check ${email.trim()} for a password reset link.`);
+    } catch (err: any) {
+      Alert.alert('Error', err.message ?? 'Could not send reset email.');
+    }
+  };
 
   const { setAuthenticated } = useAuthStore();
   const { setProfile } = useUserStore();
@@ -61,23 +76,27 @@ export default function Login() {
           <View style={styles.form}>
             <Text style={styles.fieldLabel}>Email</Text>
             <TextInput
-              style={styles.input}
+              style={[styles.input, emailFocused && styles.inputFocused]}
               value={email}
               onChangeText={setEmail}
               autoCapitalize="none"
               keyboardType="email-address"
               placeholder="you@example.com"
               placeholderTextColor="rgba(255,255,255,0.4)"
+              onFocus={() => setEmailFocused(true)}
+              onBlur={() => setEmailFocused(false)}
             />
 
             <Text style={styles.fieldLabel}>Password</Text>
             <TextInput
-              style={styles.input}
+              style={[styles.input, passwordFocused && styles.inputFocused]}
               value={password}
               onChangeText={setPassword}
               secureTextEntry
               placeholder="••••••••"
               placeholderTextColor="rgba(255,255,255,0.4)"
+              onFocus={() => setPasswordFocused(true)}
+              onBlur={() => setPasswordFocused(false)}
             />
 
             <Button
@@ -88,7 +107,7 @@ export default function Login() {
               size="lg"
             />
 
-            <Pressable style={styles.link}>
+            <Pressable style={styles.link} onPress={handleForgotPassword}>
               <Text style={styles.linkText}>Forgot password?</Text>
             </Pressable>
           </View>
@@ -129,6 +148,10 @@ const styles = StyleSheet.create({
     marginBottom: spacing.sm,
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.15)',
+  },
+  inputFocused: {
+    borderColor: 'rgba(255,255,255,0.65)',
+    backgroundColor: 'rgba(255,255,255,0.18)',
   },
   link: { alignItems: 'center', paddingVertical: spacing.sm },
   linkText: { color: 'rgba(255,255,255,0.55)', fontSize: 13 },

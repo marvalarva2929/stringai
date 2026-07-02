@@ -9,7 +9,7 @@ const SMOOTH_ALPHA = 0.35;
 const MIN_SHOULDER_WIDTH = 0.05;
 
 function cloneLandmark(lm: Landmark): Landmark {
-  return { x: lm.x, y: lm.y, z: lm.z, visibility: lm.visibility };
+  return { x: lm.x, y: lm.y, z: lm.z, visibility: lm.visibility, wx: lm.wx, wy: lm.wy, wz: lm.wz };
 }
 
 function smoothLandmark(prev: Landmark | undefined, next: Landmark): Landmark {
@@ -25,6 +25,9 @@ function smoothLandmark(prev: Landmark | undefined, next: Landmark): Landmark {
     y: prev.y * (1 - a) + next.y * a,
     z: prev.z * (1 - a) + next.z * a,
     visibility: Math.max(prev.visibility ?? 0, next.visibility ?? 0),
+    wx: (prev.wx != null && next.wx != null) ? prev.wx * (1 - a) + next.wx * a : next.wx,
+    wy: (prev.wy != null && next.wy != null) ? prev.wy * (1 - a) + next.wy * a : next.wy,
+    wz: (prev.wz != null && next.wz != null) ? prev.wz * (1 - a) + next.wz * a : next.wz,
   };
 }
 

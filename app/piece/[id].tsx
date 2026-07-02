@@ -43,7 +43,7 @@ function ScoreBar({ score, maxScore }: { score: number; maxScore: number }) {
 const bar = StyleSheet.create({
   wrap: { alignItems: 'center', gap: 3 },
   label: { fontSize: 10, color: colors.text.muted, fontWeight: '600' },
-  fill: { width: 22, borderRadius: 4 },
+  fill: { width: 28, borderRadius: 4 },
 });
 
 export default function PieceDetailScreen() {
@@ -114,15 +114,21 @@ export default function PieceDetailScreen() {
         {/* Score trend chart */}
         <Card style={styles.chartCard}>
           <Text style={styles.sectionLabel}>Score Over Sessions</Text>
-          <View style={styles.chartArea}>
-            {sessions.map((s, i) => (
-              <View key={s.id} style={styles.chartCol}>
-                <ScoreBar score={s.overallScore} maxScore={bestScore} />
-                <Text style={styles.chartDateLabel}>
-                  {new Date(s.recordedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
-                </Text>
+          <View style={styles.chartWrapper}>
+            {/* Reference line at score 70 ("good" threshold) */}
+            <View style={styles.chartRefLine} />
+            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+              <View style={styles.chartArea}>
+                {sessions.map((s, i) => (
+                  <View key={s.id} style={styles.chartCol}>
+                    <ScoreBar score={s.overallScore} maxScore={bestScore} />
+                    <Text style={styles.chartDateLabel}>
+                      {new Date(s.recordedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                    </Text>
+                  </View>
+                ))}
               </View>
-            ))}
+            </ScrollView>
           </View>
           {improvement !== null && (
             <Text style={[
@@ -236,12 +242,27 @@ const styles = StyleSheet.create({
     fontSize: 12, fontWeight: '700', color: colors.text.muted,
     textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: spacing.md,
   },
+  chartWrapper: {
+    position: 'relative',
+    minHeight: 110,
+    paddingTop: spacing.sm,
+  },
+  chartRefLine: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: Math.round(spacing.sm + (1 - 0.70) * 80),
+    height: 1,
+    backgroundColor: 'rgba(22,163,74,0.25)',
+    zIndex: 1,
+  },
   chartArea: {
     flexDirection: 'row',
     alignItems: 'flex-end',
     gap: spacing.sm,
     minHeight: 100,
     paddingTop: spacing.sm,
+    paddingBottom: 4,
   },
   chartCol: { alignItems: 'center', gap: 4 },
   chartDateLabel: { fontSize: 9, color: colors.text.muted, textAlign: 'center' },
