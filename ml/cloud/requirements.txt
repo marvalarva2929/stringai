@@ -1,5 +1,7 @@
 # torch/torchvision are already installed on RunPod PyTorch templates — don't reinstall.
-transformers>=4.57.1
+# Pinned: the model's trust_remote_code overrides internal transformers methods
+# whose signatures changed in newer releases (e.g. allow_all_kernels kwarg).
+transformers==4.57.6
 accelerate
 gradio>=4.44
 pillow

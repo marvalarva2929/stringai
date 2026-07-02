@@ -98,7 +98,10 @@ def parse_boxes(text: str, img_w: int, img_h: int) -> list[dict]:
         r"<box>\s*[<\[]?(\d+)[>\]]?,?\s*[<\[]?(\d+)[>\]]?,?\s*[<\[]?(\d+)[>\]]?,?\s*[<\[]?(\d+)[>\]]?\s*</box>",
         text,
     ):
-        x1n, y1n, x2n, y2n = [int(g) / 1000.0 for g in m.groups()]
+        x1n, y1n, x2n, y2n = [min(max(int(g) / 1000.0, 0.0), 1.0) for g in m.groups()]
+        # The model does not guarantee corner ordering; PIL requires x1<=x2, y1<=y2
+        x1n, x2n = sorted((x1n, x2n))
+        y1n, y2n = sorted((y1n, y2n))
         boxes.append({
             "x1": round(x1n * img_w), "y1": round(y1n * img_h),
             "x2": round(x2n * img_w), "y2": round(y2n * img_h),
