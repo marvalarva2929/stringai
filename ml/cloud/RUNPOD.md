@@ -85,17 +85,62 @@ Log in with the `--auth` credentials, upload a frame, and you should see the
 amber (bow) and cyan (violin) boxes in ~1–2 s each, plus a magenta circle
 where the box-diagonal intersection estimates the bow/string contact point.
 
-## 5. Bulk auto-labeling (once the prompts look good)
+## 5. Mass-training: auto-label + train on the same pod
 
-The same pod can run the batch script for dataset generation. Copy
-`ml/locate_anything_test.py` and a frames directory up (Option A/B above), then:
+Once the prompts are validated in the web app, the full pipeline is:
+
+**a. Extract frames on the Mac** (dedup keeps the dataset varied):
 
 ```bash
-python locate_anything_test.py --input raw_frames/ --limit 0 --export-labels
+cd ~/Projects/stringai/ml
+python extract_frames.py --input videos/ --output data/raw_frames/ --fps 10
 ```
 
-At ~2 s/frame/prompt on a 4090, ~3,000 frames is a couple of GPU-hours —
-run it under `nohup`, then `runpodctl send` the `auto_labels/` output back down.
+**b. Upload frames + scripts to the pod:**
+
+```bash
+cd ~/Projects/stringai/ml
+tar czf frames.tgz -C data raw_frames
+scp -P <port> -i ~/.ssh/id_ed25519 frames.tgz \
+    cloud/autolabel.py cloud/train_detect.py cloud/data_detect.yaml root@<ip>:/workspace/
+# on the pod:  cd /workspace && tar xzf frames.tgz
+```
+
+**c. Auto-label (long-running — use nohup):**
+
+```bash
+cd /workspace
+export HF_HOME=/workspace/hf
+nohup python autolabel.py --input raw_frames/ --output dataset/ > autolabel.log 2>&1 &
+tail -f autolabel.log
+```
+
+Two prompts per frame ≈ 3–4 s/frame on a 4090 → ~3,000 frames ≈ 2.5–3.5 h.
+Resumable: rerunning skips frames that already have labels. Frames where no
+bow is found are dropped automatically.
+
+**d. Review.** Pull `dataset/annotated/` down (or browse via Jupyter on the
+pod) and delete bad frames — a bad box teaches the small model the wrong
+thing. Delete both `dataset/images/<split>/NAME.jpg` and
+`dataset/labels/<split>/NAME.txt`.
+
+**e. Train the on-device model (minutes on the pod GPU):**
+
+```bash
+pip install ultralytics
+python train_detect.py --device 0
+```
+
+**f. Bring weights home and export CoreML on the Mac:**
+
+```bash
+# Mac:
+scp -P <port> -i ~/.ssh/id_ed25519 root@<ip>:/workspace/runs/bow_detect/train/weights/best.pt ~/Projects/stringai/ml/
+cd ~/Projects/stringai/ml
+python export_coreml.py --weights best.pt
+```
+
+Then **stop the pod**.
 
 ## 6. Cost control
 

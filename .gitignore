@@ -37,3 +37,13 @@ test/fixtures/intonation/*
 
 # Xcode simulator app-data captures (huge, machine-local debugging dumps)
 *.xcappdata/
+
+# Raw training frames (14k+ JPGs, ~3.3GB) — too large for git, transfer directly
+# to the training host instead (see ml/cloud/RUNPOD.md).
+ml/data/raw_frames/
+ml/data/raw_frames.tar.gz
+
+# Bulk ML data — never commit
+ml/cloud/dataset.tar
+ml/cloud/dataset/
+ml/cloud/review_flagged.json

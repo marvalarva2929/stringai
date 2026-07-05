@@ -1,0 +1,14 @@
+# YOLOv8 detect dataset config — StringAI bow + violin detector (2 classes).
+#
+# Dataset produced by autolabel.py (LocateAnything auto-labels).
+# Class ids must match autolabel.py CLASSES: 0 = bow, 1 = violin.
+#
+# `path` is resolved relative to this file: run train_detect.py from ml/cloud/
+# (or wherever autolabel.py wrote dataset/), or override with --data.
+
+path: dataset
+train: images/train
+val: images/val
+
+nc: 2
+names: ['bow', 'violin']
