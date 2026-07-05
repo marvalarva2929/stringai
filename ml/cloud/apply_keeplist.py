@@ -58,7 +58,15 @@ def main():
     stats = {"linked": 0, "labels_written": 0, "lines_dropped": 0,
              "missing_image": 0, "missing_label": 0}
 
+    import time
+    t0 = time.time()
+    done = 0
     for name, info in frames.items():
+        done += 1
+        if done % 500 == 0:
+            rate = done / (time.time() - t0)
+            eta = (len(frames) - done) / rate / 60
+            print(f"  [{done}/{len(frames)}]  {rate:.0f} frames/s, ETA {eta:.1f}m", flush=True)
         split = info["split"]
         wanted_ids = {CLASS_IDS[c] for c in info["classes"]}
 
