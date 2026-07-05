@@ -47,3 +47,4 @@ ml/data/raw_frames.tar.gz
 ml/cloud/dataset.tar
 ml/cloud/dataset/
 ml/cloud/review_flagged.json
+ml/cloud/dataset_clean/

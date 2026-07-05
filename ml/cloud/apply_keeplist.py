@@ -17,6 +17,10 @@ Usage (pod):
     cd ml/cloud            # after git pull brought keeplist.json
     python apply_keeplist.py --dataset /workspace/dataset --out /workspace/dataset_clean
     python train_detect.py --data /workspace/dataset_clean/data.yaml --device 0
+
+--dataset may also be an uncompressed dataset.tar (local training without a
+full extraction): kept images are extracted, labels written filtered — the
+result only needs space for the kept frames, not the whole dataset.
 """
 
 from __future__ import annotations
@@ -42,10 +46,16 @@ def main():
 
     ds = Path(args.dataset).resolve()
     out = Path(args.out).resolve()
-    if not (ds / "images").is_dir() or not (ds / "labels").is_dir():
-        sys.exit(f"[ERROR] {ds} does not look like a dataset (needs images/ and labels/)")
-    if out == ds:
-        sys.exit("[ERROR] --out must differ from --dataset")
+    tar_backend = None
+    if ds.is_dir():
+        if not (ds / "images").is_dir() or not (ds / "labels").is_dir():
+            sys.exit(f"[ERROR] {ds} does not look like a dataset (needs images/ and labels/)")
+        if out == ds:
+            sys.exit("[ERROR] --out must differ from --dataset")
+    else:
+        from review import TarBackend  # same-directory module
+        print(f"Indexing {ds.name} …")
+        tar_backend = TarBackend(ds)
 
     keeplist = json.loads(Path(args.keeplist).read_text())
     frames = keeplist["frames"]
@@ -70,17 +80,29 @@ def main():
         split = info["split"]
         wanted_ids = {CLASS_IDS[c] for c in info["classes"]}
 
-        src_img = ds / "images" / split / f"{name}.jpg"
-        src_lbl = ds / "labels" / split / f"{name}.txt"
-        if not src_img.exists():
-            stats["missing_image"] += 1
-            continue
-        if not src_lbl.exists():
-            stats["missing_label"] += 1
-            continue
+        if tar_backend is not None:
+            img_bytes = tar_backend.read_image(name, split, "raw")
+            lbl_bytes = tar_backend._read(f"{tar_backend.prefix}labels/{split}/{name}.txt")
+            if img_bytes is None:
+                stats["missing_image"] += 1
+                continue
+            if lbl_bytes is None:
+                stats["missing_label"] += 1
+                continue
+            label_text = lbl_bytes.decode("utf-8", "replace")
+        else:
+            src_img = ds / "images" / split / f"{name}.jpg"
+            src_lbl = ds / "labels" / split / f"{name}.txt"
+            if not src_img.exists():
+                stats["missing_image"] += 1
+                continue
+            if not src_lbl.exists():
+                stats["missing_label"] += 1
+                continue
+            label_text = src_lbl.read_text()
 
         kept_lines = []
-        for line in src_lbl.read_text().splitlines():
+        for line in label_text.splitlines():
             parts = line.split()
             if len(parts) == 5 and int(parts[0]) in wanted_ids:
                 kept_lines.append(line)
@@ -96,7 +118,9 @@ def main():
 
         if dst_img.exists() or dst_img.is_symlink():
             dst_img.unlink()
-        if args.copy:
+        if tar_backend is not None:
+            dst_img.write_bytes(img_bytes)
+        elif args.copy:
             shutil.copy2(src_img, dst_img)
         else:
             dst_img.symlink_to(os.path.relpath(src_img, dst_img.parent))

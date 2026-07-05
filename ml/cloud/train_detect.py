@@ -40,12 +40,30 @@ def main():
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--name", default="train", help="Run name under runs/bow_detect/")
     parser.add_argument("--device", default=None, help="cpu, mps, or CUDA index like 0")
+    parser.add_argument("--workers", type=int, default=8,
+                        help="Dataloader workers (ultralytics defaults to 0 on MPS, "
+                             "which starves the GPU — 8 keeps an M-series busy)")
     args = parser.parse_args()
 
     data_yaml = Path(args.data) if args.data else Path(__file__).parent / "data_detect.yaml"
     if not data_yaml.exists():
         print(f"[ERROR] Dataset config not found: {data_yaml}", file=sys.stderr)
         sys.exit(1)
+
+    # Ultralytics force-zeroes workers for cpu/mps devices (engine/trainer.py:
+    # "faster CPU training as time dominated by inference") — backwards on
+    # Apple-silicon GPUs, where single-threaded dataloading starves the GPU
+    # (~2 s/it observed vs GPU-bound compute). Restore the requested count
+    # right after trainer init, before dataloaders are built.
+    if args.workers > 0:
+        from ultralytics.engine.trainer import BaseTrainer
+        orig_init = BaseTrainer.__init__
+
+        def patched_init(self, *a, **kw):
+            orig_init(self, *a, **kw)
+            self.args.workers = args.workers
+
+        BaseTrainer.__init__ = patched_init
 
     if args.resume:
         model = YOLO(args.resume)
@@ -73,6 +91,7 @@ def main():
             save_period=10,
             val=True,
             plots=True,
+            workers=args.workers,
         )
         if args.device is not None:
             train_kwargs["device"] = args.device
