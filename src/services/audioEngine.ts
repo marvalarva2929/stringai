@@ -22,6 +22,10 @@ import {
   computeRmsEnvelope,
   estimateF0HPS,
   sumHarmonicPower,
+  computeSpectralFluxOnsets,
+  detectPitchChangeOnsets,
+  mergeOnsets,
+  collapseAdjacentSameNoteOnsets,
 } from './dsp';
 import { scoreToneQuality } from './toneAnalysis';
 import {
@@ -102,158 +106,9 @@ function parseWav(bytes: Uint8Array): WavData | null {
 }
 
 // PitchFrame, YIN pitch detection (yinWindow/detectPitches), centsFromNearestNote,
-// the FFT (fftInPlace/magnitudeSpectrum) and computeRmsEnvelope now live in ./dsp
-// (pure, unit-testable). They are imported at the top of this file.
-
-// ─────────────────────────────────────────────────────────────
-// Onset Detection — Two-Source (Spectral Flux + Pitch Change)
-// ─────────────────────────────────────────────────────────────
-
-const SF_FFT_SIZE     = 512;   // 256 bins; resolves bow transients without 1024-pt cost
-const SF_HOP_SIZE_S   = 0.01;  // 10ms hop — 2× finer than RMS hop; catches fast detaché
-const SF_LOG_C        = 1000;  // log(1 + C*mag) compression (librosa default)
-const SF_MEDIAN_WIN   = 10;    // ±10 frames (±100ms) local median window
-const SF_MULTIPLIER   = 2.0;   // threshold = median × 2.0 + delta (raised from 1.5; reduces bow-noise triggers)
-const SF_DELTA        = 0.04;  // additive floor; prevents threshold → 0 during silence
-
-const PC_SEMITONE_THRESH  = 1.0; // pitch must move ≥ 1 semitone (vibrato is ±0.3–0.6)
-const PC_STABILITY_FRAMES = 3;   // new pitch must hold 3×25ms = 75ms before confirming onset
-const MERGE_DEDUP_GAP_S   = 0.050; // within 50ms → same physical event, keep earlier
-const MERGE_MIN_IOI_S     = 0.120; // global minimum inter-onset (≈ 16th note at 120 BPM)
-
-function computeSpectralFluxOnsets(samples: Float32Array, sampleRate: number): number[] {
-  const hopSize   = Math.round(sampleRate * SF_HOP_SIZE_S);
-  const numFrames = Math.max(0, Math.floor((samples.length - SF_FFT_SIZE) / hopSize) + 1);
-  if (numFrames < 2 * SF_MEDIAN_WIN + 3) return [];
-
-  // Pass 1: log-magnitude spectral flux (half-wave rectified)
-  const flux = new Float32Array(numFrames);
-  let prevLogMag: Float32Array | null = null;
-  for (let fi = 0; fi < numFrames; fi++) {
-    const mag = magnitudeSpectrum(samples, fi * hopSize, SF_FFT_SIZE);
-    const logMag = new Float32Array(mag.length);
-    for (let k = 0; k < mag.length; k++) logMag[k] = Math.log1p(SF_LOG_C * mag[k]);
-    if (prevLogMag !== null) {
-      let sf = 0;
-      for (let k = 0; k < logMag.length; k++) {
-        const d = logMag[k] - prevLogMag[k];
-        if (d > 0) sf += d;
-      }
-      flux[fi] = sf;
-    }
-    prevLogMag = logMag;
-  }
-
-  // Pass 2: adaptive threshold = local median × multiplier + delta
-  const thresh = new Float32Array(numFrames);
-  for (let fi = 0; fi < numFrames; fi++) {
-    const win: number[] = [];
-    for (let j = Math.max(0, fi - SF_MEDIAN_WIN); j <= Math.min(numFrames - 1, fi + SF_MEDIAN_WIN); j++)
-      win.push(flux[j]);
-    win.sort((a, b) => a - b);
-    thresh[fi] = win[Math.floor(win.length / 2)] * SF_MULTIPLIER + SF_DELTA;
-  }
-
-  // Pass 3: peak-pick above threshold, enforce min gap
-  const onsets: number[] = [];
-  const minGapFrames = Math.round(MERGE_MIN_IOI_S / SF_HOP_SIZE_S);
-  let lastFrame = -minGapFrames;
-  for (let fi = 1; fi < numFrames - 1; fi++) {
-    if (flux[fi] > thresh[fi]
-        && flux[fi] >= flux[fi - 1] && flux[fi] >= flux[fi + 1]
-        && fi - lastFrame > minGapFrames) {
-      onsets.push((fi * hopSize) / sampleRate);
-      lastFrame = fi;
-    }
-  }
-  return onsets;
-}
-
-function detectPitchChangeOnsets(pitches: PitchFrame[]): number[] {
-  const onsets: number[] = [];
-  const active = pitches.filter((f) => f.frequency !== null) as { frequency: number; timestamp: number }[];
-  if (active.length < PC_STABILITY_FRAMES + 1) return [];
-
-  let settledMidi = Math.round(12 * Math.log2(active[0].frequency / 440) + 69);
-  let candidateMidi: number | null = null;
-  let candidateStart: number | null = null;
-  let candidateCount = 0;
-  let prevWasNull = false;
-
-  for (const frame of pitches) {
-    if (frame.frequency === null) {
-      prevWasNull = true;
-      candidateMidi = null; candidateCount = 0; candidateStart = null;
-      continue;
-    }
-    const midi = Math.round(12 * Math.log2(frame.frequency / 440) + 69);
-    if (prevWasNull) {
-      // Only fire if the resumed pitch is a different note; bow changes on the same
-      // held pitch produce a brief YIN silence but shouldn't count as a new onset.
-      if (Math.abs(midi - settledMidi) >= PC_SEMITONE_THRESH) {
-        onsets.push(frame.timestamp);
-      }
-      settledMidi = midi; candidateMidi = null; candidateCount = 0;
-      prevWasNull = false;
-      continue;
-    }
-    prevWasNull = false;
-    if (Math.abs(midi - settledMidi) < PC_SEMITONE_THRESH) {
-      candidateMidi = null; candidateCount = 0; candidateStart = null;
-    } else if (midi === candidateMidi) {
-      candidateCount++;
-      if (candidateCount >= PC_STABILITY_FRAMES) {
-        onsets.push(candidateStart!);
-        settledMidi = candidateMidi!;
-        candidateMidi = null; candidateCount = 0; candidateStart = null;
-      }
-    } else {
-      candidateMidi = midi; candidateCount = 1; candidateStart = frame.timestamp;
-    }
-  }
-  return onsets;
-}
-
-function mergeOnsets(fluxOnsets: number[], pitchOnsets: number[]): number[] {
-  const combined = [...fluxOnsets, ...pitchOnsets].sort((a, b) => a - b);
-  if (combined.length === 0) return [];
-  const deduped: number[] = [combined[0]];
-  for (let i = 1; i < combined.length; i++)
-    if (combined[i] - deduped[deduped.length - 1] >= MERGE_DEDUP_GAP_S)
-      deduped.push(combined[i]);
-  const final: number[] = [deduped[0]];
-  for (let i = 1; i < deduped.length; i++)
-    if (deduped[i] - final[final.length - 1] >= MERGE_MIN_IOI_S)
-      final.push(deduped[i]);
-  return final;
-}
-
-function collapseAdjacentSameNoteOnsets(onsets: number[], pitches: PitchFrame[], audioDuration: number): number[] {
-  if (onsets.length < 2) return onsets;
-  const active = pitches.filter((f) => f.frequency !== null) as { frequency: number; timestamp: number }[];
-  if (active.length === 0) return onsets;
-
-  const medianMidi = (startS: number, endS: number): number | null => {
-    const frames = active.filter((f) => f.timestamp >= startS && f.timestamp < endS);
-    if (frames.length < 3) return null;
-    const midis = frames.map((f) => Math.round(12 * Math.log2(f.frequency / 440) + 69));
-    midis.sort((a, b) => a - b);
-    return midis[Math.floor(midis.length / 2)];
-  };
-
-  // Greedy: keep an onset only if the pitch changes across it.
-  // "prevStart" tracks the start of the current merged segment (last kept onset).
-  const kept: number[] = [onsets[0]];
-  for (let i = 1; i < onsets.length; i++) {
-    const prevStart = kept[kept.length - 1];
-    const nextEnd   = onsets[i + 1] ?? audioDuration;
-    const midiA = medianMidi(prevStart, onsets[i]);
-    const midiB = medianMidi(onsets[i], nextEnd);
-    if (midiA !== null && midiB !== null && midiA === midiB) continue; // same note — collapse
-    kept.push(onsets[i]);
-  }
-  return kept;
-}
+// the FFT (fftInPlace/magnitudeSpectrum), computeRmsEnvelope, and the two-source
+// onset detector (spectral flux + pitch change + merge/collapse) now live in
+// ./dsp (pure, unit-testable). They are imported at the top of this file.
 
 // ─────────────────────────────────────────────────────────────
 // Scoring Functions
@@ -1496,7 +1351,8 @@ export async function analyzeWavFile(
   const rms = computeRmsEnvelope(samples, rmsWin, rmsHop);
   const fluxOnsets  = computeSpectralFluxOnsets(samples, sampleRate);
   const pitchOnsets = detectPitchChangeOnsets(pitches);
-  const onsets      = collapseAdjacentSameNoteOnsets(mergeOnsets(fluxOnsets, pitchOnsets), pitches, duration);
+  const uncollapsedOnsets = mergeOnsets(fluxOnsets, pitchOnsets);
+  const onsets      = collapseAdjacentSameNoteOnsets(uncollapsedOnsets, pitches, duration);
 
   const timbreFrames = computeTimbreFrames(samples, sampleRate);
 
@@ -1522,6 +1378,7 @@ export async function analyzeWavFile(
     spectralCentroidFrames: timbreFrames.map(({ spectralCentroid, timestamp }) => ({ value: spectralCentroid, timestamp })),
     brightnessFrames:       timbreFrames.map(({ brightness, timestamp })       => ({ value: brightness, timestamp })),
     onsetTimestamps: onsets,
+    uncollapsedOnsetTimestamps: uncollapsedOnsets,
     sampleRate,
     duration,
   };

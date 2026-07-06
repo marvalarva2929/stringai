@@ -1,13 +1,13 @@
-import { AudioAnalysisOutput } from '../types/analysis';
+import type { AudioAnalysisOutput } from '../types/analysis';
 import {
-  RawBowFrame,
-  SessionSignals,
-  TimeSeriesPoint,
   createTimeSeries,
+  type RawBowFrame,
+  type SessionSignals,
+  type TimeSeriesPoint,
 } from '../types/signals';
-import { NoteEvent } from './noteFusion';
-import { FrameKeypoints, POSE, HAND, jointAngle } from './poseScoring';
-import { deriveBowTimeSeries } from './bowAnalysis';
+import type { NoteEvent } from './noteFusion';
+import { POSE, HAND, jointAngle, type FrameKeypoints } from './poseScoring';
+import { deriveBowTimeSeries, type BowTimeSeries } from './bowAnalysis';
 
 // ─────────────────────────────────────────────────────────────
 // Pose time series extraction
@@ -16,12 +16,14 @@ import { deriveBowTimeSeries } from './bowAnalysis';
 interface PoseTimeSeries {
   leftWristAngle: Array<TimeSeriesPoint<number | null>>;
   rightElbowY:    Array<TimeSeriesPoint<number | null>>;
+  rightShoulderY: Array<TimeSeriesPoint<number | null>>;
   shoulderDiff:   Array<TimeSeriesPoint<number | null>>;
 }
 
 function extractPoseTimeSeries(frames: FrameKeypoints[]): PoseTimeSeries {
   const leftWristAngle: Array<TimeSeriesPoint<number | null>> = [];
   const rightElbowY:    Array<TimeSeriesPoint<number | null>> = [];
+  const rightShoulderY: Array<TimeSeriesPoint<number | null>> = [];
   const shoulderDiff:   Array<TimeSeriesPoint<number | null>> = [];
 
   for (const f of frames) {
@@ -46,6 +48,13 @@ function extractPoseTimeSeries(frames: FrameKeypoints[]): PoseTimeSeries {
       if (re?.visibility) elbowY = re.y;
     }
 
+    // Right shoulder Y: reference so elbow height is shoulder-relative
+    let shoulderY: number | null = null;
+    if (pose) {
+      const rs = pose[POSE.RIGHT_SHOULDER];
+      if (rs?.visibility) shoulderY = rs.y;
+    }
+
     // Shoulder diff: absolute y-difference between shoulders
     let sDiff: number | null = null;
     if (pose) {
@@ -58,10 +67,11 @@ function extractPoseTimeSeries(frames: FrameKeypoints[]): PoseTimeSeries {
 
     leftWristAngle.push({ t: f.timestamp, v: wristAngle });
     rightElbowY.push(   { t: f.timestamp, v: elbowY    });
+    rightShoulderY.push({ t: f.timestamp, v: shoulderY });
     shoulderDiff.push(  { t: f.timestamp, v: sDiff     });
   }
 
-  return { leftWristAngle, rightElbowY, shoulderDiff };
+  return { leftWristAngle, rightElbowY, rightShoulderY, shoulderDiff };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -76,6 +86,9 @@ function extractPoseTimeSeries(frames: FrameKeypoints[]): PoseTimeSeries {
  * @param bowFrames       RawBowFrame[] extracted from the native frame dicts.
  * @param noteEvents      NoteEvent[] from noteFusion (audio-only fields).
  * @param durationSeconds Session duration in seconds.
+ * @param bowSeries       Precomputed bow time series — pass when the caller
+ *                        already derived it (sessionPipeline) to avoid a
+ *                        second deriveBowTimeSeries over the same frames.
  */
 export function buildSessionSignals(
   audioOutput:      AudioAnalysisOutput,
@@ -83,6 +96,7 @@ export function buildSessionSignals(
   bowFrames:        RawBowFrame[],
   noteEvents:       NoteEvent[],
   durationSeconds:  number,
+  bowSeries?:       BowTimeSeries,
 ): SessionSignals {
   const { rawSignals } = audioOutput;
 
@@ -104,10 +118,10 @@ export function buildSessionSignals(
   );
 
   // ── Pose time series ────────────────────────────────────────
-  const { leftWristAngle, rightElbowY, shoulderDiff } = extractPoseTimeSeries(poseFrames);
+  const { leftWristAngle, rightElbowY, rightShoulderY, shoulderDiff } = extractPoseTimeSeries(poseFrames);
 
   // ── Bow time series ─────────────────────────────────────────
-  const bow = deriveBowTimeSeries(bowFrames);
+  const bow = bowSeries ?? deriveBowTimeSeries(bowFrames);
 
   return {
     durationSeconds,
@@ -118,10 +132,12 @@ export function buildSessionSignals(
     brightness,
     leftWristAngle: createTimeSeries(leftWristAngle),
     rightElbowY:    createTimeSeries(rightElbowY),
+    rightShoulderY: createTimeSeries(rightShoulderY),
     shoulderDiff:   createTimeSeries(shoulderDiff),
     bowContactPoint: bow.bowContactPoint,
     bowAngle:        bow.bowAngle,
     bowSpeed:        bow.bowSpeed,
+    bowDirection:    bow.bowDirection,
     noteEvents,
   };
 }

@@ -1,5 +1,5 @@
-import { NoteEvent } from './noteFusion';
-import { SessionSignals } from '../types/signals';
+import type { NoteEvent } from './noteFusion';
+import type { SessionSignals } from '../types/signals';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // StatisticalFinding
@@ -303,6 +303,152 @@ export function testDynamicRangeNarrow(signals: SessionSignals, _noteEvents: Not
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Test: bow_distribution_narrow
+//
+// Detects: player uses only a small portion of the bow (e.g. always middle).
+// Method:  range (max − min) of the non-null bowContactPoint samples.
+// Fires:   when range < 0.35 AND ≥ 20 samples (confidence ≥ 0.4).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function testBowDistributionNarrow(signals: SessionSignals, _noteEvents: NoteEvent[]): StatisticalFinding {
+  const u = signals.bowContactPoint.points.map((p) => p.v).filter((v): v is number => v !== null);
+  if (u.length < 20) return notFired('bow_distribution_narrow');
+
+  const maxU = Math.max(...u);
+  const minU = Math.min(...u);
+  const range = maxU - minU;
+
+  const NARROW_THRESHOLD = 0.35;
+  const effectSize = Math.max(0, NARROW_THRESHOLD - range) / NARROW_THRESHOLD;
+  const confidence = confidenceFromEffect(u.length, effectSize);
+
+  const fired = range < NARROW_THRESHOLD && confidence >= 0.4;
+  if (!fired) return { ...notFired('bow_distribution_narrow'), confidence };
+
+  const severity: StatisticalFinding['severity'] =
+    range < 0.2 ? 'significant' : range < 0.28 ? 'moderate' : 'minor';
+  const center = mean(u);
+  const zone = center < 0.33 ? 'lower half' : center > 0.67 ? 'upper half' : 'middle';
+
+  return {
+    testId: 'bow_distribution_narrow',
+    fired: true,
+    severity,
+    confidence,
+    summary: `Only ${(range * 100).toFixed(0)}% of the bow length is being used, concentrated in the ${zone} — full strokes develop tone control across the whole bow.`,
+    evidence: {
+      groupA: { label: 'Bow range used (0=frog, 1=tip)', value: range, n: u.length },
+      groupB: { label: 'Mean contact point', value: center, n: u.length },
+      effectSize: range,
+    },
+    timestamps: [],
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test: upper_bow_tone_degradation
+//
+// Detects: tone quality collapses in the upper half of the bow (usually not
+//          enough arm weight transfer toward the tip).
+// Method:  notes split by bowContactPoint > 0.6 (upper) vs < 0.4 (lower);
+//          compare mean fundamentalRatio.
+// Fires:   when upper tone is ≥ 15% worse, both groups ≥ 8 notes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function testUpperBowToneDegradation(_signals: SessionSignals, noteEvents: NoteEvent[]): StatisticalFinding {
+  const withBow = noteEvents.filter((n) => n.bowContactPoint !== null);
+  const upper = withBow.filter((n) => n.bowContactPoint! > 0.6);
+  const lower = withBow.filter((n) => n.bowContactPoint! < 0.4);
+  if (upper.length < MIN_GROUP_SIZE || lower.length < MIN_GROUP_SIZE) {
+    return notFired('upper_bow_tone_degradation');
+  }
+
+  const upperTone = mean(upper.map((n) => n.fundamentalRatio));
+  const lowerTone = mean(lower.map((n) => n.fundamentalRatio));
+  if (lowerTone <= 0) return notFired('upper_bow_tone_degradation');
+
+  const degradation = (lowerTone - upperTone) / lowerTone;
+
+  const DEGRADATION_THRESHOLD = 0.15;
+  // Normalize against the 'significant' bar (0.35) — a 35% tone drop is a
+  // full-strength effect for fundamentalRatio, not 0.35 of one.
+  const confidence = confidenceFromEffect(Math.min(upper.length, lower.length), degradation / 0.35);
+
+  const fired = degradation >= DEGRADATION_THRESHOLD && confidence >= 0.4;
+  if (!fired) return { ...notFired('upper_bow_tone_degradation'), confidence };
+
+  const severity: StatisticalFinding['severity'] =
+    degradation > 0.35 ? 'significant' : degradation > 0.25 ? 'moderate' : 'minor';
+
+  return {
+    testId: 'upper_bow_tone_degradation',
+    fired: true,
+    severity,
+    confidence,
+    summary: `Tone quality drops ${(degradation * 100).toFixed(0)}% in the upper half of the bow — usually a sign the arm weight isn't following through toward the tip.`,
+    evidence: {
+      groupA: { label: 'Upper-bow notes (u > 0.6)', value: upperTone, n: upper.length },
+      groupB: { label: 'Lower-bow notes (u < 0.4)', value: lowerTone, n: lower.length },
+      effectSize: degradation,
+    },
+    timestamps: upper
+      .filter((n) => n.fundamentalRatio <= upperTone)
+      .map((n) => ({ startSeconds: n.startSeconds, endSeconds: n.endSeconds }))
+      .slice(0, 5),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test: tip_dynamic_ceiling
+//
+// Detects: sound gets quiet at the tip (insufficient index-finger leverage).
+// Method:  tip-zone notes (u > 0.67) mean dynamicLevel vs all other bow zones.
+// Fires:   when tip notes are ≥ 25% quieter, both groups ≥ 8 notes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function testTipDynamicCeiling(_signals: SessionSignals, noteEvents: NoteEvent[]): StatisticalFinding {
+  const withBow = noteEvents.filter((n) => n.bowContactPoint !== null);
+  const tip = withBow.filter((n) => n.bowContactPoint! > 0.67);
+  const rest = withBow.filter((n) => n.bowContactPoint! <= 0.67);
+  if (tip.length < MIN_GROUP_SIZE || rest.length < MIN_GROUP_SIZE) {
+    return notFired('tip_dynamic_ceiling');
+  }
+
+  const tipLevel = mean(tip.map((n) => n.dynamicLevel));
+  const restLevel = mean(rest.map((n) => n.dynamicLevel));
+  if (restLevel <= 0) return notFired('tip_dynamic_ceiling');
+
+  const drop = (restLevel - tipLevel) / restLevel;
+
+  const DROP_THRESHOLD = 0.25;
+  // Normalized against the 'significant' bar (0.5) like the tone test above.
+  const confidence = confidenceFromEffect(Math.min(tip.length, rest.length), drop / 0.5);
+
+  const fired = drop >= DROP_THRESHOLD && confidence >= 0.4;
+  if (!fired) return { ...notFired('tip_dynamic_ceiling'), confidence };
+
+  const severity: StatisticalFinding['severity'] =
+    drop > 0.5 ? 'significant' : drop > 0.35 ? 'moderate' : 'minor';
+
+  return {
+    testId: 'tip_dynamic_ceiling',
+    fired: true,
+    severity,
+    confidence,
+    summary: `Volume drops ${(drop * 100).toFixed(0)}% when playing at the tip — index-finger pressure needs to compensate as the bow's natural weight decreases.`,
+    evidence: {
+      groupA: { label: 'Tip-zone notes (u > 0.67)', value: tipLevel, n: tip.length },
+      groupB: { label: 'Rest of the bow', value: restLevel, n: rest.length },
+      effectSize: drop,
+    },
+    timestamps: tip
+      .filter((n) => n.dynamicLevel < tipLevel)
+      .map((n) => ({ startSeconds: n.startSeconds, endSeconds: n.endSeconds }))
+      .slice(0, 5),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -322,6 +468,9 @@ export function runPatternDetection(
     testFingerAccuracyGap(noteEvents),
     testPitchTendency(noteEvents),
     testDynamicRangeNarrow(signals, noteEvents),
+    testBowDistributionNarrow(signals, noteEvents),
+    testUpperBowToneDegradation(signals, noteEvents),
+    testTipDynamicCeiling(signals, noteEvents),
   ];
 
   return tests.filter((f) => f.fired && f.confidence >= 0.4);

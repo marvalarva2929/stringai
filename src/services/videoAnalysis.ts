@@ -1,14 +1,8 @@
-import { FrameKeypoints, Landmark, POSE, HAND, scorePoseMetrics, CONFIDENCE_THRESHOLD } from '../lib/poseScoring';
-import { preparePoseFramesForScoring } from '../lib/poseFramePrep';
-import { MetricScore, MeasurementQuality } from '../types/analysis';
+import { FrameKeypoints, Landmark, POSE, HAND } from '../lib/poseScoring';
 import { PoseJoints, HandLandmarks, PoseJoint } from '../components/analysis/PoseSkeleton';
-import { InstrumentId } from '../types/instrument';
 import { RawBowFrame } from '../types/signals';
+import { deriveBowFrameFromBoxes } from '../lib/bowBoxGeometry';
 import { analyzeVideo } from 'pose-camera';
-
-// Minimum shoulder width in raw screen coordinates (0-1) for reliable measurement.
-// Below this, the camera angle is too oblique or the player is too far away.
-const MIN_SHOULDER_WIDTH_RAW = 0.15;
 
 // Placeholder for landmarks we don't capture — visibility: 0 causes poseScoring.ts
 // to skip them via the visible() check (threshold 0.5).
@@ -68,29 +62,27 @@ export function convertPoseFrame(
 }
 
 /**
- * Assess overall visibility quality from RAW (un-normalized) screen-space frames.
- * Returns 'low' if fewer than 40% of frames have both shoulders clearly visible.
- * Must be called before preparePoseFramesForScoring — body-normalized frames always
- * have shoulderWidth ≈ 1.0, making this check meaningless after normalization.
+ * Parse bow data from a raw native frame dict into RawBowFrame, or null.
+ *
+ * Current payload (2-class detect model): bowBox + violinBox + wrist joints →
+ * tip/frog/contact derived geometrically in bowBoxGeometry.ts. The wrists must
+ * be the RAW native joints (non-mirrored, same coordinate space as the boxes),
+ * NOT the mirrored scoring-space landmarks produced by toL().
+ *
+ * Legacy payload (3-keypoint pose model): bowTip/bowFrog/bowContact passed
+ * through directly — kept so an old bundled model still produces data.
  */
-function assessFrameQuality(frames: FrameKeypoints[]): MeasurementQuality {
-  if (frames.length === 0) return 'unavailable';
-  let goodFrames = 0;
-  for (const frame of frames) {
-    const pose = frame.poseLandmarks;
-    if (!pose) continue;
-    const lS = pose[POSE.LEFT_SHOULDER];
-    const rS = pose[POSE.RIGHT_SHOULDER];
-    if (!lS || !rS) continue;
-    if ((lS.visibility ?? 0) < CONFIDENCE_THRESHOLD || (rS.visibility ?? 0) < CONFIDENCE_THRESHOLD) continue;
-    const shoulderWidth = Math.abs(lS.x - rS.x);
-    if (shoulderWidth >= MIN_SHOULDER_WIDTH_RAW) goodFrames++;
-  }
-  return goodFrames / frames.length >= 0.4 ? 'high' : 'low';
-}
-
-/** Parse bow keypoints from a raw native frame dict into RawBowFrame, or null. */
 function parseBowFrame(f: any): RawBowFrame | null {
+  if (f.bowBox && typeof f.bowConfidence === 'number') {
+    return deriveBowFrameFromBoxes({
+      timestamp: f.timestamp ?? 0,
+      bowBox: f.bowBox,
+      bowConfidence: f.bowConfidence,
+      violinBox: f.violinBox ?? null,
+      rightWrist: f.joints?.rightWrist ?? null,
+      leftWrist: f.joints?.leftWrist ?? null,
+    });
+  }
   if (!f.bowTip || !f.bowFrog || !f.bowContact) return null;
   return {
     timestamp:      f.timestamp ?? 0,
@@ -99,25 +91,6 @@ function parseBowFrame(f: any): RawBowFrame | null {
     contactX:       f.bowContact.x, contactY: f.bowContact.y, contactVisible: !!f.bowContact.visible,
     confidence:     f.bowConfidence ?? 0,
   };
-}
-
-export function scorePoseFrames(
-  frames: FrameKeypoints[],
-  instrument: InstrumentId,
-  durationSeconds: number,
-  bowFrames: RawBowFrame[] = [],
-): MetricScore[] {
-  if (frames.length < 5) return [];
-  const quality = assessFrameQuality(frames);
-  const prepared = preparePoseFramesForScoring(frames);
-  if (prepared.length < 5) return [];
-  const metrics = scorePoseMetrics(prepared, bowFrames, instrument, durationSeconds);
-  if (quality === 'low') {
-    return metrics.map((m) =>
-      m.measurementQuality === 'unavailable' ? m : { ...m, measurementQuality: 'low' as MeasurementQuality },
-    );
-  }
-  return metrics;
 }
 
 /**

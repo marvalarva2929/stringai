@@ -5,6 +5,7 @@ import { PlayerCategory } from '../types/analysis';
 const GUEST_ANALYSES_KEY = 'guest_analyses_used';
 const ONBOARDING_KEY = 'has_completed_onboarding';
 const PLAYER_CATEGORY_KEY = 'player_category';
+const WEEKLY_GOAL_KEY = 'weekly_goal_minutes';
 const FREE_LIMIT = 2;
 
 interface AuthState {
@@ -13,11 +14,13 @@ interface AuthState {
   accessToken: string | null;
   hasCompletedOnboarding: boolean;
   playerCategory: PlayerCategory | null;
+  weeklyGoalMinutes: number | null;
   guestAnalysesUsed: number;
 
   setAuthenticated: (userId: string, token: string) => void;
   setOnboardingComplete: () => void;
   setPlayerCategory: (category: PlayerCategory) => Promise<void>;
+  setWeeklyGoal: (minutes: number) => Promise<void>;
   loadOnboardingStatus: () => Promise<void>;
   signOut: () => void;
   loadGuestCount: () => Promise<void>;
@@ -31,6 +34,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   accessToken: null,
   hasCompletedOnboarding: false,
   playerCategory: null,
+  weeklyGoalMinutes: null,
   guestAnalysesUsed: 0,
 
   setAuthenticated: (userId, token) =>
@@ -46,14 +50,21 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     await AsyncStorage.setItem(PLAYER_CATEGORY_KEY, category).catch(() => {});
   },
 
+  setWeeklyGoal: async (minutes) => {
+    set({ weeklyGoalMinutes: minutes });
+    await AsyncStorage.setItem(WEEKLY_GOAL_KEY, String(minutes)).catch(() => {});
+  },
+
   loadOnboardingStatus: async () => {
-    const [onboarding, category] = await Promise.all([
+    const [onboarding, category, weeklyGoal] = await Promise.all([
       AsyncStorage.getItem(ONBOARDING_KEY),
       AsyncStorage.getItem(PLAYER_CATEGORY_KEY),
+      AsyncStorage.getItem(WEEKLY_GOAL_KEY),
     ]);
     set({
       hasCompletedOnboarding: onboarding === 'true',
       playerCategory: (category as PlayerCategory | null) ?? null,
+      weeklyGoalMinutes: weeklyGoal ? parseInt(weeklyGoal, 10) : null,
     });
   },
 

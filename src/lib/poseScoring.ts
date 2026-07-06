@@ -11,10 +11,11 @@
  *   - rightShoulder.x < leftShoulder.x always
  */
 
-import { MetricScore, MetricKey, MeasurementQuality, TechniqueEvent, FlaggedTimestamp, severityFromScore } from '../types/analysis';
-import { InstrumentId } from '../types/instrument';
-import { RawBowFrame } from '../types/signals';
-import { deriveBowTimeSeries, BowTimeSeries } from './bowAnalysis';
+import { severityFromScore, type MetricScore, type MetricKey, type MeasurementQuality, type TechniqueEvent, type FlaggedTimestamp } from '../types/analysis';
+import type { InstrumentId } from '../types/instrument';
+import type { RawBowFrame, SessionSignals } from '../types/signals';
+import { deriveBowTimeSeries, type BowTimeSeries } from './bowAnalysis';
+import { INSTRUMENTS } from '../constants/instruments';
 
 // ─────────────────────────────────────────────────────────────
 // Landmark type definitions (MediaPipe format)
@@ -216,6 +217,12 @@ const THRESHOLDS = {
     minDistributionRange: 0.35,
     // Minimum bow frames required before a metric is considered reliable.
     minFrames: 5,
+    // Placement proxy: allowed drift of the string-diagonal contact position
+    // from the player's session median before a frame is flagged.
+    placementDriftS: 0.15,
+    // Arm level: allowed deviation of shoulder-relative elbow height from the
+    // expected height for the string being played (normalized frame units).
+    armLevelToleranceY: 0.08,
   },
 };
 
@@ -223,10 +230,52 @@ const THRESHOLDS = {
 // Per-metric scoring
 // ─────────────────────────────────────────────────────────────
 
-// Bow placement (sul ponticello / normal / sul tasto) requires knowing bridge
-// position in the frame, which needs a bridge detector. Deferred.
-function scoreBowPlacement(_bow: BowTimeSeries): MetricScore {
-  return unavailableMetric('bowPlacement', 'Bow contact zone (bridge vs fingerboard) requires bridge position detection — coming in a future update.');
+// Bow placement proxy: contact position along the violin-box string diagonal
+// (RawBowFrame.stringPosS). Without a bridge detector we can't label absolute
+// sul tasto / sul ponticello zones, but drift away from the player's own
+// session-median contact position is measurable — quality stays 'low' until
+// the bridge detector (Phase 18) provides absolute zones.
+function scoreBowPlacement(bow: BowTimeSeries): MetricScore {
+  const pts = bow.stringPos.points.filter(p => p.v !== null) as Array<{ t: number; v: number }>;
+  if (pts.length < THRESHOLDS.bow.minFrames * 2) {
+    return unavailableMetric('bowPlacement', 'Not enough bow-contact frames detected in this session.');
+  }
+
+  const sorted = [...pts].map(p => p.v).sort((a, b) => a - b);
+  const baseline = sorted[Math.floor(sorted.length / 2)];
+  const timestamps = pts.map(p => p.t);
+
+  const flaggedIndexes: number[] = [];
+  let goodFrames = 0;
+  for (let i = 0; i < pts.length; i++) {
+    if (Math.abs(pts[i].v - baseline) <= THRESHOLDS.bow.placementDriftS) {
+      goodFrames++;
+    } else {
+      flaggedIndexes.push(i);
+    }
+  }
+
+  const confirmedFlags = filterConsecutiveRuns(flaggedIndexes);
+  const score = clamp(Math.round((goodFrames / pts.length) * 100));
+  const occurrenceRate = confirmedFlags.length / pts.length;
+  const flaggedTimestamps = framesToTimestamps(confirmedFlags, timestamps, 'Contact point drifting along the string');
+  const events = timestampsToEvents(flaggedTimestamps, 'bow_placement_drift');
+
+  const entryCount = countEntries(confirmedFlags);
+  const observationSummary = entryCount === 0
+    ? 'Bow contact point stayed consistent along the string.'
+    : `Bow contact point drifted noticeably ${entryCount} ${entryCount === 1 ? 'time' : 'times'} — aim for a steady lane between bridge and fingerboard.`;
+
+  return {
+    key: 'bowPlacement',
+    score,
+    flaggedTimestamps,
+    severity: severityFromScore(score),
+    events,
+    occurrenceRate,
+    observationSummary,
+    measurementQuality: 'low',
+  };
 }
 
 function scoreBowAngle(bow: BowTimeSeries): MetricScore {
@@ -276,10 +325,87 @@ function scoreBowAngle(bow: BowTimeSeries): MetricScore {
   };
 }
 
-// Bow arm level requires correlating elbow height to the current string (from pitch).
-// Partial — needs pitch-string mapping from SessionSignals. Deferred to next sprint.
-function scoreBowArmLevel(_bow: BowTimeSeries, _instrument: InstrumentId): MetricScore {
-  return unavailableMetric('bowArmLevel', 'Bow arm level assessment requires pitch-to-string mapping — coming in next sprint.');
+// Bow arm level: shoulder-relative elbow height vs the expected height for the
+// string currently being played (string inferred from the pitch signal).
+// Config semantics: elbowHeightHigh = expected height on the LOWEST string
+// (G — elbow raised), elbowHeightLow = on the HIGHEST string (E — elbow drops).
+function scoreBowArmLevel(
+  _bow: BowTimeSeries,
+  instrument: InstrumentId,
+  signals?: SessionSignals,
+): MetricScore {
+  if (!signals) {
+    return unavailableMetric('bowArmLevel', 'Bow arm level requires the session signal store.');
+  }
+
+  const config = INSTRUMENTS[instrument];
+  const strings = config.strings;                 // low → high
+  const { elbowHeightLow, elbowHeightHigh } = config.bowArmThresholds;
+
+  // Usable samples: elbow + shoulder + a voiced pitch at the same moment
+  type Sample = { t: number; height: number; stringIdx: number };
+  const samples: Sample[] = [];
+  for (const p of signals.rightElbowY.points) {
+    if (p.v === null) continue;
+    const shoulderY = signals.rightShoulderY.sample(p.t);
+    const pitch = signals.pitch.sample(p.t, 0.2);
+    if (shoulderY === null || pitch === null) continue;
+
+    // String from pitch: highest string whose open frequency is below the pitch
+    let stringIdx = 0;
+    for (let s = strings.length - 1; s >= 0; s--) {
+      if (pitch >= strings[s].openFrequency) { stringIdx = s; break; }
+    }
+    // Height above shoulder (screen y grows downward)
+    samples.push({ t: p.t, height: shoulderY - p.v, stringIdx });
+  }
+
+  if (samples.length < THRESHOLDS.bow.minFrames * 2) {
+    return unavailableMetric('bowArmLevel', 'Not enough frames with both pose and pitch data.');
+  }
+
+  const flaggedIndexes: number[] = [];
+  const timestamps = samples.map(s => s.t);
+  let goodFrames = 0;
+  let lowCount = 0;   // elbow below expected band
+  for (let i = 0; i < samples.length; i++) {
+    const { height, stringIdx } = samples[i];
+    // Interpolate expected height: lowest string → elbowHeightHigh, highest → elbowHeightLow
+    const frac = strings.length > 1 ? stringIdx / (strings.length - 1) : 0;
+    const expected = elbowHeightHigh + (elbowHeightLow - elbowHeightHigh) * frac;
+    const dev = height - expected;
+    if (Math.abs(dev) <= THRESHOLDS.bow.armLevelToleranceY) {
+      goodFrames++;
+    } else {
+      flaggedIndexes.push(i);
+      if (dev < 0) lowCount++;
+    }
+  }
+
+  const confirmedFlags = filterConsecutiveRuns(flaggedIndexes);
+  const score = clamp(Math.round((goodFrames / samples.length) * 100));
+  const occurrenceRate = confirmedFlags.length / samples.length;
+  const flaggedTimestamps = framesToTimestamps(confirmedFlags, timestamps, 'Bow arm height off for the string being played');
+  const events = timestampsToEvents(flaggedTimestamps, 'bow_arm_level');
+
+  const entryCount = countEntries(confirmedFlags);
+  const mostlyLow = flaggedIndexes.length > 0 && lowCount / flaggedIndexes.length > 0.6;
+  const observationSummary = entryCount === 0
+    ? 'Bow arm height tracked the string level well.'
+    : mostlyLow
+    ? `Bow elbow sat too low for the string being played ${entryCount} ${entryCount === 1 ? 'time' : 'times'} — raise the arm as you move to lower strings.`
+    : `Bow arm height didn't match the string level ${entryCount} ${entryCount === 1 ? 'time' : 'times'}.`;
+
+  return {
+    key: 'bowArmLevel',
+    score,
+    flaggedTimestamps,
+    severity: severityFromScore(score),
+    events,
+    occurrenceRate,
+    observationSummary,
+    measurementQuality: 'low',
+  };
 }
 
 function scoreBowDistribution(bow: BowTimeSeries): MetricScore {
@@ -487,13 +613,14 @@ export function scorePoseMetrics(
   bowFrames: RawBowFrame[],
   instrument: InstrumentId,
   _duration: number,
+  signals?: SessionSignals,
 ): MetricScore[] {
   if (frames.length === 0) return [];
   const bow = deriveBowTimeSeries(bowFrames);
   return [
     scoreBowPlacement(bow),
     scoreBowAngle(bow),
-    scoreBowArmLevel(bow, instrument),
+    scoreBowArmLevel(bow, instrument, signals),
     scoreBowDistribution(bow),
     scoreLeftHandWrist(frames),
     scorePosture(frames),

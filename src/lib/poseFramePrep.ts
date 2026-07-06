@@ -1,4 +1,4 @@
-import { FrameKeypoints, Landmark, POSE, HAND, CONFIDENCE_THRESHOLD } from './poseScoring';
+import { POSE, HAND, CONFIDENCE_THRESHOLD, type FrameKeypoints, type Landmark } from './poseScoring';
 
 /** Unified sampling rate for live and uploaded video scoring paths. */
 export const SCORING_TARGET_FPS = 10;

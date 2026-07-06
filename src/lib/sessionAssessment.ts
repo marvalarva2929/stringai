@@ -1,4 +1,4 @@
-import {
+import type {
   MetricScore,
   MetricKey,
   SeverityBand,
@@ -9,6 +9,8 @@ import {
 } from '../types/analysis';
 import { EXERCISES } from '../constants/exercises';
 import { METRIC_META } from '../constants/metricMeta';
+import type { StatisticalFinding } from './patternDetection';
+import type { PhraseFeatures } from './phraseFeatures';
 
 // ─────────────────────────────────────────────────────────────
 // Constants
@@ -219,6 +221,76 @@ function buildKeyObservations(
     }));
 }
 
+// ─────────────────────────────────────────────────────────────
+// Upper-layer evidence (L7 phrase features + L8 findings)
+// ─────────────────────────────────────────────────────────────
+
+// Which metric card a statistical finding belongs under.
+const FINDING_METRIC_KEY: Record<string, MetricKey> = {
+  intonation_fatigue: 'pitchAccuracy',
+  finger_accuracy_gap: 'pitchAccuracy',
+  pitch_tendency: 'pitchAccuracy',
+  dynamic_range_narrow: 'dynamicControl',
+  bow_distribution_narrow: 'bowDistribution',
+  upper_bow_tone_degradation: 'toneQuality',
+  tip_dynamic_ceiling: 'dynamicControl',
+};
+
+const SEVERITY_RANK: Record<StatisticalFinding['severity'], number> = {
+  minor: 1,
+  moderate: 2,
+  significant: 3,
+};
+
+// Top findings become key observations — they carry session-specific evidence
+// the canned per-severity text can't match.
+function buildFindingObservations(
+  findings: StatisticalFinding[],
+): { metricKey: MetricKey; note: string }[] {
+  return [...findings]
+    .filter((f) => f.fired && FINDING_METRIC_KEY[f.testId])
+    .sort(
+      (a, b) =>
+        SEVERITY_RANK[b.severity] * b.confidence - SEVERITY_RANK[a.severity] * a.confidence,
+    )
+    .slice(0, 2)
+    .map((f) => ({ metricKey: FINDING_METRIC_KEY[f.testId], note: f.summary }));
+}
+
+// One categorical line from the phrase features (L9 rule: no raw numbers).
+function buildPhraseObservation(
+  features: PhraseFeatures[],
+): { metricKey: MetricKey; note: string } | null {
+  if (features.length < 2) return null;
+
+  const flatShare = features.filter((f) => f.energy_shape === 'flat').length / features.length;
+  if (flatShare > 0.6) {
+    return {
+      metricKey: 'dynamicControl',
+      note: 'Most phrases stay at one dynamic level — shape each phrase with a clear rise and fall.',
+    };
+  }
+
+  const withBow = features.filter((f) => f.bow_usage !== null);
+  if (withBow.length >= 2) {
+    const frogShare = withBow.filter((f) => f.bow_usage!.distribution === 'frog_heavy').length / withBow.length;
+    const tipShare = withBow.filter((f) => f.bow_usage!.distribution === 'tip_heavy').length / withBow.length;
+    if (frogShare > 0.6) {
+      return {
+        metricKey: 'bowDistribution',
+        note: 'Playing is concentrated in the lower half of the bow across most phrases — travel out toward the tip.',
+      };
+    }
+    if (tipShare > 0.6) {
+      return {
+        metricKey: 'bowDistribution',
+        note: 'Playing is concentrated near the tip across most phrases — use the weight available at the frog.',
+      };
+    }
+  }
+  return null;
+}
+
 function buildPostureMetrics(videoMetrics: MetricScore[]): PostureMetrics {
   const available = videoMetrics.filter((m) => m.measurementQuality !== 'unavailable');
   const get = (key: MetricKey) =>
@@ -240,15 +312,32 @@ function buildPostureMetrics(videoMetrics: MetricScore[]): PostureMetrics {
 // Public entry point
 // ─────────────────────────────────────────────────────────────
 
+export interface AssessmentExtras {
+  /** L8 statistical findings that fired. */
+  findings?: StatisticalFinding[];
+  /** L7 per-phrase features. */
+  phraseFeatures?: PhraseFeatures[];
+}
+
 export function buildSessionAssessment(
   videoMetrics: MetricScore[],
   userCategory?: PlayerCategory,
+  extras?: AssessmentExtras,
 ): SessionAssessment {
   // Prefer the user's self-reported goal; fall back to video-computed classification
   const category = userCategory ?? classifyPlayer(videoMetrics);
   const postureMetrics = buildPostureMetrics(videoMetrics);
   const techniqueSummary = buildTechniqueSummary(category, videoMetrics);
-  const keyObservations = buildKeyObservations(videoMetrics);
+
+  // Evidence-backed observations from the upper layers lead; canned per-metric
+  // text fills the remaining slots.
+  const findingObs = extras?.findings ? buildFindingObservations(extras.findings) : [];
+  const phraseObs = extras?.phraseFeatures ? buildPhraseObservation(extras.phraseFeatures) : null;
+  const keyObservations = [
+    ...findingObs,
+    ...(phraseObs ? [phraseObs] : []),
+    ...buildKeyObservations(videoMetrics),
+  ].slice(0, 5);
 
   // Foundation: surface issues below 75 (broader net)
   // Refinement: surface issues below 82 (higher bar — only meaningful gaps)

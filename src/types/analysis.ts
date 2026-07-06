@@ -118,10 +118,27 @@ export interface LLMCoachingItem {
   exercise?: string;    // Recommended drill text
 }
 
+export interface LLMPhraseFeedback {
+  phraseId: number;
+  observation: string;
+  tip: string;
+}
+
+export interface LLMPracticePlanStep {
+  title: string;
+  duration: string;
+  instructions: string;
+}
+
 export interface LLMFeedback {
   overallTake: string;
   items: LLMCoachingItem[];
   generatedAt: string;
+  /** Present only on Edge Function (Claude) responses, not static fallback. */
+  phraseFeedback?: LLMPhraseFeedback[];
+  practicePlan?: LLMPracticePlanStep[];
+  /** 'claude' = Edge Function; absent/'static' = local template fallback. */
+  source?: 'claude' | 'static';
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -280,6 +297,12 @@ export interface AnalysisResult {
   audioQualityWarning?: string;
   videoUri?: string;  // local path to the session video for replay
   noteEvents?: import('../lib/noteFusion').NoteEvent[];
+  /** L8 findings that fired. Persisted with the session for L10 coaching. */
+  patternFindings?: import('../lib/patternDetection').StatisticalFinding[];
+  /** L3 substrate. In-memory only — contains closures (TimeSeries.sample/window)
+   *  that don't survive JSON serialization; stripped from persistence and from
+   *  all but the newest sessionResultCache entry. */
+  sessionSignals?: import('./signals').SessionSignals;
 }
 
 // Raw intermediate signals from audio DSP — consumed by noteFusion.ts
@@ -290,6 +313,9 @@ export interface RawAudioSignals {
   spectralCentroidFrames: { value: number; timestamp: number }[];
   brightnessFrames:       { value: number; timestamp: number }[];
   onsetTimestamps: number[];
+  /** Merged flux+pitch onsets BEFORE same-note collapsing. Same-pitch bow-change
+   *  candidates survive here — noteFusion re-validates them against bow speed. */
+  uncollapsedOnsetTimestamps: number[];
   sampleRate: number;
   duration: number;
 }

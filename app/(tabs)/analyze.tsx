@@ -28,7 +28,11 @@ import { useAnalysisStore } from '../../src/store/useAnalysisStore';
 import { useAuthStore } from '../../src/store/useAuthStore';
 import { useUserStore } from '../../src/store/useUserStore';
 import { TunerModal } from '../../src/components/tuner/TunerModal';
-import { runAudioAnalysis, runVideoAnalysis, computeOverallScore, saveSession, sessionToSummary, buildSessionFeedback } from '../../src/services/analysis';
+import { runAudioAnalysis, mockVideoMetrics, computeOverallScore, saveSession, sessionToSummary, buildSessionFeedback, updateSessionLlmFeedback } from '../../src/services/analysis';
+import { runSessionPipeline } from '../../src/lib/sessionPipeline';
+import { incrementFreeAnalysesInDb } from '../../src/services/auth';
+import { isSupabaseConfigured } from '../../src/services/supabase';
+import { buildCoachingInput, fetchCoachingFeedback } from '../../src/services/llmFeedback';
 import { AnalysisTimeline } from '../../src/components/analysis/AnalysisTimeline';
 import { CoachingReport } from '../../src/components/analysis/CoachingReport';
 import { InlineVideoPlayer } from '../../src/components/analysis/InlineVideoPlayer';
@@ -45,9 +49,10 @@ import { INSTRUMENTS } from '../../src/constants/instruments';
 import { PoseSkeleton, PoseJoint, PoseJoints, HandLandmarks, LEFT_HAND_COLOR, RIGHT_HAND_COLOR } from '../../src/components/analysis/PoseSkeleton';
 import { startRecording as poseStartRecording, stopRecording as poseStopRecording, getPoseCameraView, setHomeIndicatorHidden } from 'pose-camera';
 import { FrameKeypoints } from '../../src/lib/poseScoring';
-import { convertPoseFrame } from '../../src/services/videoAnalysis';
+import { deriveBowFrameFromBoxes } from '../../src/lib/bowBoxGeometry';
+import { convertPoseFrame, extractVideoFrames } from '../../src/services/videoAnalysis';
 import { RawBowFrame } from '../../src/types/signals';
-import { fuseSignals, debugLogNoteEvents, deriveIntonationAnalysis } from '../../src/lib/noteFusion';
+import { debugLogNoteEvents, deriveIntonationAnalysis } from '../../src/lib/noteFusion';
 import { classifyVibratoSegment } from '../../src/services/pitchContour';
 import Svg, { Circle, Line, G, Rect, Path, Polygon, Text as SvgText } from 'react-native-svg';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -69,6 +74,11 @@ const VIOLIN_ELBOW_MIN_ANGLE = 60;    // violin arm too bent → wrist collapse
 
 // Toggle if the skeleton appears mirrored or upside-down in the landscape view.
 const LANDSCAPE_FLIP = true;
+// Hides the wrist/vibrato HUD panels while analyzing bow+violin detection.
+// Typed as boolean (not literal false) so TS still runs control-flow
+// narrowing inside the hidden JSX — a literal `false &&` marks the branch
+// unreachable and breaks the null guards within.
+const SHOW_LIVE_HUD: boolean = false;
 
 // Aspect ratio of the captured frame (.high preset = 1920×1080 landscape).
 // Used to correct normalised image distances in wrist angle calculation.
@@ -613,8 +623,8 @@ export default function AnalyzeScreen() {
     setPhase, setSelectedPiece, setRecordingUri, setResult, setError, reset,
     addToHistory, addToMetricHistory, cacheSessionResult, continueWithPiece,
   } = useAnalysisStore();
-  const { profile } = useUserStore();
-  const { isAuthenticated, playerCategory } = useAuthStore();
+  const { profile, incrementFreeAnalyses } = useUserStore();
+  const { isAuthenticated, playerCategory, incrementGuestCount } = useAuthStore();
 
   // Video seek state (for inline player in results)
   const [seekVersion, setSeekVersion] = useState(0);
@@ -693,17 +703,14 @@ export default function AnalyzeScreen() {
   // Accumulated pose + bow frames for post-session scoring
   const poseFramesRef = useRef<FrameKeypoints[]>([]);
   const bowFramesRef  = useRef<RawBowFrame[]>([]);
-  // Live bow keypoints for overlay rendering (null = not detected this frame)
-  const [liveBowKps, setLiveBowKps] = useState<{
-    tip:        { x: number; y: number } | null;
-    frog:       { x: number; y: number } | null;
-    contact:    { x: number; y: number } | null;
-    box:        { x1: number; y1: number; x2: number; y2: number } | null;
-    confidence: number;
+  // Live detector boxes for the debug overlay (joint-space coords from native;
+  // null = no detection yet). Bow is amber, violin cyan — same as the ml tools.
+  const [liveBoxes, setLiveBoxes] = useState<{
+    bow: { x1: number; y1: number; x2: number; y2: number } | null;
+    bowConf: number;
+    violin: { x1: number; y1: number; x2: number; y2: number } | null;
+    violinConf: number;
   } | null>(null);
-  // 0=identity, 1=90°CW, 2=180°, 3=270°CW (default — matches Vision .down coordinate flip)
-  const [bowRotation, setBowRotation] = useState(3);
-  const [bowFlipped, setBowFlipped] = useState(false);
   const recordingStartTimeRef = useRef<number>(0);
   const poseCheckIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // Warnings surface after appearing in 2 consecutive 1s checks (2s debounce).
@@ -892,7 +899,7 @@ export default function AnalyzeScreen() {
     firstPoseRef.current          = false;
     poseFramesRef.current         = [];
     bowFramesRef.current          = [];
-    setLiveBowKps(null);
+    setLiveBoxes(null);
     recordingStartTimeRef.current = 0;
     haptic.medium();
     setPhase('recording');
@@ -1020,17 +1027,49 @@ export default function AnalyzeScreen() {
       }
 
       setPhase('processing_video');
-      const videoMetrics: MetricScore[] = isVideo
-        ? await runVideoAnalysis(uri, instrument, poseFrames, durationSec, bowFramesRef.current)
-        : [];
+      // Acquire pose + bow frames: the live path uses frames captured during
+      // recording; the upload path extracts them from the saved video file.
+      const isLivePose = !!poseFrames && poseFrames.length >= 5;
+      let pipelinePoseFrames: FrameKeypoints[] = isLivePose ? poseFrames! : [];
+      let pipelineBowFrames: RawBowFrame[] = isLivePose ? bowFramesRef.current : [];
+      if (isVideo && !isLivePose) {
+        try {
+          const extracted = await extractVideoFrames(uri);
+          pipelinePoseFrames = extracted.poseFrames;
+          pipelineBowFrames = extracted.bowFrames;
+        } catch {
+          // module unavailable (Android) or video unreadable — mock fallback below
+        }
+      }
 
-      // Fuse audio signals + pose frames into per-note events (single source of truth)
-      // Pass raw (un-normalized) frames — fuseSignals needs screen-space coords for
-      // getShoulderRaised; scorePoseFrames (inside runVideoAnalysis) owns normalization.
-      const noteEvents = audioOutput
-        ? fuseSignals(audioOutput.rawSignals, poseFrames ?? [])
-        : [];
+      // Use the user's stated goal from onboarding; fall back to video-computed classification
+      const userCategory = profile?.playerCategory ?? playerCategory ?? undefined;
+
+      // L1–L9 in one pure call. Raw (un-normalized) frames go in — fuseSignals
+      // needs screen-space coords for getShoulderRaised; the pipeline owns
+      // normalization for scoring and SessionSignals.
+      const pipeline = audioOutput
+        ? runSessionPipeline({
+            audioOutput,
+            poseFrames: pipelinePoseFrames,
+            bowFrames: pipelineBowFrames,
+            durationSeconds: durationSec,
+            instrument,
+            userCategory,
+          })
+        : null;
+
+      const noteEvents = pipeline?.noteEvents ?? [];
       if (__DEV__) debugLogNoteEvents(noteEvents);
+
+      let videoMetrics: MetricScore[] = pipeline?.videoMetrics ?? [];
+      let sessionAssessment = pipeline?.sessionAssessment
+        ?? buildSessionAssessment(videoMetrics, userCategory);
+      if (isVideo && videoMetrics.length === 0) {
+        // Android or Vision produced too few frames — placeholder scores.
+        videoMetrics = await mockVideoMetrics();
+        sessionAssessment = buildSessionAssessment(videoMetrics, userCategory);
+      }
 
       // Derive intonation analysis from the same note events — single source of truth.
       // If fuseSignals produces no events, intonation is undefined so feedback never
@@ -1089,9 +1128,6 @@ export default function AnalyzeScreen() {
       const sessionId = Math.random().toString(36).slice(2);
       const recordedAt = new Date().toISOString();
       const allMetrics = [...audioMetricsFinal, ...videoMetrics];
-      // Use the user's stated goal from onboarding; fall back to video-computed classification
-      const userCategory = profile?.playerCategory ?? playerCategory ?? undefined;
-      const sessionAssessment = buildSessionAssessment(videoMetrics, userCategory);
 
       // Generate coaching feedback from all metrics + previous session for trend comparison
       const prevSessionMetrics = metricHistory[0]?.scores;
@@ -1124,6 +1160,8 @@ export default function AnalyzeScreen() {
         audioQualityWarning,
         videoUri,
         noteEvents,
+        patternFindings: pipeline?.findings,
+        sessionSignals: pipeline?.signals,
       };
 
       // Write wrist debug data to a file so it can be pulled via xcrun devicectl.
@@ -1135,12 +1173,45 @@ export default function AnalyzeScreen() {
         ).catch(() => {});
       }
 
-      if (isAuthenticated && profile?.id) await saveSession(result);
+      if (isAuthenticated && profile?.id && isSupabaseConfigured) {
+        await saveSession(result).catch(() => {});
+        // Free-tier quota: local counter for immediate UI, server RPC so the
+        // limit is enforced across devices/reinstalls (fire-and-forget).
+        incrementFreeAnalyses();
+        incrementFreeAnalysesInDb(profile.id).catch(() => {});
+      } else if (!isAuthenticated) {
+        incrementGuestCount().catch(() => {});
+      }
       addToHistory(sessionToSummary(result));
       addToMetricHistory({ sessionId, recordedAt, scores: allMetrics });
       cacheSessionResult(result);
 
       setResult(result);
+
+      // L10: upgrade the static feedback with Claude coaching. Non-blocking —
+      // the UI already shows the template feedback; on success the richer
+      // response is merged in and cached on the session row so re-viewing
+      // never re-calls the LLM.
+      if (isAuthenticated && profile?.id && isSupabaseConfigured && pipeline) {
+        const coachingInput = buildCoachingInput(
+          allMetrics,
+          sessionAssessment.playerCategory,
+          skillLevel,
+          selectedPiece ?? undefined,
+          pipeline.findings,
+          pipeline.phraseFeatures,
+        );
+        fetchCoachingFeedback(coachingInput)
+          .then((claudeFeedback) => {
+            const upgraded: AnalysisResult = { ...result, llmFeedback: claudeFeedback };
+            cacheSessionResult(upgraded);
+            // Only swap the visible result if the user is still on this session
+            const { currentResult } = useAnalysisStore.getState();
+            if (currentResult?.sessionId === result.sessionId) setResult(upgraded);
+            updateSessionLlmFeedback(result.sessionId, claudeFeedback).catch(() => {});
+          })
+          .catch(() => {});
+      }
     } catch (err: any) {
       setError(err.message ?? 'Analysis failed');
     }
@@ -1384,17 +1455,12 @@ export default function AnalyzeScreen() {
       paddingRight: insets.bottom,
     };
 
-    // Map normalized model coords → screen center point, applying flip then rotation.
-    const bowCenter = (px: number, py: number): { x: number; y: number } => {
-      const fx = bowFlipped ? 1 - px : px;
-      switch (bowRotation) {
-        case 0: return { x: fx * screenWidth,        y: py * screenHeight };
-        case 1: return { x: (1 - py) * screenWidth,  y: fx * screenHeight };
-        case 2: return { x: (1 - fx) * screenWidth,  y: (1 - py) * screenHeight };
-        case 3: return { x: py * screenWidth,         y: (1 - fx) * screenHeight };
-        default: return { x: fx * screenWidth,        y: py * screenHeight };
-      }
-    };
+    // Joint-space normalized coords → screen px, identical to PoseSkeleton's
+    // mapping so boxes and (when re-enabled) skeleton line up pixel-perfect.
+    const jointToScreen = (x: number, y: number): { x: number; y: number } =>
+      LANDSCAPE_FLIP
+        ? { x: y * screenWidth, y: x * screenHeight }
+        : { x: (1 - y) * screenWidth, y: (1 - x) * screenHeight };
     return (
       <View style={styles.recordingScreen}>
 
@@ -1420,19 +1486,15 @@ export default function AnalyzeScreen() {
               targetRightHandRef.current = rh;
               setDebugMetrics(computeDebugMetrics(joints, lh, rh));
 
-              // Bow keypoints — present only on ~10fps bow-inference frames.
-              const bowTip     = ev.bowTip     ?? null;
-              const bowFrog    = ev.bowFrog    ?? null;
-              const bowContact = ev.bowContact ?? null;
-              const bowConf    = ev.bowConfidence ?? 0;
-              if (bowTip && bowFrog && bowContact) {
-                const bowBox = ev.bowBox ?? null;
-                setLiveBowKps({
-                  tip:        bowTip.visible     ? { x: bowTip.x,     y: bowTip.y     } : null,
-                  frog:       bowFrog.visible    ? { x: bowFrog.x,    y: bowFrog.y    } : null,
-                  contact:    bowContact.visible ? { x: bowContact.x, y: bowContact.y } : null,
-                  box:        bowBox ? { x1: bowBox.x1, y1: bowBox.y1, x2: bowBox.x2, y2: bowBox.y2 } : null,
-                  confidence: bowConf,
+              // Bow + violin boxes — present only on ~10fps detector frames.
+              // Coords arrive already in the joints' space (see PoseCameraView).
+              const bowBox = ev.bowBox ?? null;
+              if (bowBox) {
+                setLiveBoxes({
+                  bow: bowBox,
+                  bowConf: ev.bowConfidence ?? 0,
+                  violin: ev.violinBox ?? null,
+                  violinConf: ev.violinConfidence ?? 0,
                 });
               }
 
@@ -1441,15 +1503,17 @@ export default function AnalyzeScreen() {
                   ? (Date.now() - recordingStartTimeRef.current) / 1000
                   : elapsedRef.current;
                 poseFramesRef.current.push(convertPoseFrame(joints, lh, rh, ts));
-                // Collect bow frames when the model fires.
-                if (bowTip && bowFrog && bowContact) {
-                  bowFramesRef.current.push({
-                    timestamp:      ts,
-                    tipX: bowTip.x,     tipY: bowTip.y,     tipVisible:     !!bowTip.visible,
-                    frogX: bowFrog.x,   frogY: bowFrog.y,   frogVisible:    !!bowFrog.visible,
-                    contactX: bowContact.x, contactY: bowContact.y, contactVisible: !!bowContact.visible,
-                    confidence: bowConf,
+                // Derive tip/frog/contact from the boxes + wrists (same space).
+                if (bowBox) {
+                  const bowFrame = deriveBowFrameFromBoxes({
+                    timestamp: ts,
+                    bowBox,
+                    bowConfidence: ev.bowConfidence ?? 0,
+                    violinBox: ev.violinBox ?? null,
+                    rightWrist: joints.rightWrist ?? null,
+                    leftWrist: joints.leftWrist ?? null,
                   });
+                  if (bowFrame) bowFramesRef.current.push(bowFrame);
                 }
                 if (!firstPoseRef.current) {
                   firstPoseRef.current = true;
@@ -1603,51 +1667,39 @@ export default function AnalyzeScreen() {
           />
         )}
 
-        {/* Bow keypoint overlay — dots + labels + model bounding box */}
-        {isRecording && usingPoseCamera && liveBowKps && (() => {
-          const tip     = liveBowKps.tip     ? bowCenter(liveBowKps.tip.x,     liveBowKps.tip.y)     : null;
-          const frog    = liveBowKps.frog    ? bowCenter(liveBowKps.frog.x,    liveBowKps.frog.y)    : null;
-          const contact = liveBowKps.contact ? bowCenter(liveBowKps.contact.x, liveBowKps.contact.y) : null;
-          // Transform the two model bbox corners through the same flip+rotation as keypoints
-          const box = liveBowKps.box ? (() => {
-            const c1 = bowCenter(liveBowKps.box!.x1, liveBowKps.box!.y1);
-            const c2 = bowCenter(liveBowKps.box!.x2, liveBowKps.box!.y2);
+        {/* Detector debug overlay — bow (amber) + violin (cyan) boxes only */}
+        {isRecording && usingPoseCamera && liveBoxes && (() => {
+          const toRect = (b: { x1: number; y1: number; x2: number; y2: number }) => {
+            const c1 = jointToScreen(b.x1, b.y1);
+            const c2 = jointToScreen(b.x2, b.y2);
             return {
               x: Math.min(c1.x, c2.x), y: Math.min(c1.y, c2.y),
               w: Math.abs(c1.x - c2.x), h: Math.abs(c1.y - c2.y),
             };
-          })() : null;
+          };
+          const entries = [
+            liveBoxes.bow && {
+              key: 'bow', r: toRect(liveBoxes.bow), color: '#f59e0b',
+              label: `bow ${Math.round(liveBoxes.bowConf * 100)}%`,
+            },
+            liveBoxes.violin && {
+              key: 'violin', r: toRect(liveBoxes.violin), color: '#22d3ee',
+              label: `violin ${Math.round(liveBoxes.violinConf * 100)}%`,
+            },
+          ].filter(Boolean) as Array<{ key: string; r: { x: number; y: number; w: number; h: number }; color: string; label: string }>;
           return (
             <Svg style={StyleSheet.absoluteFillObject} width={screenWidth} height={screenHeight} pointerEvents="none">
-              {box && (
-                <G>
-                  <Rect x={box.x} y={box.y} width={box.w} height={box.h}
-                    fill="none" stroke="#f59e0b" strokeWidth={2.5} rx={4} />
-                  <Rect x={box.x} y={box.y - 18} width={52} height={18}
+              {entries.map(({ key, r, color, label }) => (
+                <G key={key}>
+                  <Rect x={r.x} y={r.y} width={r.w} height={r.h}
+                    fill="none" stroke={color} strokeWidth={2.5} rx={4} />
+                  <Rect x={r.x} y={Math.max(r.y - 18, 0)} width={label.length * 7 + 8} height={18}
                     fill="rgba(0,0,0,0.55)" rx={3} />
-                  <SvgText x={box.x + 4} y={box.y - 5} fontSize={11} fontWeight="700" fill="#f59e0b">
-                    {`bow ${Math.round(liveBowKps.confidence * 100)}%`}
+                  <SvgText x={r.x + 4} y={Math.max(r.y - 5, 13)} fontSize={11} fontWeight="700" fill={color}>
+                    {label}
                   </SvgText>
                 </G>
-              )}
-              {tip && (
-                <G>
-                  <Circle cx={tip.x} cy={tip.y} r={7} fill="#f59e0b" fillOpacity={0.92} stroke="rgba(0,0,0,0.5)" strokeWidth={2} />
-                  <SvgText x={tip.x + 11} y={tip.y + 4} fontSize={12} fontWeight="700" fill="#f59e0b">tip</SvgText>
-                </G>
-              )}
-              {frog && (
-                <G>
-                  <Circle cx={frog.x} cy={frog.y} r={7} fill="#8b5cf6" fillOpacity={0.92} stroke="rgba(0,0,0,0.5)" strokeWidth={2} />
-                  <SvgText x={frog.x + 11} y={frog.y + 4} fontSize={12} fontWeight="700" fill="#8b5cf6">frog</SvgText>
-                </G>
-              )}
-              {contact && (
-                <G>
-                  <Circle cx={contact.x} cy={contact.y} r={7} fill="#10b981" fillOpacity={0.92} stroke="rgba(0,0,0,0.5)" strokeWidth={2} />
-                  <SvgText x={contact.x + 11} y={contact.y + 4} fontSize={12} fontWeight="700" fill="#10b981">contact</SvgText>
-                </G>
-              )}
+              ))}
             </Svg>
           );
         })()}
@@ -1668,8 +1720,8 @@ export default function AnalyzeScreen() {
                 </View>
               </View>
             )}
-            {/* Wrist angle + debug panel — top right */}
-            {usingPoseCamera && (() => {
+            {/* Wrist angle + debug panel — temporarily hidden for bow detection testing */}
+            {SHOW_LIVE_HUD && usingPoseCamera && (() => {
               const dbg = liveWristDebugData(poseJoints);
               return (
                 <View style={styles.wristDebugBlock} pointerEvents="none">
@@ -1690,8 +1742,8 @@ export default function AnalyzeScreen() {
                 </View>
               );
             })()}
-            {/* Vibrato score — top left */}
-            {usingPoseCamera && liveVibratoScore !== null && (
+            {/* Vibrato score — temporarily hidden for bow detection testing */}
+            {SHOW_LIVE_HUD && usingPoseCamera && liveVibratoScore !== null && (
               <View style={styles.recVibratoBadge} pointerEvents="none">
                 <Text style={styles.recVibratoLabel}>VIB</Text>
                 <Text style={styles.recVibratoScore}>{liveVibratoScore}</Text>
@@ -1706,16 +1758,6 @@ export default function AnalyzeScreen() {
                 <View style={styles.stopButtonInner} />
               </Pressable>
             </View>
-            {usingPoseCamera && liveBowKps && (
-              <View style={[styles.bowBtnRow, { bottom: insets.bottom + 14 }]} pointerEvents="box-none">
-                <Pressable style={styles.bowRotateBtn} onPress={() => setBowFlipped(f => !f)} pointerEvents="auto">
-                  <Text style={styles.bowRotateBtnText}>⇆</Text>
-                </Pressable>
-                <Pressable style={styles.bowRotateBtn} onPress={() => setBowRotation(r => (r + 1) % 4)} pointerEvents="auto">
-                  <Text style={styles.bowRotateBtnText}>↻</Text>
-                </Pressable>
-              </View>
-            )}
           </View>
         )}
 

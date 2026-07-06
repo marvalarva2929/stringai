@@ -1,5 +1,7 @@
-import { RawAudioSignals, IntonationAnalysis, PitchClassIssue } from '../types/analysis';
-import { FrameKeypoints, POSE, HAND, CONFIDENCE_THRESHOLD, jointAngle } from './poseScoring';
+import type { RawAudioSignals, IntonationAnalysis, PitchClassIssue } from '../types/analysis';
+import { POSE, HAND, CONFIDENCE_THRESHOLD, jointAngle, type FrameKeypoints } from './poseScoring';
+import type { BowTimeSeries } from './bowAnalysis';
+import type { TimeSeries, TimeSeriesPoint } from '../types/signals';
 
 // ─────────────────────────────────────────────────────────────
 // NoteEvent type
@@ -27,7 +29,8 @@ export interface NoteEvent {
   fundamentalRatio: number;        // 0-1, FFT fundamental/total power
   dynamicLevel: number;            // 0-1, normalized RMS
 
-  // Bow (null until bow detector built; bowZone uses wrist proxy)
+  // Bow (from the bow detector via FuseSignalsOptions.bow; null when the bow
+  // was not visible during the note. bowZone/distance need the bridge detector.)
   bowContactPoint: number | null;
   bowAngle: number | null;
   bowDistanceFromBridge: number | null;
@@ -151,12 +154,33 @@ function getBowZone(_frame: FrameKeypoints): 'sul_ponticello' | 'normal' | 'sul_
 }
 
 // ─────────────────────────────────────────────────────────────
-// Phrase detection from smoothed RMS
+// Phrase detection (L6) — silence gaps + composite boundary score
 // ─────────────────────────────────────────────────────────────
 
-interface Phrase { start: number; end: number; duration: number }
+export interface Phrase { start: number; end: number; duration: number }
 
-function detectPhrases(rmsFrames: { value: number; timestamp: number }[]): Phrase[] {
+export interface DetectPhrasesOptions {
+  /** Bow speed series — adds the bow_speed_drop term. */
+  bowSpeed?: TimeSeries<number | null>;
+  /** Onset timestamps — adds the inter_onset_gap term. */
+  onsets?: number[];
+}
+
+const PHRASE_MIN_DURATION_S = 0.5;   // no segment shorter than this
+const PHRASE_COMPOSITE_THRESHOLD = 0.6;
+// Term weights, renormalized over whichever terms have usable data.
+// With neither bow nor onsets available, the composite pass is a no-op and
+// only the silence-gap segmentation (the historical behavior) applies.
+const PHRASE_W_RMS = 0.5;
+const PHRASE_W_BOW = 0.3;
+const PHRASE_W_GAP = 0.2;
+// Bow term is dropped when less than this fraction of samples are non-null.
+const PHRASE_BOW_MIN_COVERAGE = 0.2;
+
+export function detectPhrases(
+  rmsFrames: { value: number; timestamp: number }[],
+  opts?: DetectPhrasesOptions,
+): Phrase[] {
   if (rmsFrames.length < 2) return [];
   const hopSec = (rmsFrames[rmsFrames.length - 1].timestamp - rmsFrames[0].timestamp) /
                  (rmsFrames.length - 1);
@@ -196,7 +220,102 @@ function detectPhrases(rmsFrames: { value: number; timestamp: number }[]): Phras
     const end = rmsFrames[rmsFrames.length - 1].timestamp;
     if (end > phraseStart) phrases.push({ start: phraseStart, end, duration: end - phraseStart });
   }
-  return phrases;
+
+  if (!opts) return phrases;
+  return subdividePhrases(phrases, rmsFrames, smoothed, hopSec, opts);
+}
+
+/**
+ * Composite subdivision: within each silence-delimited phrase, split at RMS
+ * dips where the weighted evidence exceeds the threshold:
+ *
+ *   composite = 0.5·rms_drop + 0.3·bow_speed_drop + 0.2·inter_onset_gap
+ *
+ * A term with no usable data is dropped and the remaining weights are
+ * renormalized — the silence-gap phrases are the floor, never made worse.
+ */
+function subdividePhrases(
+  phrases: Phrase[],
+  rmsFrames: { value: number; timestamp: number }[],
+  smoothed: number[],
+  hopSec: number,
+  opts: DetectPhrasesOptions,
+): Phrase[] {
+  // ── Term availability ──
+  let speedMedian = 0;
+  let bowUsable = false;
+  if (opts.bowSpeed && opts.bowSpeed.points.length > 0) {
+    const vals = opts.bowSpeed.points.map(p => p.v).filter((v): v is number => v !== null);
+    if (vals.length >= 5 && vals.length / opts.bowSpeed.points.length >= PHRASE_BOW_MIN_COVERAGE) {
+      speedMedian = median(vals);
+      bowUsable = speedMedian > 0;
+    }
+  }
+  const onsets = opts.onsets && opts.onsets.length >= 3
+    ? [...opts.onsets].sort((a, b) => a - b)
+    : null;
+  let medianIOI = 0;
+  if (onsets) {
+    const iois: number[] = [];
+    for (let i = 1; i < onsets.length; i++) iois.push(onsets[i] - onsets[i - 1]);
+    medianIOI = median(iois);
+  }
+  const gapUsable = onsets !== null && medianIOI > 0;
+
+  let wRms = PHRASE_W_RMS;
+  let wBow = bowUsable ? PHRASE_W_BOW : 0;
+  let wGap = gapUsable ? PHRASE_W_GAP : 0;
+  const wSum = wRms + wBow + wGap;
+  wRms /= wSum; wBow /= wSum; wGap /= wSum;
+
+  const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+
+  const out: Phrase[] = [];
+  for (const p of phrases) {
+    const startIdx = Math.max(0, Math.round((p.start - rmsFrames[0].timestamp) / hopSec));
+    const endIdx = Math.min(rmsFrames.length - 1, Math.round((p.end - rmsFrames[0].timestamp) / hopSec));
+
+    // Reference level for rms_drop: mean of the smoothed envelope in the phrase
+    let phraseMean = 0;
+    for (let i = startIdx; i <= endIdx; i++) phraseMean += smoothed[i];
+    phraseMean /= Math.max(1, endIdx - startIdx + 1);
+
+    let segStart = p.start;
+    for (let i = startIdx + 1; i < endIdx; i++) {
+      const t = rmsFrames[i].timestamp;
+      if (t - segStart < PHRASE_MIN_DURATION_S || p.end - t < PHRASE_MIN_DURATION_S) continue;
+      // Boundary candidates are local minima of the smoothed envelope
+      if (!(smoothed[i] <= smoothed[i - 1] && smoothed[i] <= smoothed[i + 1])) continue;
+
+      const rmsDrop = phraseMean > 0 ? clamp01((phraseMean - smoothed[i]) / phraseMean) : 0;
+
+      let bowDrop = 0;
+      if (bowUsable) {
+        const s = opts.bowSpeed!.sample(t, 0.3);
+        bowDrop = s !== null ? clamp01((speedMedian - s) / speedMedian) : 0;
+      }
+
+      let gapScore = 0;
+      if (gapUsable) {
+        let prev: number | null = null, next: number | null = null;
+        for (const o of onsets!) {
+          if (o <= t) prev = o;
+          else { next = o; break; }
+        }
+        if (prev !== null && next !== null) {
+          gapScore = clamp01((next - prev - medianIOI) / (2 * medianIOI));
+        }
+      }
+
+      const composite = wRms * rmsDrop + wBow * bowDrop + wGap * gapScore;
+      if (composite >= PHRASE_COMPOSITE_THRESHOLD) {
+        out.push({ start: segStart, end: t, duration: t - segStart });
+        segStart = t;
+      }
+    }
+    out.push({ start: segStart, end: p.end, duration: p.end - segStart });
+  }
+  return out;
 }
 
 function phraseContext(phrases: Phrase[], t: number): { position: number; duration: number } {
@@ -293,6 +412,102 @@ function segmentByPitch(
   return segments;
 }
 
+// ─────────────────────────────────────────────────────────────
+// Hybrid onset: bow-corroborated segment splitting
+// ─────────────────────────────────────────────────────────────
+//
+// segmentByPitch cannot separate repeated same-pitch notes (détaché on one
+// note) — the pitch class never changes. The uncollapsed onset list from
+// audioEngine retains flux candidates at those boundaries, but flux alone
+// over-triggers on bow noise, which is why collapseAdjacentSameNoteOnsets
+// removes them for rhythm scoring. Here we re-validate each in-segment
+// candidate against the bow signal:
+//
+//   onset_score = 0.6·flux + 0.4·bow_change_strength
+//
+// flux is 1 by construction (the candidate exists), so a split requires
+// bow_change_strength ≥ 0.5 — a direction flip or a sharp speed change.
+// With no bow data the strength is null and we never split (graceful
+// degradation to pure pitch segmentation).
+
+const SPLIT_MIN_OFFSET_S = 0.08;  // candidate must be >80ms into the segment
+const SPLIT_MIN_TAIL_S   = 0.05;  // and leave ≥ the 50ms min note duration after it
+const ONSET_SCORE_FLUX_WEIGHT = 0.6;
+const ONSET_SCORE_BOW_WEIGHT  = 0.4;
+const ONSET_SPLIT_THRESHOLD   = 0.8;
+
+function medianNonNull(points: Array<TimeSeriesPoint<number | null>>): number | null {
+  const vals = points.map(p => p.v).filter((v): v is number => v !== null);
+  return vals.length > 0 ? median(vals) : null;
+}
+
+/**
+ * How strongly the bow signal indicates a stroke change at time t.
+ * Returns 0-1, or null when there is no usable bow data around t.
+ */
+function bowChangeStrength(bow: BowTimeSeries, t: number, speedNorm: number | null): number | null {
+  // Direction flip — strongest evidence. Scan a window rather than sampling
+  // fixed offsets: the committed direction lags the physical flip by ~3 frames
+  // (EMA smoothing + hysteresis), so the window extends further after t.
+  const dirWindow = bow.bowDirection.window(t - 0.3, t + 0.45);
+  const signs = dirWindow.map(p => p.v).filter((v): v is -1 | 1 => v === 1 || v === -1);
+  const sawFlip = signs.some((s, i) => i > 0 && s !== signs[i - 1]);
+  if (sawFlip) return 1;
+
+  if (speedNorm === null || speedNorm <= 0) return null;
+  const speedBefore = bow.bowSpeed.sample(t - 0.1, 0.15);
+  const speedAt     = bow.bowSpeed.sample(t, 0.1);
+  const speedAfter  = bow.bowSpeed.sample(t + 0.1, 0.15);
+  if (speedBefore === null || speedAfter === null) return null;
+
+  // |Δspeed| across the candidate, plus the dip depth at the reversal itself
+  // (speed passes through ~0 at a détaché change even when before ≈ after).
+  const delta = Math.abs(speedAfter - speedBefore);
+  const dip = speedAt !== null ? Math.max(0, Math.min(speedBefore, speedAfter) - speedAt) : 0;
+  return Math.min(1, Math.max(delta, dip) / speedNorm);
+}
+
+/**
+ * Split pitch segments at bow-corroborated onset candidates.
+ * Returns the new segment list plus the start times created by splits —
+ * those events are exempt from filterArtifacts (a split same-pitch note is
+ * exactly the prev ≈ cur ≈ next pattern the artifact filter targets).
+ */
+function splitSegmentsAtBowOnsets(
+  segments: PitchSegment[],
+  candidates: number[],
+  bow: BowTimeSeries,
+): { segments: PitchSegment[]; splitStarts: Set<number> } {
+  const splitStarts = new Set<number>();
+  if (candidates.length === 0) return { segments, splitStarts };
+
+  const speedVals = bow.bowSpeed.points.map(p => p.v).filter((v): v is number => v !== null);
+  const speedNorm = speedVals.length >= 5 ? median(speedVals) : null;
+
+  const out: PitchSegment[] = [];
+  for (const seg of segments) {
+    let current = seg;
+    for (const t of candidates) {
+      if (t <= current.start + SPLIT_MIN_OFFSET_S || t >= seg.end - SPLIT_MIN_TAIL_S) continue;
+
+      const strength = bowChangeStrength(bow, t, speedNorm);
+      if (strength === null) continue;
+      const score = ONSET_SCORE_FLUX_WEIGHT + ONSET_SCORE_BOW_WEIGHT * strength;
+      if (score < ONSET_SPLIT_THRESHOLD) continue;
+
+      const framesA = current.frames.filter(f => f.timestamp < t);
+      const framesB = current.frames.filter(f => f.timestamp >= t);
+      if (framesA.length === 0 || framesB.length === 0) continue;
+
+      out.push({ start: current.start, end: t, frames: framesA });
+      current = { start: t, end: current.end, frames: framesB };
+      splitStarts.add(t);
+    }
+    out.push(current);
+  }
+  return { segments: out, splitStarts };
+}
+
 // Iteratively removes short events that are sandwiched between notes within
 // SEMITONE_DIST semitones on both sides AND where those two neighbors are also
 // similar to each other — this targets vibrato pitch-class bleed (A→A#→A oscillation)
@@ -302,7 +517,7 @@ function segmentByPitch(
 // like G→G#→A has |G-A|=2, so G# is NOT filtered. Only the oscillation pattern
 // (prev ≈ cur ≈ next) is removed. MAX_PASSES runs iteratively because filtering one
 // artifact can expose the next.
-function filterArtifacts(events: NoteEvent[]): NoteEvent[] {
+function filterArtifacts(events: NoteEvent[], exemptStarts?: Set<number>): NoteEvent[] {
   const SHORT_S = 0.15;        // candidate threshold: events under 150ms (was 300ms — too aggressive for fast playing)
   const SEMITONE_DIST = 1;     // within 1 semitone of both neighbors
   const MAX_PASSES = 6;
@@ -312,6 +527,8 @@ function filterArtifacts(events: NoteEvent[]): NoteEvent[] {
     const next = arr.filter((ev, i) => {
       if (ev.durationSeconds >= SHORT_S) return true;
       if (i === 0 || i === arr.length - 1) return true;
+      // Bow-corroborated split boundaries are real notes, not oscillation bleed
+      if (exemptStarts?.has(ev.startSeconds)) return true;
       const prevMidi = Math.round(freqToMidiRaw(arr[i - 1].pitchHz));
       const curMidi  = Math.round(freqToMidiRaw(ev.pitchHz));
       const nextMidi = Math.round(freqToMidiRaw(arr[i + 1].pitchHz));
@@ -331,18 +548,37 @@ function filterArtifacts(events: NoteEvent[]): NoteEvent[] {
 // Main fusion function
 // ─────────────────────────────────────────────────────────────
 
+export interface FuseSignalsOptions {
+  /** Bow time series from deriveBowTimeSeries — enables hybrid onset splitting
+   *  and populates NoteEvent bow fields. Absent = pure audio+pose behavior. */
+  bow?: BowTimeSeries;
+}
+
 export function fuseSignals(
   audio: RawAudioSignals,
   poseFrames: FrameKeypoints[],
+  opts?: FuseSignalsOptions,
 ): NoteEvent[] {
   const { pitchFrames, rmsFrames, toneFrames, duration } = audio;
   if (pitchFrames.length === 0) return [];
 
-  const segments = segmentByPitch(pitchFrames, duration);
+  let segments = segmentByPitch(pitchFrames, duration);
   if (segments.length === 0) return [];
 
+  // Hybrid onset: split same-pitch segments at bow-corroborated boundaries
+  const bow = opts?.bow;
+  let splitStarts = new Set<number>();
+  if (bow && audio.uncollapsedOnsetTimestamps?.length > 0) {
+    const split = splitSegmentsAtBowOnsets(segments, audio.uncollapsedOnsetTimestamps, bow);
+    segments = split.segments;
+    splitStarts = split.splitStarts;
+  }
+
   const maxRms = rmsFrames.reduce((m, f) => Math.max(m, f.value), 0.001);
-  const phrases = detectPhrases(rmsFrames);
+  const phrases = detectPhrases(rmsFrames, {
+    bowSpeed: bow?.bowSpeed,
+    onsets: audio.onsetTimestamps,
+  });
   const events: NoteEvent[] = [];
 
   for (const seg of segments) {
@@ -381,6 +617,10 @@ export function fuseSignals(
     const shoulderRaised  = poseFrame ? getShoulderRaised(poseFrame)  : null;
     const bowZone         = poseFrame ? getBowZone(poseFrame)         : null;
 
+    // Bow signals: median over the note window (null when detector saw nothing)
+    const bowContactPoint = bow ? medianNonNull(bow.bowContactPoint.window(noteStart, noteEnd)) : null;
+    const bowAngle        = bow ? medianNonNull(bow.bowAngle.window(noteStart, noteEnd))        : null;
+
     // Phrase context
     const { position: phrasePosition, duration: phraseDurationSeconds } =
       phraseContext(phrases, noteStart);
@@ -399,9 +639,9 @@ export function fuseSignals(
       inTune: Math.abs(centsDeviation) <= 25,
       fundamentalRatio,
       dynamicLevel,
-      bowContactPoint: null,
-      bowAngle: null,
-      bowDistanceFromBridge: null,
+      bowContactPoint,
+      bowAngle,
+      bowDistanceFromBridge: null,  // needs bridge detector (Phase 18)
       bowZone,
       wristCollapsed,
       shoulderRaised,
@@ -412,7 +652,7 @@ export function fuseSignals(
   }
 
   // Remove vibrato bleed and bow-change transients before final output
-  const filtered = filterArtifacts(events);
+  const filtered = filterArtifacts(events, splitStarts);
 
   // distanceFromCrossing — scan back up to 5 notes for last string change
   for (let i = 0; i < filtered.length; i++) {

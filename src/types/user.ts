@@ -11,6 +11,7 @@ export interface UserProfile {
   instrument: InstrumentId;
   skillLevel: SkillLevel;
   playerCategory?: PlayerCategory;
+  weeklyGoalMinutes?: number;
   freeAnalysesUsed: number;
   subscriptionTier: SubscriptionTier;
   createdAt: string;

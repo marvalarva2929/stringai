@@ -1,4 +1,4 @@
-import { InstrumentConfig } from '../types/instrument';
+import type { InstrumentConfig } from '../types/instrument';
 
 export const INSTRUMENTS: Record<string, InstrumentConfig> = {
   violin: {

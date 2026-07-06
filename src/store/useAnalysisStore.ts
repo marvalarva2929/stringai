@@ -48,6 +48,8 @@ interface AnalysisState {
   setRecordingUri: (uri: string) => void;
   setResult: (result: AnalysisResult) => void;
   addToHistory: (summary: SessionSummary) => void;
+  /** Union server-fetched summaries with local ones (dedupe by id, newest first). */
+  mergeHistory: (summaries: SessionSummary[]) => void;
   addToMetricHistory: (entry: MetricHistoryEntry) => void;
   cacheSessionResult: (result: AnalysisResult) => void;
   setError: (msg: string) => void;
@@ -79,10 +81,30 @@ export const useAnalysisStore = create<AnalysisState>()(
       setResult: (result) => set({ currentResult: result, phase: 'done' }),
       addToHistory: (summary) =>
         set((state) => ({ sessionHistory: [summary, ...state.sessionHistory] })),
+      mergeHistory: (summaries) =>
+        set((state) => {
+          const byId = new Map<string, SessionSummary>();
+          for (const s of [...state.sessionHistory, ...summaries]) {
+            if (!byId.has(s.id)) byId.set(s.id, s);
+          }
+          const merged = [...byId.values()].sort(
+            (a, b) => new Date(b.recordedAt).getTime() - new Date(a.recordedAt).getTime(),
+          );
+          return { sessionHistory: merged };
+        }),
       addToMetricHistory: (entry) =>
         set((state) => ({ metricHistory: [entry, ...state.metricHistory] })),
       cacheSessionResult: (result) =>
-        set((state) => ({ sessionResultCache: { ...state.sessionResultCache, [result.sessionId]: result } })),
+        set((state) => {
+          // Keep sessionSignals only on the newest entry — the full time-series
+          // substrate is large and only the active session needs it.
+          const cache: SessionResultCache = {};
+          for (const [id, r] of Object.entries(state.sessionResultCache)) {
+            cache[id] = r.sessionSignals ? { ...r, sessionSignals: undefined } : r;
+          }
+          cache[result.sessionId] = result;
+          return { sessionResultCache: cache };
+        }),
       setError: (msg) => set({ error: msg, phase: 'error' }),
       reset: () => set({ phase: 'piece_input', selectedPiece: null, currentResult: null, error: null, recordingUri: null }),
       continueWithPiece: (piece) =>
@@ -96,7 +118,11 @@ export const useAnalysisStore = create<AnalysisState>()(
       // recordingUri/selectedPiece/error are transient.
       partialize: (state) => ({
         phase: state.phase,
-        currentResult: state.currentResult,
+        // sessionSignals holds TimeSeries closures that JSON.stringify silently
+        // drops — persisting it would rehydrate broken objects. Strip it.
+        currentResult: state.currentResult?.sessionSignals
+          ? { ...state.currentResult, sessionSignals: undefined }
+          : state.currentResult,
         sessionHistory: state.sessionHistory,
         metricHistory: state.metricHistory,
       }),

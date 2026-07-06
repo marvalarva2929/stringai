@@ -1,12 +1,9 @@
 import { supabase } from './supabase';
-import { AnalysisResult, MetricScore, SessionSummary, IntonationAnalysis, AudioAnalysisOutput, severityFromScore, VibratoAnalysis } from '../types/analysis';
+import { AnalysisResult, MetricScore, SessionSummary, IntonationAnalysis, AudioAnalysisOutput, severityFromScore, VibratoAnalysis, LLMFeedback } from '../types/analysis';
 import { Piece } from '../types/piece';
 import { InstrumentId } from '../types/instrument';
 import { analyzeMediaFile } from './audioEngine';
 import { buildSessionFeedback } from './llmFeedback';
-import { FrameKeypoints } from '../lib/poseScoring';
-import { scorePoseFrames, extractVideoFrames } from './videoAnalysis';
-import { RawBowFrame } from '../types/signals';
 
 // Fallback mock used when the audio file cannot be parsed (e.g. M4A on Android).
 function mockMetrics(): MetricScore[] {
@@ -59,43 +56,21 @@ export async function runAudioAnalysis(
       intonationAnalysis: mockIntonationAnalysis(),
       intonationStabilityAnalysis: { assessedCount: 0, unsteadyCount: 0, avgDriftCents: 0, worstNotes: [] },
       vibratoAnalysis: { eligibleCount: 0, avgNoteScore: 0, notes: [] } satisfies VibratoAnalysis,
-      rawSignals: { pitchFrames: [], rmsFrames: [], toneFrames: [], spectralCentroidFrames: [], brightnessFrames: [], onsetTimestamps: [], sampleRate: 44100, duration: durationSeconds },
+      rawSignals: { pitchFrames: [], rmsFrames: [], toneFrames: [], spectralCentroidFrames: [], brightnessFrames: [], onsetTimestamps: [], uncollapsedOnsetTimestamps: [], sampleRate: 44100, duration: durationSeconds },
     };
   }
 }
 
-export async function runVideoAnalysis(
-  videoUri: string,
-  instrument: InstrumentId,
-  poseFrames?: FrameKeypoints[],
-  durationSeconds?: number,
-  liveBowFrames?: RawBowFrame[],
-): Promise<MetricScore[]> {
-  if (poseFrames && poseFrames.length >= 5) {
-    // Live-recording path: use bow frames collected during recording (may be empty
-    // if the model isn't integrated yet — bow metrics gracefully return unavailable).
-    return scorePoseFrames(poseFrames, instrument, durationSeconds ?? 0, liveBowFrames ?? []);
-  }
-
-  // Uploaded-video path: extract pose + bow frames from the video file.
-  try {
-    const { poseFrames: extracted, bowFrames } = await extractVideoFrames(videoUri);
-    if (extracted.length >= 5) {
-      return scorePoseFrames(extracted, instrument, durationSeconds ?? 0, bowFrames);
-    }
-  } catch {
-    // module unavailable (Android) or video unreadable — fall through to mock
-  }
-
-  // Mock fallback for Android or when Vision returns too few frames.
+// Mock fallback for Android or when Vision returns too few frames.
+export async function mockVideoMetrics(): Promise<MetricScore[]> {
   await new Promise((r) => setTimeout(r, 500));
   return [
     { key: 'posture', score: 85, delta: 2, flaggedTimestamps: [], severity: severityFromScore(85), events: [], occurrenceRate: 0.04, observationSummary: 'Posture was well-balanced throughout the session.', measurementQuality: 'high' },
     { key: 'leftHandWrist', score: 70, delta: 1, flaggedTimestamps: [{ startSeconds: 30.0, endSeconds: 35.0, note: 'Wrist collapse on high positions' }], severity: severityFromScore(70), events: [{ type: 'wrist_collapse', startSeconds: 30.0, endSeconds: 35.0 }], occurrenceRate: 0.22, observationSummary: 'Left wrist collapsed 3 times.', measurementQuality: 'high' },
     { key: 'bowArmLevel', score: 72, flaggedTimestamps: [], severity: severityFromScore(72), events: [], occurrenceRate: 0.15, observationSummary: 'Bow arm height showed some adjustment for string changes.', measurementQuality: 'high' },
-    { key: 'bowPlacement', score: 0, flaggedTimestamps: [], severity: 'good', events: [], occurrenceRate: 0, observationSummary: 'Requires bow tracking — not available until a bow detector is integrated.', measurementQuality: 'unavailable' },
-    { key: 'bowAngle', score: 0, flaggedTimestamps: [], severity: 'good', events: [], occurrenceRate: 0, observationSummary: 'Requires bow tracking — not available until a bow detector is integrated.', measurementQuality: 'unavailable' },
-    { key: 'bowDistribution', score: 0, flaggedTimestamps: [], severity: 'good', events: [], occurrenceRate: 0, observationSummary: 'Requires bow tracking — not available until a bow detector is integrated.', measurementQuality: 'unavailable' },
+    { key: 'bowPlacement', score: 0, flaggedTimestamps: [], severity: 'good', events: [], occurrenceRate: 0, observationSummary: 'Bow tracking is not available on this device.', measurementQuality: 'unavailable' },
+    { key: 'bowAngle', score: 0, flaggedTimestamps: [], severity: 'good', events: [], occurrenceRate: 0, observationSummary: 'Bow tracking is not available on this device.', measurementQuality: 'unavailable' },
+    { key: 'bowDistribution', score: 0, flaggedTimestamps: [], severity: 'good', events: [], occurrenceRate: 0, observationSummary: 'Bow tracking is not available on this device.', measurementQuality: 'unavailable' },
   ];
 }
 
@@ -145,6 +120,8 @@ export async function saveSession(result: AnalysisResult): Promise<void> {
     recorded_at: result.recordedAt,
     overall_score: result.overallScore,
     overall_delta: result.overallDelta,
+    llm_feedback: result.llmFeedback ?? null,
+    pattern_findings: result.patternFindings ?? null,
   });
   if (sessionError) throw sessionError;
 
@@ -158,6 +135,15 @@ export async function saveSession(result: AnalysisResult): Promise<void> {
 
   const { error: metricsError } = await supabase.from('metric_scores').insert(metricRows);
   if (metricsError) throw metricsError;
+}
+
+/** Cache Claude coaching on the session row so re-viewing never re-calls the LLM. */
+export async function updateSessionLlmFeedback(sessionId: string, feedback: LLMFeedback): Promise<void> {
+  const { error } = await supabase
+    .from('sessions')
+    .update({ llm_feedback: feedback })
+    .eq('id', sessionId);
+  if (error) throw error;
 }
 
 export { buildSessionFeedback };
@@ -177,6 +163,58 @@ export function sessionToSummary(result: AnalysisResult): SessionSummary {
     piece: result.piece
       ? { id: result.piece.id, title: result.piece.title, composer: result.piece.composer }
       : undefined,
+  };
+}
+
+/**
+ * Reconstruct a partial AnalysisResult from Supabase for a session recorded in
+ * a previous app run (the in-memory sessionResultCache is empty after a
+ * restart). Degraded by design: no video, noteEvents, or sessionSignals —
+ * the session screen renders scores/feedback without them.
+ */
+export async function fetchSessionResult(sessionId: string): Promise<AnalysisResult | null> {
+  const { data: session, error } = await supabase
+    .from('sessions')
+    .select('id, user_id, instrument, duration_seconds, recorded_at, overall_score, overall_delta, llm_feedback, pattern_findings, pieces(id, title, composer)')
+    .eq('id', sessionId)
+    .maybeSingle();
+  if (error) throw error;
+  if (!session) return null;
+
+  const { data: metricRows, error: metricsError } = await supabase
+    .from('metric_scores')
+    .select('metric_key, score, delta, flagged_timestamps')
+    .eq('session_id', sessionId);
+  if (metricsError) throw metricsError;
+
+  const metrics: MetricScore[] = (metricRows ?? []).map((row: any) => ({
+    key: row.metric_key,
+    score: row.score,
+    delta: row.delta ?? undefined,
+    flaggedTimestamps: row.flagged_timestamps ?? [],
+    severity: severityFromScore(row.score),
+    events: [],
+    occurrenceRate: 0,
+    observationSummary: '',
+  }));
+
+  const s: any = session;
+  return {
+    sessionId: s.id,
+    userId: s.user_id,
+    instrument: s.instrument,
+    piece: s.pieces
+      ? { id: s.pieces.id, title: s.pieces.title, composer: s.pieces.composer ?? undefined, source: 'manual' }
+      : undefined,
+    durationSeconds: s.duration_seconds,
+    recordedAt: s.recorded_at,
+    overallScore: s.overall_score,
+    overallDelta: s.overall_delta ?? undefined,
+    metrics,
+    audioMetrics: metrics,
+    videoMetrics: [],
+    llmFeedback: s.llm_feedback ?? undefined,
+    patternFindings: s.pattern_findings ?? undefined,
   };
 }
 

@@ -35,6 +35,7 @@ export async function fetchProfile(userId: string): Promise<UserProfile> {
     displayName: data.display_name,
     instrument: data.instrument,
     skillLevel: data.skill_level,
+    weeklyGoalMinutes: data.weekly_goal_minutes ?? undefined,
     freeAnalysesUsed: data.free_analyses_used,
     subscriptionTier: data.subscription_tier,
     createdAt: data.created_at,
@@ -43,7 +44,12 @@ export async function fetchProfile(userId: string): Promise<UserProfile> {
 
 export async function updateProfileFields(
   userId: string,
-  fields: { skill_level?: SkillLevel; display_name?: string; instrument?: string },
+  fields: {
+    skill_level?: SkillLevel;
+    display_name?: string;
+    instrument?: string;
+    weekly_goal_minutes?: number;
+  },
 ): Promise<void> {
   const { error } = await supabase.from('profiles').update(fields).eq('id', userId);
   if (error) throw error;

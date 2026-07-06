@@ -12,7 +12,7 @@
  *   F#4 and F#5 being flat both point to the same 2nd-finger placement problem.
  */
 
-import { IntonationAnalysis, PitchClassIssue } from '../types/analysis';
+import type { IntonationAnalysis, PitchClassIssue } from '../types/analysis';
 import { INTONATION_THRESHOLDS } from '../constants/intonationSpec';
 
 // ─────────────────────────────────────────────────────────────

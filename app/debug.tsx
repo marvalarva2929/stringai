@@ -15,9 +15,25 @@ import Svg, { Path, Line } from 'react-native-svg';
 import { Video, AVPlaybackStatus, ResizeMode, Audio } from 'expo-av';
 import * as ImagePicker from 'expo-image-picker';
 import { router } from 'expo-router';
-import { analyzeMediaFileWithDebug, AudioDebugInfo } from '../src/services/audioEngine';
+import { analyzeMediaFileWithDebug, analyzeMediaFile, AudioDebugInfo } from '../src/services/audioEngine';
 import { MetricScore, SeverityBand } from '../src/types/analysis';
 import { colors, spacing, radius } from '../src/constants/theme';
+import { extractVideoFrames } from '../src/services/videoAnalysis';
+import { runSessionPipeline } from '../src/lib/sessionPipeline';
+
+// Compact view of a SessionPipelineOutput for on-screen display + raw-JSON share.
+interface PipelineSummary {
+  poseFrames: number;
+  bowFrames: number;
+  /** Fraction of bow contact-point samples that were non-null */
+  bowCoverage: number;
+  noteEvents: number;
+  groups: { slur: number; detache: number; other: number };
+  phrases: Array<{ start: number; end: number }>;
+  findings: Array<{ testId: string; severity: string; summary: string }>;
+  phraseFeatures: unknown[];
+  videoMetrics: Record<string, { score: number; quality?: string }>;
+}
 
 interface RunResult {
   fileName: string;
@@ -25,6 +41,7 @@ interface RunResult {
   scores: MetricScore[];
   debug: AudioDebugInfo;
   durationMs: number;
+  pipeline?: PipelineSummary;
 }
 
 export default function DebugScreen() {
@@ -64,7 +81,46 @@ export default function DebugScreen() {
     const t0 = Date.now();
     try {
       const { scores, debug } = await analyzeMediaFileWithDebug(asset.uri, 'violin', durationSec);
-      setResult({ fileName, videoUri: asset.uri, scores, debug, durationMs: Date.now() - t0 });
+
+      // Full L1–L9 pipeline dump (best-effort — needs the native module + audio)
+      let pipeline: PipelineSummary | undefined;
+      try {
+        const [audioOutput, extracted] = await Promise.all([
+          analyzeMediaFile(asset.uri, 'violin', durationSec),
+          extractVideoFrames(asset.uri),
+        ]);
+        const out = runSessionPipeline({
+          audioOutput,
+          poseFrames: extracted.poseFrames,
+          bowFrames: extracted.bowFrames,
+          durationSeconds: durationSec,
+          instrument: 'violin',
+        });
+        const cpPoints = out.signals.bowContactPoint.points;
+        pipeline = {
+          poseFrames: extracted.poseFrames.length,
+          bowFrames: extracted.bowFrames.length,
+          bowCoverage: cpPoints.length > 0
+            ? cpPoints.filter((p) => p.v !== null).length / cpPoints.length
+            : 0,
+          noteEvents: out.noteEvents.length,
+          groups: {
+            slur: out.noteGroups.filter((g) => g.type === 'slur').length,
+            detache: out.noteGroups.filter((g) => g.type === 'detache').length,
+            other: out.noteGroups.filter((g) => g.type === 'other').length,
+          },
+          phrases: out.phrases.map((p) => ({ start: p.start, end: p.end })),
+          findings: out.findings.map((f) => ({ testId: f.testId, severity: f.severity, summary: f.summary })),
+          phraseFeatures: out.phraseFeatures,
+          videoMetrics: Object.fromEntries(
+            out.videoMetrics.map((m) => [m.key, { score: m.score, quality: m.measurementQuality }]),
+          ),
+        };
+      } catch {
+        // Android / module unavailable — audio debug still shows
+      }
+
+      setResult({ fileName, videoUri: asset.uri, scores, debug, durationMs: Date.now() - t0, pipeline });
     } catch (err: any) {
       setError(err?.message ?? 'Analysis failed');
     } finally {
@@ -95,6 +151,7 @@ export default function DebugScreen() {
       file: result.fileName,
       scores: Object.fromEntries(result.scores.map((s) => [s.key, { score: s.score, severity: s.severity }])),
       debug: result.debug,
+      pipeline: result.pipeline ?? null,
     };
     await Share.share({ message: JSON.stringify(payload, null, 2) });
   };
@@ -194,6 +251,23 @@ export default function DebugScreen() {
               vibrato={result.debug.vibrato}
               onSegmentPress={playSegment}
             />
+
+            {result.pipeline && (
+              <View style={styles.wavBox}>
+                <Text style={styles.wavTitle}>L1–L9 Pipeline</Text>
+                <Row label="Pose / bow frames" value={`${result.pipeline.poseFrames} / ${result.pipeline.bowFrames}`} />
+                <Row label="Bow coverage" value={pct(result.pipeline.bowCoverage)} />
+                <Row label="Note events" value={String(result.pipeline.noteEvents)} />
+                <Row label="Groups (slur/dét/other)" value={`${result.pipeline.groups.slur} / ${result.pipeline.groups.detache} / ${result.pipeline.groups.other}`} />
+                <Row label="Phrases" value={String(result.pipeline.phrases.length)} />
+                <Row label="Findings fired" value={result.pipeline.findings.length > 0
+                  ? result.pipeline.findings.map((f) => f.testId).join(', ')
+                  : 'none'} />
+                {Object.entries(result.pipeline.videoMetrics).map(([key, m]) => (
+                  <Row key={key} label={`  ${key}`} value={`${m.score} (${m.quality ?? 'high'})`} />
+                ))}
+              </View>
+            )}
 
             <Video
               ref={videoRef}

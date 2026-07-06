@@ -1,4 +1,4 @@
-import { RawBowFrame, TimeSeries, TimeSeriesPoint, createTimeSeries } from '../types/signals';
+import { createTimeSeries, type RawBowFrame, type TimeSeries, type TimeSeriesPoint } from '../types/signals';
 
 // ─────────────────────────────────────────────────────────────
 // Constants
@@ -126,6 +126,136 @@ export interface BowTimeSeries {
   bowContactPoint: TimeSeries<number | null>;
   bowAngle:        TimeSeries<number | null>;
   bowSpeed:        TimeSeries<number | null>;
+  /**
+   * Stroke direction: +1 = contact point moving tipward, -1 = frogward,
+   * 0 = stationary, null = not measurable this frame.
+   *
+   * Sign semantics are geometric (contact travel along the frog→tip axis),
+   * NOT verified up-bow/down-bow labels — don't render bowing terms to users
+   * until checked against real footage.
+   */
+  bowDirection:    TimeSeries<BowDirection | null>;
+  /**
+   * Contact position along the violin string diagonal (0 = scroll end,
+   * 1 = tailpiece end). Placement proxy from RawBowFrame.stringPosS; null
+   * when the diagonal orientation was unknown or no contact was found.
+   */
+  stringPos:       TimeSeries<number | null>;
+}
+
+export type BowDirection = -1 | 0 | 1;
+
+// ─────────────────────────────────────────────────────────────
+// Bow direction
+// ─────────────────────────────────────────────────────────────
+
+// u̇ (bow-lengths/sec) below this = stationary. ~5% of the bow per second.
+const DIRECTION_STATIONARY_THRESHOLD = 0.05;
+// EMA alpha for contact-point smoothing (~3-frame effective window at 10 fps).
+const DIRECTION_SMOOTH_ALPHA = 0.5;
+// A candidate direction must persist this many consecutive frames before the
+// committed direction flips — single-frame jitter would shred L5 slur groups.
+const DIRECTION_HYSTERESIS_FRAMES = 2;
+// Gaps longer than this break the derivative (and reset smoothing state).
+const DIRECTION_MAX_GAP_S = 0.5;
+
+/**
+ * Per-frame raw direction from the primary + fallback signals:
+ *   1. Derivative of the EMA-smoothed contact-point parameter u (0=frog, 1=tip).
+ *      Camera-framing invariant, and immune to the tip swinging fast during
+ *      angle changes without any real stroke.
+ *   2. Fallback when contact is null: tip velocity projected onto the frog→tip
+ *      axis, normalized by bow length so the same threshold applies.
+ */
+function deriveDirectionPoints(
+  filtered: RawBowFrame[],
+  contactPoints: Array<TimeSeriesPoint<number | null>>,
+  anglePoints: Array<TimeSeriesPoint<number | null>>,
+  bowLengths: Array<number | null>,
+): Array<TimeSeriesPoint<BowDirection | null>> {
+  const out: Array<TimeSeriesPoint<BowDirection | null>> = [];
+
+  let smoothedU: number | null = null;
+  let prevSmoothedU: number | null = null;
+  let prevT: number | null = null;
+
+  let committed: BowDirection | null = null;
+  let pending: BowDirection | null = null;
+  let pendingRun = 0;
+
+  for (let i = 0; i < filtered.length; i++) {
+    const f = filtered[i];
+    const t = f.timestamp;
+    const gapBroken = prevT !== null && t - prevT > DIRECTION_MAX_GAP_S;
+    if (gapBroken) {
+      smoothedU = null;
+      committed = null;
+      pending = null;
+      pendingRun = 0;
+    }
+
+    // ── Raw per-frame u̇ ──
+    let uDot: number | null = null;
+
+    const cp = contactPoints[i].v;
+    if (cp !== null) {
+      prevSmoothedU = smoothedU;
+      smoothedU = smoothedU === null
+        ? cp
+        : DIRECTION_SMOOTH_ALPHA * cp + (1 - DIRECTION_SMOOTH_ALPHA) * smoothedU;
+      if (prevSmoothedU !== null && prevT !== null && t - prevT >= 0.01) {
+        uDot = (smoothedU - prevSmoothedU) / (t - prevT);
+      }
+    } else if (i > 0 && prevT !== null && t - prevT >= 0.01 && !gapBroken) {
+      // Fallback: signed tip velocity along the bow axis, in bow-lengths/sec
+      const prev = filtered[i - 1];
+      const angle = anglePoints[i].v;
+      const len = bowLengths[i];
+      if (f.tipVisible && prev.tipVisible && angle !== null && len !== null && len > 0.001) {
+        const rad = angle * (Math.PI / 180);
+        const vAlong = ((f.tipX - prev.tipX) * Math.cos(rad) + (f.tipY - prev.tipY) * Math.sin(rad)) / (t - prevT);
+        uDot = vAlong / len;
+      }
+      // A null contact frame breaks the smoothed-u chain
+      smoothedU = null;
+    } else {
+      smoothedU = null;
+    }
+
+    prevT = t;
+
+    if (uDot === null) {
+      out.push({ t, v: committed });
+      continue;
+    }
+
+    const raw: BowDirection =
+      Math.abs(uDot) < DIRECTION_STATIONARY_THRESHOLD ? 0 : uDot > 0 ? 1 : -1;
+
+    // ── Hysteresis ──
+    if (committed === null) {
+      committed = raw;
+    } else if (raw === committed) {
+      pending = null;
+      pendingRun = 0;
+    } else {
+      if (raw === pending) {
+        pendingRun++;
+      } else {
+        pending = raw;
+        pendingRun = 1;
+      }
+      if (pendingRun >= DIRECTION_HYSTERESIS_FRAMES) {
+        committed = raw;
+        pending = null;
+        pendingRun = 0;
+      }
+    }
+
+    out.push({ t, v: committed });
+  }
+
+  return out;
 }
 
 /**
@@ -146,6 +276,8 @@ export function deriveBowTimeSeries(frames: RawBowFrame[]): BowTimeSeries {
   const cpPts:    Array<TimeSeriesPoint<number | null>> = [];
   const anglePts: Array<TimeSeriesPoint<number | null>> = [];
   const speedPts: Array<TimeSeriesPoint<number | null>> = [];
+  const posPts:   Array<TimeSeriesPoint<number | null>> = [];
+  const lenVals:  Array<number | null> = [];
 
   // Carry-forward state for the frog-invisible fallback
   let lastKnownAngleDeg:    number | null = null;
@@ -186,11 +318,17 @@ export function deriveBowTimeSeries(frames: RawBowFrame[]): BowTimeSeries {
     cpPts.push(   { t: f.timestamp, v: cp    });
     anglePts.push({ t: f.timestamp, v: angle });
     speedPts.push({ t: f.timestamp, v: speed });
+    posPts.push(  { t: f.timestamp, v: f.stringPosS ?? null });
+    lenVals.push(lastKnownBowLength);
   }
+
+  const dirPts = deriveDirectionPoints(filtered, cpPts, anglePts, lenVals);
 
   return {
     bowContactPoint: createTimeSeries(cpPts),
     bowAngle:        createTimeSeries(anglePts),
     bowSpeed:        createTimeSeries(speedPts),
+    bowDirection:    createTimeSeries(dirPts),
+    stringPos:       createTimeSeries(posPts),
   };
 }

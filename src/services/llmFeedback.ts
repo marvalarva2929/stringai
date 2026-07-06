@@ -1,16 +1,12 @@
 /**
  * LLM Feedback Generation
  *
- * Generates specific, event-based coaching from the session's metric observations.
- *
- * Currently implemented as a local generator that produces coaching directly
- * from observation summaries and technique meta. This is designed so the
- * implementation can be swapped to a Supabase Edge Function call with no
- * changes to the call site:
- *
- *   // Future: replace localFeedbackGeneration with:
- *   const { data } = await supabase.functions.invoke('generate-coaching', { body: req });
- *   return data as LLMFeedback;
+ * Two paths:
+ *  - fetchCoachingFeedback(): Supabase Edge Function → Claude (L10). Async,
+ *    network-dependent, returns richer feedback (phrase notes, practice plan).
+ *  - buildSessionFeedback(): local template generator. Synchronous, offline,
+ *    used as the immediate result and as the fallback when the Edge call
+ *    fails or the user is not authenticated.
  */
 
 import { MetricScore, LLMFeedback, LLMCoachingItem, PlayerCategory, IntonationAnalysis } from '../types/analysis';
@@ -18,6 +14,87 @@ import { METRIC_META } from '../constants/metricMeta';
 import { EXERCISES } from '../constants/exercises';
 import { Piece } from '../types/piece';
 import { INTONATION_COACHING, PITCH_CLASS_TO_FINGER } from '../constants/intonationSpec';
+import { supabase } from './supabase';
+import type { StatisticalFinding } from '../lib/patternDetection';
+import type { PhraseFeatures } from '../lib/phraseFeatures';
+
+// ─────────────────────────────────────────────────────────────
+// Edge Function path (L10 — Claude coaching)
+// ─────────────────────────────────────────────────────────────
+
+export interface CoachingInput {
+  instrument: string;
+  piece?: { title: string; composer?: string };
+  skillLevel: 'beginner' | 'intermediate' | 'advanced';
+  playerCategory: PlayerCategory;
+  metrics: { key: string; score: number; severity: string; observationSummary: string }[];
+  patternFindings: { testId: string; summary: string; evidence: unknown; severity: string }[];
+  phraseFeatures?: PhraseFeatures[];
+}
+
+const EDGE_TIMEOUT_MS = 10_000;
+
+export function buildCoachingInput(
+  metrics: MetricScore[],
+  playerCategory: PlayerCategory,
+  skillLevel: 'beginner' | 'intermediate' | 'advanced',
+  piece?: Piece,
+  findings?: StatisticalFinding[],
+  phraseFeatures?: PhraseFeatures[],
+): CoachingInput {
+  return {
+    instrument: 'violin',
+    piece: piece ? { title: piece.title, composer: piece.composer } : undefined,
+    skillLevel,
+    playerCategory,
+    metrics: metrics
+      .filter((m) => m.measurementQuality !== 'unavailable')
+      .map((m) => ({
+        key: m.key,
+        score: m.score,
+        severity: m.severity,
+        observationSummary: m.observationSummary,
+      })),
+    patternFindings: (findings ?? []).map((f) => ({
+      testId: f.testId,
+      summary: f.summary,
+      evidence: f.evidence,
+      severity: f.severity,
+    })),
+    phraseFeatures,
+  };
+}
+
+/**
+ * Call the analyze-feedback Edge Function (Claude). Throws on network error,
+ * timeout, or malformed response — the caller keeps the static fallback.
+ */
+export async function fetchCoachingFeedback(input: CoachingInput): Promise<LLMFeedback> {
+  const invoke = supabase.functions.invoke('analyze-feedback', { body: input });
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error('coaching request timed out')), EDGE_TIMEOUT_MS),
+  );
+  const { data, error } = await Promise.race([invoke, timeout]);
+  if (error) throw error;
+
+  if (typeof data?.summary !== 'string' || !Array.isArray(data?.insights)) {
+    throw new Error('malformed coaching response');
+  }
+
+  return {
+    overallTake: data.summary,
+    items: data.insights.map((i: any): LLMCoachingItem => ({
+      metricKey: i.metricKey,
+      observation: i.observation ?? '',
+      feedback: i.feedback ?? '',
+      exercise: i.exercise || undefined,
+    })),
+    phraseFeedback: Array.isArray(data.phrase_feedback) ? data.phrase_feedback : undefined,
+    practicePlan: Array.isArray(data.practice_plan) ? data.practice_plan : undefined,
+    generatedAt: new Date().toISOString(),
+    source: 'claude',
+  };
+}
 
 // ─────────────────────────────────────────────────────────────
 // Public entry point

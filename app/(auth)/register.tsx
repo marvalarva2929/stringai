@@ -32,7 +32,7 @@ export default function Register() {
   const [emailFocused, setEmailFocused] = useState(false);
   const [passwordFocused, setPasswordFocused] = useState(false);
 
-  const { setOnboardingComplete } = useAuthStore();
+  const { setOnboardingComplete, weeklyGoalMinutes } = useAuthStore();
 
   const handleRegister = async () => {
     if (!email || !password) return;
@@ -47,9 +47,12 @@ export default function Register() {
 
       if (data.session) {
         // Email confirmation is disabled — user is logged in immediately.
-        // Update skill level now that we have a session.
+        // Update skill level (and any locally-set weekly goal) now that we have a session.
         try {
-          await updateProfileFields(data.user!.id, { skill_level: skillLevel });
+          await updateProfileFields(data.user!.id, {
+            skill_level: skillLevel,
+            ...(weeklyGoalMinutes ? { weekly_goal_minutes: weeklyGoalMinutes } : {}),
+          });
         } catch {}
         router.replace('/(tabs)/home');
       } else {

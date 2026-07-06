@@ -1,4 +1,4 @@
-import { NoteEvent } from '../lib/noteFusion';
+import type { NoteEvent } from '../lib/noteFusion';
 
 // ─────────────────────────────────────────────────────────────
 // TimeSeries
@@ -80,6 +80,11 @@ export interface RawBowFrame {
   frogX: number;    frogY: number;    frogVisible: boolean;
   contactX: number; contactY: number; contactVisible: boolean;
   confidence: number;
+  /** Contact position along the violin's scroll→tailpiece string diagonal
+   *  (0 = scroll end / fingerboard, 1 = tailpiece end / bridge). Only present
+   *  when the left wrist oriented the diagonal. Placement-scoring proxy until
+   *  the bridge detector (Phase 18) exists. */
+  stringPosS?: number;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -109,6 +114,8 @@ export interface SessionSignals {
   leftWristAngle: TimeSeries<number | null>;
   /** Normalized y of the bow-arm elbow */
   rightElbowY: TimeSeries<number | null>;
+  /** Normalized y of the bow-arm shoulder (reference for elbow height) */
+  rightShoulderY: TimeSeries<number | null>;
   /** |leftShoulder.y − rightShoulder.y| — shoulder unevenness */
   shoulderDiff: TimeSeries<number | null>;
 
@@ -120,6 +127,9 @@ export interface SessionSignals {
   bowAngle: TimeSeries<number | null>;
   /** Tip speed in normalized frame coords per second */
   bowSpeed: TimeSeries<number | null>;
+  /** Stroke direction: +1 = contact moving tipward, -1 = frogward, 0 = stationary.
+   *  Geometric sign only — not verified up/down-bow labels (see bowAnalysis.ts). */
+  bowDirection: TimeSeries<-1 | 0 | 1 | null>;
 
   // ── Timbre proxies (~20 Hz, 50ms hop) ───────────────────────
   /** Spectral centroid in Hz — high (>2500) = scratchy, low (<800) = breathy */
