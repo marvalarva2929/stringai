@@ -50,7 +50,10 @@ const CATEGORIES: { id: CategoryId; label: string; keys: MetricKey[] }[] = [
 
 // Categories hidden from the UI until their scoring is reliable enough to show.
 // Remove a category from this set to re-enable it everywhere.
-const HIDDEN_CATS = new Set<CategoryId>(['bow', 'posture']);
+// Bow + posture pages are visible now that the detector pipeline produces real
+// scores — cards carry their measurementQuality badge; these metrics still stay
+// out of the OVERALL score via HIDDEN_SCORE_KEYS in analyze.tsx until calibrated.
+const HIDDEN_CATS = new Set<CategoryId>([]);
 
 const VISIBLE_CATEGORIES = CATEGORIES.filter(c => !HIDDEN_CATS.has(c.id));
 
@@ -243,7 +246,12 @@ function scoreColor(score: number) {
 }
 
 function avgScore(metrics: MetricScore[], keys: MetricKey[]): number {
-  const vals = keys.map(k => metrics.find(m => m.key === k)?.score).filter((v): v is number => v !== undefined);
+  // Unavailable metrics carry score 0 — averaging them in would tank the
+  // category bar for sessions where a signal simply wasn't measurable.
+  const vals = keys
+    .map(k => metrics.find(m => m.key === k))
+    .filter((m): m is MetricScore => m !== undefined && m.measurementQuality !== 'unavailable')
+    .map(m => m.score);
   return vals.length ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length) : 0;
 }
 
@@ -272,7 +280,9 @@ function RadarChart({ metrics }: { metrics: MetricScore[] }) {
   const N = radarCats.length;
   const CX = 100, CY = 100, R = 72, LABEL_R = R + 26;
   const mm: Record<string, number> = {};
-  for (const m of metrics) mm[m.key] = m.score;
+  for (const m of metrics) {
+    if (m.measurementQuality !== 'unavailable') mm[m.key] = m.score;
+  }
   const scores = radarCats.map(cat => {
     const vals = cat.keys.map(k => mm[k]).filter((v): v is number => v !== undefined);
     return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
@@ -1260,6 +1270,29 @@ function OverviewPage({ result }: { result: AnalysisResult }) {
           </View>
         ))}
       </View>
+
+      {/* L8: statistical patterns detected across the whole session */}
+      {result.patternFindings && result.patternFindings.length > 0 && (
+        <View style={s.findingsSection}>
+          <Text style={s.findingsTitle}>PATTERNS DETECTED</Text>
+          {result.patternFindings.map(f => (
+            <View key={f.testId} style={s.findingRow}>
+              <View
+                style={[
+                  s.findingDot,
+                  {
+                    backgroundColor:
+                      f.severity === 'significant' ? colors.score.critical
+                      : f.severity === 'moderate' ? colors.score.needs_attention
+                      : colors.score.good,
+                  },
+                ]}
+              />
+              <Text style={s.findingText}>{f.summary}</Text>
+            </View>
+          ))}
+        </View>
+      )}
     </ScrollView>
     {showHint && <ScrollHintButton onPress={scrollToEnd} />}
     </View>
@@ -1541,9 +1574,15 @@ const { scrollRef, showHint, onLayout, onContentSizeChange, onScroll, scrollToEn
             <View key={m.key} style={s.catMetricRow}>
               <Text style={s.catMetricLabel}>{METRIC_LABELS[m.key] ?? m.key}</Text>
               <View style={s.catMetricBarTrack}>
-                <View style={[s.catMetricBarFill, { width: `${m.score}%`, backgroundColor: scoreColor(m.score) }]} />
+                {m.measurementQuality !== 'unavailable' && (
+                  <View style={[s.catMetricBarFill, { width: `${m.score}%`, backgroundColor: scoreColor(m.score) }]} />
+                )}
               </View>
-              <Text style={[s.catMetricScore, { color: scoreColor(m.score) }]}>{m.score}</Text>
+              {m.measurementQuality === 'unavailable' ? (
+                <Text style={[s.catMetricScore, { color: TEXT_SECONDARY }]}>–</Text>
+              ) : (
+                <Text style={[s.catMetricScore, { color: scoreColor(m.score) }]}>{m.score}</Text>
+              )}
             </View>
           ))}
         </View>
@@ -1555,6 +1594,21 @@ const { scrollRef, showHint, onLayout, onContentSizeChange, onScroll, scrollToEn
           return (
             <View style={s.observationCard}>
               <Text style={s.observationText}>{tq.observationSummary}</Text>
+            </View>
+          );
+        })()}
+
+        {/* Bow technique: detector-derived observations */}
+        {catId === 'bow' && (() => {
+          const lines = catMetrics
+            .filter(m => m.measurementQuality !== 'unavailable' && m.observationSummary && m.key !== 'bowSmoothness')
+            .map(m => m.observationSummary);
+          if (lines.length === 0) return null;
+          return (
+            <View style={s.observationCard}>
+              {lines.map((line, i) => (
+                <Text key={i} style={[s.observationText, i > 0 && { marginTop: 6 }]}>{line}</Text>
+              ))}
             </View>
           );
         })()}
@@ -2137,6 +2191,11 @@ const s = StyleSheet.create({
   overviewScoreLabel: { fontSize: 12, fontWeight: '600', color: TEXT_MUTED, textTransform: 'uppercase', letterSpacing: 1.2 },
   overviewTake: { backgroundColor: 'rgba(56,189,248,0.1)', borderRadius: 14, padding: spacing.md, borderLeftWidth: 3, borderLeftColor: '#38bdf8' },
   overviewTakeText: { fontSize: 14, color: TEXT_SECONDARY, lineHeight: 21 },
+  findingsSection: { marginTop: spacing.md, backgroundColor: CARD_BG, borderRadius: 12, padding: spacing.md, borderWidth: 1, borderColor: CARD_BORDER, gap: 10 },
+  findingsTitle: { fontSize: 11, fontWeight: '700', letterSpacing: 1, color: TEXT_SECONDARY },
+  findingRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 8 },
+  findingDot: { width: 8, height: 8, borderRadius: 4, marginTop: 6 },
+  findingText: { flex: 1, fontSize: 14, color: TEXT_SECONDARY, lineHeight: 21 },
   overviewCatList: { gap: spacing.sm },
   overviewCatRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   overviewCatIcon: { width: 28, alignItems: 'center' },
