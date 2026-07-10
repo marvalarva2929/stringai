@@ -17,6 +17,20 @@ import { INTONATION_COACHING, PITCH_CLASS_TO_FINGER } from '../constants/intonat
 import { supabase } from './supabase';
 import type { StatisticalFinding } from '../lib/patternDetection';
 import type { PhraseFeatures } from '../lib/phraseFeatures';
+import type { PracticeEvidence } from '../lib/practiceEvidence';
+
+/** Compact the frozen issue set into what the coaching model may cite. */
+export function issuesForCoaching(
+  issues: PracticeEvidence[],
+): NonNullable<CoachingInput['issues']> {
+  return issues.map((issue) => ({
+    id: issue.id,
+    summary: `${issue.title}: ${issue.evidenceSummary || issue.reason}`,
+    quality: (issue.measurementQuality === 'proxy' || issue.measurementQuality === 'low'
+      ? issue.measurementQuality
+      : 'high') as 'high' | 'proxy' | 'low',
+  }));
+}
 
 // ─────────────────────────────────────────────────────────────
 // Edge Function path (L10 — Claude coaching)
@@ -30,6 +44,9 @@ export interface CoachingInput {
   metrics: { key: string; score: number; severity: string; observationSummary: string }[];
   patternFindings: { testId: string; summary: string; evidence: unknown; severity: string }[];
   phraseFeatures?: PhraseFeatures[];
+  /** The exact issue set the model may cite. Every curated block/root cause must
+   *  reference one of these ids — the client rejects any it invents. */
+  issues?: { id: string; summary: string; quality: 'high' | 'proxy' | 'low' }[];
 }
 
 const EDGE_TIMEOUT_MS = 10_000;
@@ -41,6 +58,7 @@ export function buildCoachingInput(
   piece?: Piece,
   findings?: StatisticalFinding[],
   phraseFeatures?: PhraseFeatures[],
+  issues?: PracticeEvidence[],
 ): CoachingInput {
   return {
     instrument: 'violin',
@@ -62,12 +80,25 @@ export function buildCoachingInput(
       severity: f.severity,
     })),
     phraseFeatures,
+    issues: issues ? issuesForCoaching(issues) : undefined,
   };
+}
+
+/** Thrown when the caller is not entitled to Claude coaching (Edge Function 402). */
+export class EntitlementRequiredError extends Error {
+  constructor() {
+    super('Claude coaching requires an active Pro subscription.');
+    this.name = 'EntitlementRequiredError';
+  }
 }
 
 /**
  * Call the analyze-feedback Edge Function (Claude). Throws on network error,
  * timeout, or malformed response — the caller keeps the static fallback.
+ *
+ * A free user reaching this throws EntitlementRequiredError, which callers must
+ * swallow silently: free users hit it on every session by design, so surfacing
+ * it as an error would mean an error toast after every analysis.
  */
 export async function fetchCoachingFeedback(input: CoachingInput): Promise<LLMFeedback> {
   const invoke = supabase.functions.invoke('analyze-feedback', { body: input });
@@ -75,7 +106,13 @@ export async function fetchCoachingFeedback(input: CoachingInput): Promise<LLMFe
     setTimeout(() => reject(new Error('coaching request timed out')), EDGE_TIMEOUT_MS),
   );
   const { data, error } = await Promise.race([invoke, timeout]);
-  if (error) throw error;
+  if (error) {
+    // supabase-js wraps a non-2xx as FunctionsHttpError with the Response on
+    // `context`; a 402 is the server declining, not a failure worth retrying.
+    const status = (error as { context?: { status?: number } }).context?.status;
+    if (status === 402) throw new EntitlementRequiredError();
+    throw error;
+  }
 
   if (typeof data?.summary !== 'string' || !Array.isArray(data?.insights)) {
     throw new Error('malformed coaching response');
@@ -90,7 +127,6 @@ export async function fetchCoachingFeedback(input: CoachingInput): Promise<LLMFe
       exercise: i.exercise || undefined,
     })),
     phraseFeedback: Array.isArray(data.phrase_feedback) ? data.phrase_feedback : undefined,
-    practicePlan: Array.isArray(data.practice_plan) ? data.practice_plan : undefined,
     generatedAt: new Date().toISOString(),
     source: 'claude',
   };
