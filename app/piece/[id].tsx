@@ -10,6 +10,8 @@ import {
 import { router, useLocalSearchParams } from 'expo-router';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useAnalysisStore } from '../../src/store/useAnalysisStore';
+import { useUserStore } from '../../src/store/useUserStore';
+import { haptic } from '../../src/lib/haptics';
 import { Card } from '../../src/components/ui/Card';
 import { ScoreGauge } from '../../src/components/ui/ScoreGauge';
 import { colors, spacing, radius } from '../../src/constants/theme';
@@ -49,8 +51,12 @@ const bar = StyleSheet.create({
 export default function PieceDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const { sessionHistory } = useAnalysisStore();
+  const currentPiece = useUserStore((st) => st.profile?.currentPiece);
+  const pinPiece = useUserStore((st) => st.pinPiece);
+  const unpinPiece = useUserStore((st) => st.unpinPiece);
 
   const isGeneral = id === 'general';
+  const isPinned = currentPiece?.pieceId === id;
 
   const sessions = useMemo<SessionSummary[]>(
     () =>
@@ -93,6 +99,21 @@ export default function PieceDetailScreen() {
         </Pressable>
         <Text style={styles.pieceTitle} numberOfLines={2}>{piece.title}</Text>
         {piece.composer && <Text style={styles.pieceComposer}>{piece.composer}</Text>}
+
+        {!isGeneral && (
+          <Pressable
+            style={styles.pinBtn}
+            onPress={() => {
+              haptic.medium();
+              if (isPinned) unpinPiece();
+              else pinPiece({ pieceId: id, title: piece?.title ?? 'This piece', composer: piece?.composer });
+            }}
+          >
+            <Text style={styles.pinBtnText}>
+              {isPinned ? '★ Currently practicing — tap to unpin' : '☆ Set as current piece'}
+            </Text>
+          </Pressable>
+        )}
       </LinearGradient>
 
       <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
@@ -212,6 +233,15 @@ const styles = StyleSheet.create({
   backLabel: { fontSize: 14, color: 'rgba(255,255,255,0.8)', fontWeight: '500' },
   pieceTitle: { fontSize: 22, fontWeight: '700', color: '#fff', lineHeight: 28 },
   pieceComposer: { fontSize: 14, color: 'rgba(255,255,255,0.7)', marginTop: 4 },
+  pinBtn: {
+    marginTop: spacing.md,
+    alignSelf: 'flex-start',
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    borderRadius: radius.full,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 7,
+  },
+  pinBtnText: { color: '#fff', fontSize: 13, fontWeight: '800' },
 
   content: { padding: spacing.lg, gap: spacing.md },
 

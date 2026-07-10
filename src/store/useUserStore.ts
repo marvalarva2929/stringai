@@ -1,17 +1,21 @@
 import { create } from 'zustand';
-import { UserProfile } from '../types/user';
+import { UserProfile, CurrentPiece } from '../types/user';
 
+// Profile state only. Whether a user may run an analysis is decided by
+// useEntitlementStore / src/lib/entitlements.ts, and enforced server-side by
+// the consume_analysis RPC.
 interface UserState {
   profile: UserProfile | null;
   setProfile: (profile: UserProfile | null) => void;
   updateProfile: (partial: Partial<UserProfile>) => void;
-  incrementFreeAnalyses: () => void;
-  canAnalyze: () => boolean;
+  /** Pin a piece as "currently practicing" (home card + piece-scoped plan). */
+  pinPiece: (piece: Omit<CurrentPiece, 'startedAt'> & { startedAt?: string }) => void;
+  /** Update just the stated goals of the pinned piece. */
+  setPieceGoals: (goals: string) => void;
+  unpinPiece: () => void;
 }
 
-const FREE_ANALYSIS_LIMIT = 2;
-
-export const useUserStore = create<UserState>((set, get) => ({
+export const useUserStore = create<UserState>((set) => ({
   profile: null,
 
   setProfile: (profile) => set({ profile: profile ?? null }),
@@ -21,17 +25,20 @@ export const useUserStore = create<UserState>((set, get) => ({
       profile: state.profile ? { ...state.profile, ...partial } : null,
     })),
 
-  incrementFreeAnalyses: () =>
-    set((state) => ({
-      profile: state.profile
-        ? { ...state.profile, freeAnalysesUsed: state.profile.freeAnalysesUsed + 1 }
-        : null,
-    })),
+  pinPiece: (piece) =>
+    set((state) => (state.profile
+      ? { profile: { ...state.profile, currentPiece: { ...piece, startedAt: piece.startedAt ?? new Date().toISOString() } } }
+      : {})),
 
-  canAnalyze: () => {
-    const { profile } = get();
-    if (!profile) return false;
-    if (profile.subscriptionTier !== 'free') return true;
-    return profile.freeAnalysesUsed < FREE_ANALYSIS_LIMIT;
-  },
+  setPieceGoals: (goals) =>
+    set((state) => (state.profile?.currentPiece
+      ? { profile: { ...state.profile, currentPiece: { ...state.profile.currentPiece, goals } } }
+      : {})),
+
+  unpinPiece: () =>
+    set((state) => {
+      if (!state.profile) return {};
+      const { currentPiece: _drop, ...rest } = state.profile;
+      return { profile: rest };
+    }),
 }));
