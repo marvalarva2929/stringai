@@ -1,7 +1,24 @@
-import { MetricKey } from '../types/analysis';
-import { MetricHistoryEntry } from '../store/useAnalysisStore';
-import { Exercise, exercisesForMetric } from '../constants/exercises';
+import type { MetricKey, AnalysisResult, PlayerCategory } from '../types/analysis';
+import type { SkillLevel } from '../types/user';
+import type { MetricHistoryEntry } from '../store/useAnalysisStore';
+import { exercisesForMetric } from '../constants/exercises';
+import type { Exercise } from '../constants/exercises';
 import { METRIC_META } from '../constants/metricMeta';
+import {
+  buildPracticeEvidence,
+  type PracticeEvidence,
+} from './practiceEvidence';
+import {
+  rankPracticeEvidence,
+  type RankedPracticeEvidence,
+} from './practiceRanking';
+import {
+  buildPracticeBlocks,
+  coachIntensityFor,
+  targetPlanMinutes,
+  type CoachIntensity,
+  type PracticeBlock,
+} from './practiceBlocks';
 
 export interface WeakArea {
   metricKey: MetricKey;
@@ -10,75 +27,206 @@ export interface WeakArea {
   exercises: Exercise[];
 }
 
+/** What the plan is scoped to. Also determines the plan id, which keys progress
+ *  — so a session plan, a piece plan, and the daily plan coexist independently. */
+export type PlanScope =
+  | { kind: 'daily' }
+  | { kind: 'session'; sessionId: string }
+  | { kind: 'piece'; pieceId: string };
+
+export interface PracticePlanInput {
+  recentSessions?: AnalysisResult[];
+  metricHistory?: MetricHistoryEntry[];
+  playerCategory?: PlayerCategory | null;
+  weeklyGoalMinutes?: number | null;
+  skillLevel?: SkillLevel;
+  sessionWindow?: number;
+  /** Defaults to daily. Session/piece scopes filter the evidence window down to
+   *  the matching sessions and stamp a distinct plan id. */
+  scope?: PlanScope;
+}
+
+/** Serialize a scope into route params (daily carries none). */
+export function scopeToParams(scope: PlanScope): Record<string, string> {
+  if (scope.kind === 'session') return { sessionId: scope.sessionId };
+  if (scope.kind === 'piece') return { pieceId: scope.pieceId };
+  return {};
+}
+
+/** Read a scope back from route params; absent → daily. */
+export function scopeFromParams(p: { sessionId?: string; pieceId?: string }): PlanScope {
+  if (p.sessionId) return { kind: 'session', sessionId: p.sessionId };
+  if (p.pieceId) return { kind: 'piece', pieceId: p.pieceId };
+  return { kind: 'daily' };
+}
+
+function planIdFor(scope: PlanScope | undefined, date: string): string {
+  if (scope?.kind === 'session') return `session:${scope.sessionId}`;
+  if (scope?.kind === 'piece') return `piece:${scope.pieceId}`;
+  return `daily:${date}`;
+}
+
+function scopeSessions(sessions: AnalysisResult[], scope?: PlanScope): AnalysisResult[] {
+  if (scope?.kind === 'session') return sessions.filter((s) => s.sessionId === scope.sessionId);
+  if (scope?.kind === 'piece') return sessions.filter((s) => s.piece?.id === scope.pieceId);
+  return sessions;
+}
+
+function scopeHistory(history: MetricHistoryEntry[], scope?: PlanScope): MetricHistoryEntry[] {
+  if (scope?.kind === 'session') return history.filter((h) => h.sessionId === scope.sessionId);
+  if (scope?.kind === 'piece') return history.filter((h) => h.pieceId === scope.pieceId);
+  return history;
+}
+
 export interface PracticePlan {
+  id: string;
+  generatedAt: string;
   sessionCount: number;
+  durationMinutes: number;
+  coachIntensity: CoachIntensity;
+  primaryFocus: string;
+  summary: string;
+  blocks: PracticeBlock[];
+  evidence: RankedPracticeEvidence[];
+  sourceSessionIds: string[];
   weakAreas: WeakArea[];
   allMetricAverages: Partial<Record<MetricKey, number>>;
 }
 
 export function computePracticePlan(
   metricHistory: MetricHistoryEntry[],
-  sessionWindow = 5,
+  sessionWindow?: number,
+): PracticePlan;
+export function computePracticePlan(input: PracticePlanInput): PracticePlan;
+export function computePracticePlan(
+  inputOrHistory: PracticePlanInput | MetricHistoryEntry[],
+  legacySessionWindow = 5,
 ): PracticePlan {
-  const recent = metricHistory.slice(0, sessionWindow);
+  const input: PracticePlanInput = Array.isArray(inputOrHistory)
+    ? { metricHistory: inputOrHistory, sessionWindow: legacySessionWindow }
+    : inputOrHistory;
 
-  if (recent.length === 0) {
-    return { sessionCount: 0, weakAreas: [], allMetricAverages: {} };
+  const sessionWindow = input.sessionWindow ?? 5;
+  const scopedSessions = scopeSessions(input.recentSessions ?? [], input.scope);
+  const scopedHistory = scopeHistory(input.metricHistory ?? [], input.scope);
+  const evidenceResult = buildPracticeEvidence({
+    recentSessions: scopedSessions,
+    metricHistory: scopedHistory,
+    sessionWindow,
+    playerCategory: input.playerCategory,
+  });
+  const ranked = rankPracticeEvidence(evidenceResult.evidence, {
+    playerCategory: input.playerCategory,
+  });
+  const blocks = buildPracticeBlocks(ranked, {
+    playerCategory: input.playerCategory,
+    weeklyGoalMinutes: input.weeklyGoalMinutes,
+    skillLevel: input.skillLevel,
+    hasAnalyzedSessions: evidenceResult.sessionCount > 0,
+  });
+
+  const generatedAt = new Date().toISOString();
+  const sourceSessionIds = unique(
+    ranked
+      .map((e) => e.sourceSessionId)
+      .filter((id): id is string => Boolean(id)),
+  );
+  const weakAreas = buildWeakAreas(
+    evidenceResult.allMetricAverages,
+    scopedHistory,
+    sessionWindow,
+  );
+  const durationMinutes = distributeBlockMinutes(blocks, targetPlanMinutes(input.weeklyGoalMinutes));
+
+  return {
+    id: planIdFor(input.scope, generatedAt.slice(0, 10)),
+    generatedAt,
+    sessionCount: evidenceResult.sessionCount,
+    durationMinutes,
+    coachIntensity: coachIntensityFor(input.playerCategory, input.weeklyGoalMinutes),
+    primaryFocus: primaryFocus(blocks, ranked),
+    summary: planSummary(evidenceResult.sessionCount, blocks, ranked, input.playerCategory),
+    blocks,
+    evidence: ranked,
+    sourceSessionIds,
+    weakAreas,
+    allMetricAverages: evidenceResult.allMetricAverages,
+  };
+}
+
+function distributeBlockMinutes(blocks: PracticeBlock[], targetMinutes: number): number {
+  if (blocks.length === 0) return targetMinutes;
+  const current = blocks.reduce((sum, block) => sum + block.estimatedMinutes, 0);
+  if (current === targetMinutes) return current;
+  // Preserve per-block estimates for display today; duration should reflect the
+  // selected weekly commitment rather than the raw sum of templates.
+  return targetMinutes;
+}
+
+function primaryFocus(blocks: PracticeBlock[], evidence: PracticeEvidence[]): string {
+  const firstBlock = blocks[0];
+  if (firstBlock?.type === 'pitch_landing' && firstBlock.target.pitchClass) {
+    return `${firstBlock.target.pitchClass} landing`;
   }
+  if (firstBlock) return firstBlock.title;
+  return evidence[0]?.title ?? 'Baseline practice';
+}
 
-  // Accumulate scores per metric key across sessions
-  const accumulator = new Map<MetricKey, number[]>();
+function planSummary(
+  sessionCount: number,
+  blocks: PracticeBlock[],
+  evidence: PracticeEvidence[],
+  playerCategory?: PlayerCategory | null,
+): string {
+  if (sessionCount === 0) {
+    return 'Record one baseline session first; the next plan will target exact notes, bow habits, and phrase patterns.';
+  }
+  const focus = blocks.slice(0, 2).map((b) => b.title).join(' + ');
+  const categoryCopy = playerCategory === 'refinement'
+    ? 'The plan prioritizes specific, high-confidence evidence and phrase-level refinements.'
+    : 'The plan prioritizes fundamentals first, with live checks before moving on.';
+  const evidenceCopy = evidence.length > 0
+    ? `Based on ${evidence.length} recent evidence signal${evidence.length === 1 ? '' : 's'}.`
+    : 'Based on recent metric trends.';
+  return `${focus}. ${categoryCopy} ${evidenceCopy}`;
+}
+
+function buildWeakAreas(
+  averages: Partial<Record<MetricKey, number>>,
+  metricHistory: MetricHistoryEntry[],
+  sessionWindow: number,
+): WeakArea[] {
+  const recent = metricHistory.slice(0, sessionWindow);
+  const counts = new Map<MetricKey, number>();
   for (const entry of recent) {
     for (const score of entry.scores) {
-      const arr = accumulator.get(score.key) ?? [];
-      arr.push(score.score);
-      accumulator.set(score.key, arr);
+      counts.set(score.key, (counts.get(score.key) ?? 0) + 1);
     }
   }
 
-  // Average each metric and build the full map
-  const allMetricAverages: Partial<Record<MetricKey, number>> = {};
-  for (const [key, scores] of accumulator.entries()) {
-    allMetricAverages[key] = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
-  }
-
-  // Priority score: lower average = higher priority; more sessions = more confidence
-  const prioritized = [...accumulator.entries()]
-    .map(([key, scores]) => {
-      const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
-      // Weight by recency: metrics that appear in every session are more reliable
-      const consistency = scores.length / recent.length;
-      const priority = (100 - avg) * consistency;
-      return { key, avg, priority, sessionCount: scores.length };
-    })
-    .sort((a, b) => b.priority - a.priority);
-
-  // Top 3 weak areas that have at least one exercise defined
-  const weakAreas: WeakArea[] = prioritized
-    .filter((m) => m.avg < 85) // Only surface metrics that genuinely need work
+  return Object.entries(averages)
+    .map(([key, avgScore]) => ({
+      metricKey: key as MetricKey,
+      avgScore: avgScore ?? 0,
+      sessionCount: counts.get(key as MetricKey) ?? Math.max(1, recent.length),
+    }))
+    .filter((area) => area.avgScore < 85)
+    .sort((a, b) => a.avgScore - b.avgScore)
     .slice(0, 3)
-    .map((m) => {
-      const exs = exercisesForMetric(m.key);
-      // Pick one beginner and one intermediate exercise (or best available)
+    .map((area) => {
+      const exs = exercisesForMetric(area.metricKey);
       const beginner = exs.find((e) => e.difficulty === 'beginner');
       const intermediate = exs.find((e) => e.difficulty === 'intermediate');
-      const selected: Exercise[] = [];
-      if (beginner) selected.push(beginner);
-      if (intermediate && intermediate !== beginner) selected.push(intermediate);
-      if (selected.length === 0 && exs.length > 0) selected.push(exs[0]);
-      return {
-        metricKey: m.key,
-        avgScore: Math.round(m.avg),
-        sessionCount: m.sessionCount,
-        exercises: selected,
-      };
+      const exercises: Exercise[] = [];
+      if (beginner) exercises.push(beginner);
+      if (intermediate && intermediate !== beginner) exercises.push(intermediate);
+      if (exercises.length === 0 && exs.length > 0) exercises.push(exs[0]);
+      return { ...area, exercises };
     });
+}
 
-  return {
-    sessionCount: recent.length,
-    weakAreas,
-    allMetricAverages,
-  };
+function unique(values: string[]): string[] {
+  return [...new Set(values)];
 }
 
 export function metricLabel(key: MetricKey): string {

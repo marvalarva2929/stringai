@@ -31,6 +31,12 @@ export interface MetricHistoryEntry {
   sessionId: string;
   recordedAt: string;
   scores: MetricScore[];
+  /** Frozen L9 evidence for this session. Persisted (unlike sessionResultCache)
+   *  so the daily plan's window survives an app restart. Absent on entries saved
+   *  before this existed — callers fall back to the score-level derivation. */
+  evidence?: import('../lib/practiceEvidence').PracticeEvidence[];
+  /** Piece this session practiced, for piece-scoped issue queries. */
+  pieceId?: string;
 }
 
 interface AnalysisState {

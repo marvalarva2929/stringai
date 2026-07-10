@@ -124,19 +124,12 @@ export interface LLMPhraseFeedback {
   tip: string;
 }
 
-export interface LLMPracticePlanStep {
-  title: string;
-  duration: string;
-  instructions: string;
-}
-
 export interface LLMFeedback {
   overallTake: string;
   items: LLMCoachingItem[];
   generatedAt: string;
   /** Present only on Edge Function (Claude) responses, not static fallback. */
   phraseFeedback?: LLMPhraseFeedback[];
-  practicePlan?: LLMPracticePlanStep[];
   /** 'claude' = Edge Function; absent/'static' = local template fallback. */
   source?: 'claude' | 'static';
 }
@@ -270,8 +263,6 @@ export interface SessionAssessment {
   playerCategory: PlayerCategory;
   techniqueSummary: string;
   keyObservations: { metricKey: MetricKey; note: string }[];
-  foundationIssues: Issue[];
-  refinementIssues: Issue[];
   postureMetrics: PostureMetrics;
   intonationSummary?: string;
 }
@@ -299,6 +290,13 @@ export interface AnalysisResult {
   noteEvents?: import('../lib/noteFusion').NoteEvent[];
   /** L8 findings that fired. Persisted with the session for L10 coaching. */
   patternFindings?: import('../lib/patternDetection').StatisticalFinding[];
+  /** L7 per-phrase musical descriptors. Plain data, so unlike sessionSignals it
+   *  survives persistence — phrase-scoped practice blocks need these windows. */
+  phraseFeatures?: import('../lib/phraseFeatures').PhraseFeatures[];
+  /** L9 per-session practice evidence ("issues"), computed once at analysis time.
+   *  The single source of truth the results screen and the daily/session plans
+   *  both read, instead of each re-deriving from raw analyses. */
+  sessionEvidence?: import('../lib/practiceEvidence').PracticeEvidence[];
   /** L3 substrate. In-memory only — contains closures (TimeSeries.sample/window)
    *  that don't survive JSON serialization; stripped from persistence and from
    *  all but the newest sessionResultCache entry. */

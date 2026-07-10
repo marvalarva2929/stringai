@@ -3,11 +3,9 @@ import type {
   MetricKey,
   SeverityBand,
   PlayerCategory,
-  Issue,
   PostureMetrics,
   SessionAssessment,
 } from '../types/analysis';
-import { EXERCISES } from '../constants/exercises';
 import { METRIC_META } from '../constants/metricMeta';
 import type { StatisticalFinding } from './patternDetection';
 import type { PhraseFeatures } from './phraseFeatures';
@@ -88,79 +86,8 @@ const METRIC_OBSERVATION: Partial<Record<MetricKey, Record<SeverityBand, string>
 };
 
 // ─────────────────────────────────────────────────────────────
-// Issue data
-// ─────────────────────────────────────────────────────────────
-
-const ISSUE_INFO: Partial<Record<MetricKey, { title: string; description: string }>> = {
-  posture: {
-    title: 'Body alignment',
-    description: 'Uneven shoulders or tilted head adds tension and limits bow freedom.',
-  },
-  leftHandWrist: {
-    title: 'Left wrist position',
-    description: 'Wrist collapse locks up finger independence and builds long-term tension.',
-  },
-  bowPlacement: {
-    title: 'Bow contact point',
-    description: 'Bow drifting from the sweet spot produces a thin, unfocused tone.',
-  },
-  bowAngle: {
-    title: 'Bow angle',
-    description: 'A tilted bow reduces contact quality and makes tone inconsistent.',
-  },
-  bowArmLevel: {
-    title: 'Bow arm height',
-    description: 'Arm not adjusting for string crossings causes noisy, imprecise transitions.',
-  },
-  bowDistribution: {
-    title: 'Bow distribution',
-    description: 'Using only the middle of the bow limits dynamic range and expressiveness.',
-  },
-};
-
-// ─────────────────────────────────────────────────────────────
 // Builder helpers
 // ─────────────────────────────────────────────────────────────
-
-function buildIssues(
-  metrics: MetricScore[],
-  scoreThreshold: number,
-  maxIssues: number,
-): Issue[] {
-  return metrics
-    .filter(
-      (m) =>
-        FORM_METRIC_KEYS.includes(m.key) &&
-        m.measurementQuality !== 'unavailable' &&
-        m.score < scoreThreshold,
-    )
-    .sort((a, b) => a.score - b.score)
-    .slice(0, maxIssues)
-    .flatMap((m) => {
-      const info = ISSUE_INFO[m.key];
-      if (!info) return [];
-      const exercises = EXERCISES.filter((e) => e.metricKey === m.key);
-      const preferred = m.score < 50 ? 'beginner' : 'intermediate';
-      const exercise =
-        exercises.find((e) => e.difficulty === preferred) ??
-        exercises.find((e) => e.difficulty === 'beginner') ??
-        exercises[0];
-      const issue: Issue = {
-        metricKey: m.key,
-        title: info.title,
-        description: info.description,
-        exercise: exercise
-          ? {
-              id: exercise.id,
-              title: exercise.title,
-              duration: exercise.duration,
-              instructions: exercise.instructions,
-            }
-          : undefined,
-      };
-      return [issue];
-    });
-}
 
 function buildTechniqueSummary(
   category: PlayerCategory,
@@ -232,6 +159,7 @@ const FINDING_METRIC_KEY: Record<string, MetricKey> = {
   pitch_tendency: 'pitchAccuracy',
   dynamic_range_narrow: 'dynamicControl',
   bow_distribution_narrow: 'bowDistribution',
+  bow_zone_camping: 'bowDistribution',
   upper_bow_tone_degradation: 'toneQuality',
   tip_dynamic_ceiling: 'dynamicControl',
 };
@@ -339,17 +267,10 @@ export function buildSessionAssessment(
     ...buildKeyObservations(videoMetrics),
   ].slice(0, 5);
 
-  // Foundation: surface issues below 75 (broader net)
-  // Refinement: surface issues below 82 (higher bar — only meaningful gaps)
-  const foundationIssues = buildIssues(videoMetrics, 75, 3);
-  const refinementIssues = buildIssues(videoMetrics, 82, 3);
-
   return {
     playerCategory: category,
     techniqueSummary,
     keyObservations,
-    foundationIssues,
-    refinementIssues,
     postureMetrics,
   };
 }

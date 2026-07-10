@@ -30,7 +30,13 @@ import { useUserStore } from '../../src/store/useUserStore';
 import { TunerModal } from '../../src/components/tuner/TunerModal';
 import { runAudioAnalysis, mockVideoMetrics, computeOverallScore, saveSession, sessionToSummary, buildSessionFeedback, updateSessionLlmFeedback } from '../../src/services/analysis';
 import { runSessionPipeline } from '../../src/lib/sessionPipeline';
-import { incrementFreeAnalysesInDb } from '../../src/services/auth';
+import { useEntitlementStore } from '../../src/store/useEntitlementStore';
+import {
+  FREE_DAILY_ANALYSES,
+  analysesRemaining,
+  canRecordLive,
+  canUseLlmCoaching,
+} from '../../src/lib/entitlements';
 import { isSupabaseConfigured } from '../../src/services/supabase';
 import { buildCoachingInput, fetchCoachingFeedback } from '../../src/services/llmFeedback';
 import { AnalysisTimeline } from '../../src/components/analysis/AnalysisTimeline';
@@ -44,6 +50,7 @@ import { haptic } from '../../src/lib/haptics';
 import { colors, spacing, radius } from '../../src/constants/theme';
 import { AnalysisResult, MetricScore } from '../../src/types/analysis';
 import { buildSessionAssessment } from '../../src/lib/sessionAssessment';
+import { buildSessionEvidence } from '../../src/lib/practiceEvidence';
 import { Piece } from '../../src/types/piece';
 import { INSTRUMENTS } from '../../src/constants/instruments';
 import { PoseSkeleton, PoseJoint, PoseJoints, HandLandmarks, LEFT_HAND_COLOR, RIGHT_HAND_COLOR } from '../../src/components/analysis/PoseSkeleton';
@@ -582,6 +589,7 @@ function MethodButton({
   iconColor,
   title,
   subtitle,
+  locked = false,
 }: {
   onPress: () => void;
   iconName: React.ComponentProps<typeof Ionicons>['name'];
@@ -589,6 +597,8 @@ function MethodButton({
   iconColor: string;
   title: string;
   subtitle: string;
+  /** Shows a Pro pill instead of the chevron. Still pressable — it opens the paywall. */
+  locked?: boolean;
 }) {
   const offset = useSharedValue(0);
   const surfaceStyle = useAnimatedStyle(() => ({
@@ -610,7 +620,14 @@ function MethodButton({
           <Text style={styles.methodBtnTitle}>{title}</Text>
           <Text style={styles.methodBtnSub}>{subtitle}</Text>
         </View>
-        <Ionicons name="chevron-forward" size={18} color={colors.text.muted} />
+        {locked ? (
+          <View style={styles.methodProPill}>
+            <Ionicons name="lock-closed" size={11} color="#fff" />
+            <Text style={styles.methodProPillText}>PRO</Text>
+          </View>
+        ) : (
+          <Ionicons name="chevron-forward" size={18} color={colors.text.muted} />
+        )}
       </RAnimated.View>
     </Pressable>
   );
@@ -623,8 +640,12 @@ export default function AnalyzeScreen() {
     setPhase, setSelectedPiece, setRecordingUri, setResult, setError, reset,
     addToHistory, addToMetricHistory, cacheSessionResult, continueWithPiece,
   } = useAnalysisStore();
-  const { profile, incrementFreeAnalyses } = useUserStore();
-  const { isAuthenticated, playerCategory, incrementGuestCount } = useAuthStore();
+  const { profile } = useUserStore();
+  const { isAuthenticated, playerCategory } = useAuthStore();
+  const { entitlement, tryConsumeAnalysis } = useEntitlementStore();
+
+  const liveRecordingUnlocked = canRecordLive(entitlement);
+  const remainingToday = analysesRemaining(entitlement);
 
   // Video seek state (for inline player in results)
   const [seekVersion, setSeekVersion] = useState(0);
@@ -711,6 +732,10 @@ export default function AnalyzeScreen() {
     violin: { x1: number; y1: number; x2: number; y2: number } | null;
     violinConf: number;
   } | null>(null);
+  // Last-seen violin box + timestamp. The violin is nearly stationary while
+  // playing but the detector only clears threshold on a minority of frames, so
+  // we hold the most recent box for a short window to give a stable overlay.
+  const lastViolinRef = useRef<{ box: { x1: number; y1: number; x2: number; y2: number }; conf: number; t: number } | null>(null);
   const recordingStartTimeRef = useRef<number>(0);
   const poseCheckIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // Warnings surface after appearing in 2 consecutive 1s checks (2s debounce).
@@ -899,6 +924,7 @@ export default function AnalyzeScreen() {
     firstPoseRef.current          = false;
     poseFramesRef.current         = [];
     bowFramesRef.current          = [];
+    lastViolinRef.current         = null;
     setLiveBoxes(null);
     recordingStartTimeRef.current = 0;
     haptic.medium();
@@ -998,6 +1024,15 @@ export default function AnalyzeScreen() {
   // ── Core analysis pipeline ─────────────────────────────────
 
   const processMedia = async (uri: string, durationSec: number, isVideo: boolean, poseFrames?: FrameKeypoints[]) => {
+    // The commit point for both capture paths. consume_analysis is the server's
+    // only writer and its answer is final — the method picker's earlier check is
+    // just UX, since another device may have spent the day's quota since then.
+    if (!(await tryConsumeAnalysis(isAuthenticated))) {
+      reset();
+      router.push('/paywall');
+      return;
+    }
+
     let videoUri: string | undefined;
     if (isVideo) {
       try {
@@ -1161,8 +1196,14 @@ export default function AnalyzeScreen() {
         videoUri,
         noteEvents,
         patternFindings: pipeline?.findings,
+        phraseFeatures: pipeline?.phraseFeatures,
         sessionSignals: pipeline?.signals,
       };
+
+      // L9: freeze this session's practice evidence now, from the fully-assembled
+      // analyses, so every downstream surface reads the same issues instead of
+      // re-deriving them independently.
+      result.sessionEvidence = buildSessionEvidence(result);
 
       // Write wrist debug data to a file so it can be pulled via xcrun devicectl.
       const wristDbg = videoMetrics.find(m => m.key === 'leftHandWrist')?.debugSeries;
@@ -1173,17 +1214,12 @@ export default function AnalyzeScreen() {
         ).catch(() => {});
       }
 
+      // Quota was already consumed at the top of processMedia.
       if (isAuthenticated && profile?.id && isSupabaseConfigured) {
         await saveSession(result).catch(() => {});
-        // Free-tier quota: local counter for immediate UI, server RPC so the
-        // limit is enforced across devices/reinstalls (fire-and-forget).
-        incrementFreeAnalyses();
-        incrementFreeAnalysesInDb(profile.id).catch(() => {});
-      } else if (!isAuthenticated) {
-        incrementGuestCount().catch(() => {});
       }
       addToHistory(sessionToSummary(result));
-      addToMetricHistory({ sessionId, recordedAt, scores: allMetrics });
+      addToMetricHistory({ sessionId, recordedAt, scores: allMetrics, evidence: result.sessionEvidence, pieceId: result.piece?.id });
       cacheSessionResult(result);
 
       setResult(result);
@@ -1191,8 +1227,9 @@ export default function AnalyzeScreen() {
       // L10: upgrade the static feedback with Claude coaching. Non-blocking —
       // the UI already shows the template feedback; on success the richer
       // response is merged in and cached on the session row so re-viewing
-      // never re-calls the LLM.
-      if (isAuthenticated && profile?.id && isSupabaseConfigured && pipeline) {
+      // never re-calls the LLM. Pro only: free users keep the template feedback,
+      // and the Edge Function independently rejects them with a 402.
+      if (canUseLlmCoaching(entitlement) && isAuthenticated && profile?.id && isSupabaseConfigured && pipeline) {
         const coachingInput = buildCoachingInput(
           allMetrics,
           sessionAssessment.playerCategory,
@@ -1200,6 +1237,7 @@ export default function AnalyzeScreen() {
           selectedPiece ?? undefined,
           pipeline.findings,
           pipeline.phraseFeatures,
+          result.sessionEvidence,
         );
         fetchCoachingFeedback(coachingInput)
           .then((claudeFeedback) => {
@@ -1401,12 +1439,23 @@ export default function AnalyzeScreen() {
             {/* Popout method buttons */}
             <View style={styles.methodCards}>
               <MethodButton
-                onPress={() => { haptic.medium(); setPhase('camera_tip'); }}
+                onPress={() => {
+                  haptic.medium();
+                  // Shown locked rather than hidden — a visible Pro feature is
+                  // what the paywall is selling.
+                  if (!liveRecordingUnlocked) { router.push('/paywall'); return; }
+                  setPhase('camera_tip');
+                }}
                 iconName="videocam"
                 iconBg={colors.brand[50]}
                 iconColor={colors.brand[600]}
                 title="Record In-App"
-                subtitle="Live camera with real-time feedback"
+                subtitle={
+                  liveRecordingUnlocked
+                    ? 'Live camera with real-time feedback'
+                    : 'Live camera with real-time feedback — Pro'
+                }
+                locked={!liveRecordingUnlocked}
               />
 
               <View style={styles.dividerRow}>
@@ -1416,7 +1465,13 @@ export default function AnalyzeScreen() {
               </View>
 
               <MethodButton
-                onPress={() => { haptic.medium(); setShowUploadTips(true); }}
+                onPress={() => {
+                  haptic.medium();
+                  // Cheap pre-check so a free user isn't sent to pick a video
+                  // only to be turned away. processMedia still consumes.
+                  if (remainingToday <= 0) { router.push('/paywall'); return; }
+                  setShowUploadTips(true);
+                }}
                 iconName="film"
                 iconBg="#fef9c3"
                 iconColor="#a16207"
@@ -1424,6 +1479,14 @@ export default function AnalyzeScreen() {
                 subtitle="Pick a recording from your camera roll"
               />
             </View>
+
+            {Number.isFinite(remainingToday) && (
+              <Text style={styles.methodQuotaHint}>
+                {remainingToday > 0
+                  ? `${remainingToday} of ${FREE_DAILY_ANALYSES} free analyses left today`
+                  : 'Daily limit reached — resets at midnight'}
+              </Text>
+            )}
 
             {/* Bottom actions */}
             <View style={styles.methodBottom}>
@@ -1490,11 +1553,26 @@ export default function AnalyzeScreen() {
               // Coords arrive already in the joints' space (see PoseCameraView).
               const bowBox = ev.bowBox ?? null;
               if (bowBox) {
+                // TEMP DIAGNOSTIC — surfaces bow/violin detection to the Metro
+                // JS console (native Swift print() does NOT reach Metro). If
+                // violinBox is null the model isn't clearing the NMS floor (0.10).
+                console.log(`[DETECT] bow=${(ev.bowConfidence ?? 0).toFixed(3)} ` +
+                  `violin=${ev.violinBox ? (ev.violinConfidence ?? 0).toFixed(3) : 'NONE'}`);
+                // Persist the violin box: the detector clears threshold on only a
+                // minority of frames, but the violin barely moves — hold the last
+                // box for VIOLIN_HOLD_MS so the overlay stays stable to test with.
+                const VIOLIN_HOLD_MS = 4000;
+                const nowMs = Date.now();
+                if (ev.violinBox) {
+                  lastViolinRef.current = { box: ev.violinBox, conf: ev.violinConfidence ?? 0, t: nowMs };
+                }
+                const held = lastViolinRef.current;
+                const violinFresh = held && nowMs - held.t < VIOLIN_HOLD_MS;
                 setLiveBoxes({
                   bow: bowBox,
                   bowConf: ev.bowConfidence ?? 0,
-                  violin: ev.violinBox ?? null,
-                  violinConf: ev.violinConfidence ?? 0,
+                  violin: violinFresh ? held!.box : null,
+                  violinConf: violinFresh ? held!.conf : 0,
                 });
               }
 
@@ -1842,7 +1920,13 @@ export default function AnalyzeScreen() {
     return (
       <ResultsCarousel
         result={currentResult}
-        onDone={() => { reset(); router.push('/(tabs)/home'); }}
+        onDone={() => {
+          // Post-session loop: hand the student straight into exercises scoped to
+          // the take they just recorded (Phase 3.5 / the submit→drill→resubmit flow).
+          const sessionId = currentResult.sessionId;
+          reset();
+          router.push({ pathname: '/practice/plan', params: { sessionId } });
+        }}
       />
     );
   }
@@ -2011,6 +2095,22 @@ const styles = StyleSheet.create({
   methodBtnText: { flex: 1 },
   methodBtnTitle: { fontSize: 16, fontWeight: '700', color: colors.text.primary },
   methodBtnSub: { fontSize: 12, color: colors.text.muted, marginTop: 2, lineHeight: 17 },
+  methodProPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+    backgroundColor: colors.brand[600],
+    borderRadius: 10,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+  },
+  methodProPillText: { color: '#fff', fontSize: 10, fontWeight: '800', letterSpacing: 0.3 },
+  methodQuotaHint: {
+    fontSize: 12,
+    color: colors.text.muted,
+    textAlign: 'center',
+    marginTop: spacing.md,
+  },
   dividerRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   dividerLine: { flex: 1, height: 1, backgroundColor: '#e5e7eb' },
   dividerLabel: { fontSize: 13, color: colors.text.muted, fontWeight: '500' },
