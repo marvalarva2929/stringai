@@ -1,5 +1,6 @@
 import type { NoteEvent } from './noteFusion';
 import type { SessionSignals } from '../types/signals';
+import { analyzeBowUsage, bowZoneLabel } from './bowAnalysis';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // StatisticalFinding
@@ -72,9 +73,17 @@ function notFired(testId: string): StatisticalFinding {
 // Test: intonation_fatigue
 //
 // Detects: pitch accuracy degrades over time.
-// Method:  OLS regression of absCentsDeviation on startSeconds.
-//          A positive slope means intonation gets worse as the session goes on.
-// Fires:   when slope > 0.3 cents/second AND confidence ≥ 0.4.
+// Method:  OLS regression of absCentsDeviation on startSeconds. The slope is
+//          extrapolated across the session span to get total drift in cents,
+//          then expressed as a fraction of the session's mean error.
+// Fires:   when total drift > 8 cents AND confidence ≥ 0.4.
+//
+// Both the threshold and the effect size are duration-invariant. A raw
+// cents/second slope is not: the same drift in a longer take yields a smaller
+// slope, so a fixed slope threshold silently gets stricter the longer someone
+// plays. Dividing slope (cents/sec) by mean error (cents) also yields units of
+// 1/sec — feeding that to confidenceFromEffect, which expects a dimensionless
+// 0–1 effect, kept confidence near 0.1 and stopped this test from ever firing.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function testIntonationFatigue(notes: NoteEvent[]): StatisticalFinding {
@@ -84,11 +93,16 @@ export function testIntonationFatigue(notes: NoteEvent[]): StatisticalFinding {
   const ys = notes.map((n) => n.absCentsDeviation);
   const { slope } = linearRegression(xs, ys);
 
-  // Effect size: slope in cents/second — normalize by session mean
-  const avgError = mean(ys);
-  const normalizedSlope = avgError > 0 ? slope / avgError : 0;
+  const span = xs[xs.length - 1] - xs[0];
+  if (span <= 0) return notFired('intonation_fatigue');
 
-  const confidence = confidenceFromEffect(notes.length, Math.abs(normalizedSlope));
+  // Total cents of error growth predicted across the session.
+  const driftCents = slope * span;
+  // Dimensionless: drift as a fraction of the session's mean error.
+  const avgError = mean(ys);
+  const relativeDrift = avgError > 0 ? driftCents / avgError : 0;
+
+  const confidence = confidenceFromEffect(notes.length, relativeDrift);
 
   // Split into early/late halves for evidence
   const mid = notes.length >> 1;
@@ -97,8 +111,8 @@ export function testIntonationFatigue(notes: NoteEvent[]): StatisticalFinding {
   const earlyMean  = mean(earlyNotes.map((n) => n.absCentsDeviation));
   const lateMean   = mean(lateNotes.map((n) => n.absCentsDeviation));
 
-  const SLOPE_THRESHOLD = 0.3;
-  const fired = slope > SLOPE_THRESHOLD && confidence >= 0.4;
+  const DRIFT_THRESHOLD = 8;  // cents of growth across the whole session
+  const fired = driftCents > DRIFT_THRESHOLD && confidence >= 0.4;
 
   if (!fired) return { ...notFired('intonation_fatigue'), confidence };
 
@@ -111,7 +125,7 @@ export function testIntonationFatigue(notes: NoteEvent[]): StatisticalFinding {
     evidence: {
       groupA: { label: 'Early session', value: earlyMean, n: earlyNotes.length },
       groupB: { label: 'Late session',  value: lateMean,  n: lateNotes.length },
-      effectSize: slope,
+      effectSize: driftCents,
     },
     timestamps: [
       { startSeconds: lateNotes[0].startSeconds, endSeconds: notes[notes.length - 1].endSeconds },
@@ -314,9 +328,8 @@ export function testBowDistributionNarrow(signals: SessionSignals, _noteEvents: 
   const u = signals.bowContactPoint.points.map((p) => p.v).filter((v): v is number => v !== null);
   if (u.length < 20) return notFired('bow_distribution_narrow');
 
-  const maxU = Math.max(...u);
-  const minU = Math.min(...u);
-  const range = maxU - minU;
+  // Robust (p95−p05) range — raw min/max lets outlier frames mask narrowness
+  const range = analyzeBowUsage(u)!.robustRange;
 
   const NARROW_THRESHOLD = 0.35;
   const effectSize = Math.max(0, NARROW_THRESHOLD - range) / NARROW_THRESHOLD;
@@ -340,6 +353,48 @@ export function testBowDistributionNarrow(signals: SessionSignals, _noteEvents: 
       groupA: { label: 'Bow range used (0=frog, 1=tip)', value: range, n: u.length },
       groupB: { label: 'Mean contact point', value: center, n: u.length },
       effectSize: range,
+    },
+    timestamps: [],
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test: bow_zone_camping
+//
+// Detects: the player parks in one region of the bow (e.g. upper half only).
+// Complementary to bow_distribution_narrow: local travel can be wide while an
+// entire region of the bow goes unused — range alone can't see that. Also the
+// case the contrast tests (upper_bow_tone_degradation, tip_dynamic_ceiling)
+// cannot fire on, since camping leaves them no comparison group.
+// Fires:   when one third of the bow holds ≥70% of contact samples, or one
+//          half holds ≥85% (thresholds in bowAnalysis.ts), n ≥ 20.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function testBowZoneCamping(signals: SessionSignals, _noteEvents: NoteEvent[]): StatisticalFinding {
+  const u = signals.bowContactPoint.points.map((p) => p.v).filter((v): v is number => v !== null);
+  if (u.length < 20) return notFired('bow_zone_camping');
+
+  const usage = analyzeBowUsage(u)!;
+  if (usage.campedZone === null) return notFired('bow_zone_camping');
+
+  // Effect: how far past an even split the occupancy is (0.5 → 0, 1.0 → 1)
+  const effectSize = (usage.campedShare - 0.5) / 0.5;
+  const confidence = confidenceFromEffect(u.length, effectSize);
+  if (confidence < 0.4) return { ...notFired('bow_zone_camping'), confidence };
+
+  const severity: StatisticalFinding['severity'] =
+    usage.campedShare > 0.9 ? 'significant' : usage.campedShare > 0.8 ? 'moderate' : 'minor';
+
+  return {
+    testId: 'bow_zone_camping',
+    fired: true,
+    severity,
+    confidence,
+    summary: `You played in the ${bowZoneLabel(usage.campedZone)} for ${Math.round(usage.campedShare * 100)}% of the session — the rest of the bow went unused.`,
+    evidence: {
+      groupA: { label: bowZoneLabel(usage.campedZone), value: usage.campedShare, n: u.length },
+      groupB: { label: 'Rest of the bow', value: 1 - usage.campedShare, n: u.length },
+      effectSize: usage.campedShare,
     },
     timestamps: [],
   };
@@ -469,6 +524,7 @@ export function runPatternDetection(
     testPitchTendency(noteEvents),
     testDynamicRangeNarrow(signals, noteEvents),
     testBowDistributionNarrow(signals, noteEvents),
+    testBowZoneCamping(signals, noteEvents),
     testUpperBowToneDegradation(signals, noteEvents),
     testTipDynamicCeiling(signals, noteEvents),
   ];
