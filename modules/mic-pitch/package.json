@@ -1,0 +1,6 @@
+{
+  "name": "mic-pitch",
+  "version": "1.0.0",
+  "description": "Real-time streaming mic pitch detection (YIN) for StringAI",
+  "main": "index.js"
+}

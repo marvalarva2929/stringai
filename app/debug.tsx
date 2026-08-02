@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback, useEffect } from 'react';
+import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import {
   View,
   Text,
@@ -11,15 +11,16 @@ import {
   Alert,
   Dimensions,
 } from 'react-native';
-import Svg, { Path, Line } from 'react-native-svg';
+import Svg, { Path, Line, Rect, Circle, Text as SvgText } from 'react-native-svg';
 import { Video, AVPlaybackStatus, ResizeMode, Audio } from 'expo-av';
 import * as ImagePicker from 'expo-image-picker';
 import { router } from 'expo-router';
 import { analyzeMediaFileWithDebug, analyzeMediaFile, AudioDebugInfo } from '../src/services/audioEngine';
 import { MetricScore, SeverityBand } from '../src/types/analysis';
 import { colors, spacing, radius } from '../src/constants/theme';
-import { extractVideoFrames } from '../src/services/videoAnalysis';
+import { extractVideoFrames, DetectionFrame } from '../src/services/videoAnalysis';
 import { runSessionPipeline } from '../src/lib/sessionPipeline';
+import { analyzeBowUsage } from '../src/lib/bowAnalysis';
 
 // Compact view of a SessionPipelineOutput for on-screen display + raw-JSON share.
 interface PipelineSummary {
@@ -27,6 +28,15 @@ interface PipelineSummary {
   bowFrames: number;
   /** Fraction of bow contact-point samples that were non-null */
   bowCoverage: number;
+  /** Contact-point distribution — robust range, thirds occupancy, camping */
+  bowUsage: {
+    robustRange: number;
+    p05: number;
+    p95: number;
+    zoneShares: { lower: number; middle: number; upper: number };
+    campedZone: string | null;
+    campedShare: number;
+  } | null;
   noteEvents: number;
   groups: { slur: number; detache: number; other: number };
   phrases: Array<{ start: number; end: number }>;
@@ -42,9 +52,14 @@ interface RunResult {
   debug: AudioDebugInfo;
   durationMs: number;
   pipeline?: PipelineSummary;
+  detectionFrames?: DetectionFrame[];
 }
 
-export default function DebugScreen() {
+// Internal dev tooling. Not gated by rendering conditionally inside this
+// component (would break rules-of-hooks) — instead DebugScreen below refuses
+// to mount it outside __DEV__, so the route stays a dead end in release
+// builds even if someone deep-links to it directly.
+function DebugScreenInner() {
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<RunResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -84,11 +99,13 @@ export default function DebugScreen() {
 
       // Full L1–L9 pipeline dump (best-effort — needs the native module + audio)
       let pipeline: PipelineSummary | undefined;
+      let detectionFrames: DetectionFrame[] | undefined;
       try {
         const [audioOutput, extracted] = await Promise.all([
           analyzeMediaFile(asset.uri, 'violin', durationSec),
           extractVideoFrames(asset.uri),
         ]);
+        detectionFrames = extracted.detectionFrames;
         const out = runSessionPipeline({
           audioOutput,
           poseFrames: extracted.poseFrames,
@@ -97,12 +114,24 @@ export default function DebugScreen() {
           instrument: 'violin',
         });
         const cpPoints = out.signals.bowContactPoint.points;
+        const uValues = cpPoints.map((p) => p.v).filter((v): v is number => v !== null);
+        const usage = analyzeBowUsage(uValues);
         pipeline = {
           poseFrames: extracted.poseFrames.length,
           bowFrames: extracted.bowFrames.length,
           bowCoverage: cpPoints.length > 0
             ? cpPoints.filter((p) => p.v !== null).length / cpPoints.length
             : 0,
+          bowUsage: usage
+            ? {
+                robustRange: usage.robustRange,
+                p05: usage.p05,
+                p95: usage.p95,
+                zoneShares: usage.zoneShares,
+                campedZone: usage.campedZone,
+                campedShare: usage.campedShare,
+              }
+            : null,
           noteEvents: out.noteEvents.length,
           groups: {
             slur: out.noteGroups.filter((g) => g.type === 'slur').length,
@@ -120,7 +149,7 @@ export default function DebugScreen() {
         // Android / module unavailable — audio debug still shows
       }
 
-      setResult({ fileName, videoUri: asset.uri, scores, debug, durationMs: Date.now() - t0, pipeline });
+      setResult({ fileName, videoUri: asset.uri, scores, debug, durationMs: Date.now() - t0, pipeline, detectionFrames });
     } catch (err: any) {
       setError(err?.message ?? 'Analysis failed');
     } finally {
@@ -257,6 +286,15 @@ export default function DebugScreen() {
                 <Text style={styles.wavTitle}>L1–L9 Pipeline</Text>
                 <Row label="Pose / bow frames" value={`${result.pipeline.poseFrames} / ${result.pipeline.bowFrames}`} />
                 <Row label="Bow coverage" value={pct(result.pipeline.bowCoverage)} />
+                {result.pipeline.bowUsage && (
+                  <>
+                    <Row label="Bow range (p5–p95)" value={`${pct(result.pipeline.bowUsage.robustRange)}  (${result.pipeline.bowUsage.p05.toFixed(2)}–${result.pipeline.bowUsage.p95.toFixed(2)})`} />
+                    <Row label="Zones frog/mid/tip" value={`${pct(result.pipeline.bowUsage.zoneShares.lower)} / ${pct(result.pipeline.bowUsage.zoneShares.middle)} / ${pct(result.pipeline.bowUsage.zoneShares.upper)}`} />
+                    <Row label="Camping" value={result.pipeline.bowUsage.campedZone
+                      ? `${result.pipeline.bowUsage.campedZone} (${pct(result.pipeline.bowUsage.campedShare)})`
+                      : 'none'} />
+                  </>
+                )}
                 <Row label="Note events" value={String(result.pipeline.noteEvents)} />
                 <Row label="Groups (slur/dét/other)" value={`${result.pipeline.groups.slur} / ${result.pipeline.groups.detache} / ${result.pipeline.groups.other}`} />
                 <Row label="Phrases" value={String(result.pipeline.phrases.length)} />
@@ -267,6 +305,10 @@ export default function DebugScreen() {
                   <Row key={key} label={`  ${key}`} value={`${m.score} (${m.quality ?? 'high'})`} />
                 ))}
               </View>
+            )}
+
+            {result.detectionFrames && result.detectionFrames.length > 0 && (
+              <DetectionInspector videoUri={result.videoUri} frames={result.detectionFrames} />
             )}
 
             <Video
@@ -285,6 +327,213 @@ export default function DebugScreen() {
         )}
       </ScrollView>
     </SafeAreaView>
+  );
+}
+
+/**
+ * Frame-by-frame viewer for the raw bow/violin detector boxes on an uploaded
+ * video. Seeks the (paused) video to each detected frame and overlays the boxes
+ * exactly as the CoreML model emitted them — the fastest way to eyeball whether
+ * the violin is being detected and how tight the boxes are.
+ */
+function DetectionInspector({ videoUri, frames }: { videoUri: string; frames: DetectionFrame[] }) {
+  const videoRef = useRef<Video>(null);
+  const [idx, setIdx] = useState(0);
+  const [aspect, setAspect] = useState(16 / 9); // width / height
+  const [barW, setBarW] = useState(1);
+
+  const width = Dimensions.get('window').width - spacing.lg * 2;
+  const height = width / aspect;
+  const frame = frames[Math.min(idx, frames.length - 1)];
+
+  const violinCount = useMemo(() => frames.filter((f) => f.violin).length, [frames]);
+  // The full bow was calibrated at least once iff some frame has a non-approx
+  // bow position (approx = no full-bow length available yet).
+  const fullBowSeen = useMemo(
+    () => frames.some((f) => f.bowPosT != null && !f.bowPosApprox),
+    [frames],
+  );
+
+  // Coalesced video seeking: keep at most ONE setPositionAsync in flight. Drag
+  // moves update `idx` (and the overlay) instantly; the video image chases the
+  // latest requested frame without a backlog of queued seeks, which is what made
+  // scrubbing stutter. A looser tolerance also lets each seek resolve faster.
+  const seekInFlight = useRef(false);
+  const pendingIdx = useRef<number | null>(null);
+
+  const runSeek = useCallback((i: number) => {
+    const f = frames[i];
+    if (!f || !videoRef.current) return;
+    if (seekInFlight.current) { pendingIdx.current = i; return; }
+    seekInFlight.current = true;
+    videoRef.current
+      .setPositionAsync(f.timestamp * 1000, { toleranceMillisBefore: 80, toleranceMillisAfter: 80 })
+      .catch(() => {})
+      .finally(() => {
+        seekInFlight.current = false;
+        const next = pendingIdx.current;
+        pendingIdx.current = null;
+        if (next != null && next !== i) runSeek(next);
+      });
+  }, [frames]);
+
+  useEffect(() => { runSeek(idx); }, [idx, runSeek]);
+
+  const step = (d: number) => setIdx((i) => Math.max(0, Math.min(frames.length - 1, i + d)));
+
+  // Scrub track geometry, measured in window coords. We use absolute pageX (not
+  // locationX) because locationX is reported relative to whichever child view is
+  // under the finger — and the thumb tracks the finger, so locationX would snap
+  // back and forth. pageX − trackLeft is stable regardless of what's hit.
+  const trackRef = useRef<View>(null);
+  const trackLeftRef = useRef(0);
+  const measureTrack = useCallback(() => {
+    trackRef.current?.measureInWindow((x, _y, w) => {
+      trackLeftRef.current = x;
+      if (w) setBarW(w);
+    });
+  }, []);
+
+  const seekFromPageX = useCallback((pageX: number) => {
+    const x = pageX - trackLeftRef.current;
+    const i = Math.round((x / Math.max(barW, 1)) * (frames.length - 1));
+    setIdx(Math.max(0, Math.min(frames.length - 1, i)));
+  }, [barW, frames.length]);
+
+  const toRect = (b: { x1: number; y1: number; x2: number; y2: number }) => ({
+    x: b.x1 * width, y: b.y1 * height,
+    w: (b.x2 - b.x1) * width, h: (b.y2 - b.y1) * height,
+  });
+
+  return (
+    <View style={styles.wavBox}>
+      <Text style={styles.wavTitle}>Detection Inspector</Text>
+      <Text style={styles.inspectSummary}>
+        violin detected in {violinCount}/{frames.length} frames ({pct(violinCount / frames.length)})
+      </Text>
+      {!fullBowSeen && (
+        <Text style={styles.inspectWarn}>
+          ⚠️ Full bow never visible in this clip — bow distribution can't be measured reliably.
+        </Text>
+      )}
+
+      <View style={[styles.inspectStage, { width, height }]}>
+        <Video
+          ref={videoRef}
+          source={{ uri: videoUri }}
+          style={{ width, height }}
+          resizeMode={ResizeMode.CONTAIN}
+          shouldPlay={false}
+          onReadyForDisplay={(e) => {
+            const ns = (e as any).naturalSize;
+            if (ns?.width && ns?.height) setAspect(ns.width / ns.height);
+          }}
+        />
+        <Svg style={StyleSheet.absoluteFill} width={width} height={height} pointerEvents="none">
+          {frame?.bow && (() => {
+            const r = toRect(frame.bow);
+            return (
+              <React.Fragment>
+                <Rect x={r.x} y={r.y} width={r.w} height={r.h} fill="none" stroke="#f59e0b" strokeWidth={2} rx={3} />
+                <SvgText x={r.x + 3} y={Math.max(r.y - 4, 11)} fontSize={11} fontWeight="700" fill="#f59e0b">
+                  {`bow ${Math.round(frame.bowConfidence * 100)}%`}
+                </SvgText>
+              </React.Fragment>
+            );
+          })()}
+          {frame?.violin && (() => {
+            const r = toRect(frame.violin);
+            return (
+              <React.Fragment>
+                <Rect x={r.x} y={r.y} width={r.w} height={r.h} fill="none" stroke="#22d3ee" strokeWidth={2} rx={3} />
+                <SvgText x={r.x + 3} y={Math.max(r.y - 4, 11)} fontSize={11} fontWeight="700" fill="#22d3ee">
+                  {`violin ${Math.round(frame.violinConfidence * 100)}%`}
+                </SvgText>
+              </React.Fragment>
+            );
+          })()}
+          {/* Bow diagonal (frog → tip) — the line the contact math runs along */}
+          {frame?.frog && frame?.tip && (
+            <Line
+              x1={frame.frog.x * width} y1={frame.frog.y * height}
+              x2={frame.tip.x * width} y2={frame.tip.y * height}
+              stroke="#f59e0b" strokeWidth={2} strokeDasharray="6 4" strokeOpacity={0.9}
+            />
+          )}
+          {/* String diagonal (fingerboard → bridge) */}
+          {frame?.stringA && frame?.stringB && (
+            <Line
+              x1={frame.stringA.x * width} y1={frame.stringA.y * height}
+              x2={frame.stringB.x * width} y2={frame.stringB.y * height}
+              stroke="#22d3ee" strokeWidth={2} strokeDasharray="6 4" strokeOpacity={0.9}
+            />
+          )}
+          {frame?.contact && (
+            <React.Fragment>
+              <Circle cx={frame.contact.x * width} cy={frame.contact.y * height} r={7} fill="none" stroke="#ef4444" strokeWidth={2} />
+              <Circle cx={frame.contact.x * width} cy={frame.contact.y * height} r={2.5} fill="#ef4444" />
+            </React.Fragment>
+          )}
+        </Svg>
+      </View>
+
+      {/* Bow-distribution: where along the bow (frog → tip) the string contacts */}
+      <View style={styles.contactBox}>
+        <View style={styles.contactHeader}>
+          <Text style={styles.contactLabel}>
+            Contact point on bow{frame?.bowPosApprox ? '  (approx — no full bow seen yet)' : ''}
+          </Text>
+          <Text style={[styles.contactValue, frame?.bowPosApprox && styles.contactValueApprox]}>
+            {frame?.bowPosT != null ? frame.bowPosT.toFixed(2) : '—'}
+          </Text>
+        </View>
+        <View style={styles.contactTrack}>
+          {frame?.bowPosT != null && (
+            <View style={[
+              styles.contactMarker,
+              frame?.bowPosApprox && styles.contactMarkerApprox,
+              { left: `${Math.max(0, Math.min(1, frame.bowPosT)) * 100}%` },
+            ]} />
+          )}
+        </View>
+        <View style={styles.contactEnds}>
+          <Text style={styles.contactEndText}>frog</Text>
+          <Text style={styles.contactEndText}>tip</Text>
+        </View>
+      </View>
+
+      {/* Draggable scrub bar — tap or drag to scrub through frames. Larger hit
+          area (padding) makes the thumb easy to grab; children are non-
+          interactive so touches always resolve against the track itself. */}
+      <View
+        ref={trackRef}
+        style={styles.scrubHit}
+        onLayout={measureTrack}
+        onStartShouldSetResponder={() => true}
+        onMoveShouldSetResponder={() => true}
+        onResponderTerminationRequest={() => false}
+        onResponderGrant={(e) => seekFromPageX(e.nativeEvent.pageX)}
+        onResponderMove={(e) => seekFromPageX(e.nativeEvent.pageX)}
+      >
+        <View style={styles.scrubTrack} pointerEvents="none">
+          <View style={[styles.scrubFill, { width: `${(idx / Math.max(frames.length - 1, 1)) * 100}%` }]} />
+          <View style={[styles.scrubThumb, { left: `${(idx / Math.max(frames.length - 1, 1)) * 100}%` }]} />
+        </View>
+      </View>
+
+      <View style={styles.inspectRow}>
+        <Pressable style={styles.stepBtn} onPress={() => step(-10)}><Text style={styles.stepBtnText}>«10</Text></Pressable>
+        <Pressable style={styles.stepBtn} onPress={() => step(-1)}><Text style={styles.stepBtnText}>‹</Text></Pressable>
+        <View style={styles.inspectMetaBox}>
+          <Text style={styles.inspectMeta}>{`${idx + 1}/${frames.length}  ·  ${frame ? frame.timestamp.toFixed(2) : '0.00'}s`}</Text>
+          <Text style={styles.inspectMetaSub}>
+            {`bow ${frame ? Math.round(frame.bowConfidence * 100) : 0}%   violin ${frame?.violin ? Math.round(frame.violinConfidence * 100) + '%' : '—'}`}
+          </Text>
+        </View>
+        <Pressable style={styles.stepBtn} onPress={() => step(1)}><Text style={styles.stepBtnText}>›</Text></Pressable>
+        <Pressable style={styles.stepBtn} onPress={() => step(10)}><Text style={styles.stepBtnText}>10»</Text></Pressable>
+      </View>
+    </View>
   );
 }
 
@@ -543,6 +792,82 @@ const styles = StyleSheet.create({
   },
   wavTitle: { fontSize: 11, fontWeight: '700', color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 },
 
+  inspectSummary: { fontSize: 12, color: 'rgba(255,255,255,0.7)', marginBottom: spacing.xs },
+  inspectWarn: { fontSize: 12, color: '#f59e0b', fontWeight: '600', marginBottom: spacing.xs },
+  inspectStage: {
+    alignSelf: 'center',
+    backgroundColor: '#000',
+    borderRadius: radius.md,
+    overflow: 'hidden',
+  },
+  // Full-width transparent touch target (taller than the visible bar) so the
+  // thumb is easy to grab. No horizontal padding — its width must equal the
+  // inner track's so pageX maps directly to the fill percentage.
+  scrubHit: {
+    marginTop: spacing.sm,
+    paddingVertical: 12,
+  },
+  scrubTrack: {
+    height: 20,
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderRadius: 10,
+  },
+  scrubFill: { height: '100%', backgroundColor: colors.brand[500] },
+  scrubThumb: {
+    position: 'absolute',
+    top: -3,
+    width: 14,
+    height: 26,
+    marginLeft: -7,
+    borderRadius: 7,
+    backgroundColor: '#fff',
+    borderWidth: 2,
+    borderColor: colors.brand[500],
+  },
+
+  contactBox: { marginTop: spacing.md, gap: 4 },
+  contactHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  contactLabel: { fontSize: 12, fontWeight: '700', color: 'rgba(255,255,255,0.7)' },
+  contactValue: { fontSize: 13, fontWeight: '700', color: '#ef4444', fontVariant: ['tabular-nums'] },
+  contactValueApprox: { color: '#f59e0b' },
+  contactTrack: {
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    justifyContent: 'center',
+  },
+  contactMarker: {
+    position: 'absolute',
+    width: 12,
+    height: 12,
+    marginLeft: -6,
+    borderRadius: 6,
+    backgroundColor: '#ef4444',
+  },
+  contactMarkerApprox: { backgroundColor: '#f59e0b' },
+  contactEnds: { flexDirection: 'row', justifyContent: 'space-between' },
+  contactEndText: { fontSize: 10, color: 'rgba(255,255,255,0.4)' },
+  inspectRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: spacing.sm,
+    gap: spacing.xs,
+  },
+  stepBtn: {
+    backgroundColor: colors.brand[600],
+    borderRadius: radius.sm,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    minWidth: 40,
+    alignItems: 'center',
+  },
+  stepBtnText: { color: '#fff', fontWeight: '700', fontSize: 14 },
+  inspectMetaBox: { flex: 1, alignItems: 'center' },
+  inspectMeta: { color: '#fff', fontSize: 13, fontWeight: '700' },
+  inspectMetaSub: { color: 'rgba(255,255,255,0.6)', fontSize: 11 },
+
   metricCard: {
     backgroundColor: '#1e1b3a',
     borderRadius: radius.md,
@@ -590,3 +915,8 @@ const styles = StyleSheet.create({
   },
   shareBtnText: { color: 'rgba(255,255,255,0.7)', fontSize: 14, fontWeight: '600' },
 });
+
+export default function DebugScreen() {
+  if (!__DEV__) return null;
+  return <DebugScreenInner />;
+}

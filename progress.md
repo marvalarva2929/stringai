@@ -1,5 +1,14 @@
 # StringAI — Progress & Codebase Reference
 
+> **Update**: this document is a point-in-time snapshot from Jun 18–23, 2026 and
+> several items below are now stale. Notably: the Supabase Edge Functions
+> (`analyze-feedback`, `session-chat`, `delete-account`, `revenuecat-webhook`)
+> are complete, production-quality implementations — not stubs — and just need
+> `supabase functions deploy` run against the live project. The bow ML model has
+> since been trained (see `ml/cloud/pipeline_summary.json`). The paywall
+> (`app/paywall.tsx`) is a live screen, not commented out. Treat the rest of
+> this doc as historical context rather than current status.
+
 ## Current Status: Bow ML Pipeline — Critical Path to Full L1-L10 Analysis
 
 **As of Jun 18, 2026.** The audio analysis pipeline (L1 audio, L2 note fusion, L3 signals, L4 basic pattern detection) is fully implemented in TypeScript and working on-device. The bow detector ML model is the critical missing piece: all four bow metrics return "unavailable," and L5 (slur detection), L7 (phrase features), and several L8 pattern tests are blocked until the bow detector provides real bow position/speed/angle data.

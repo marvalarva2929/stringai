@@ -7,7 +7,7 @@ class 1 = violin). This replaces the old 3-keypoint pose model: keypoints
 (tip/frog/contact) are now derived geometrically in the app from the two boxes
 plus pose landmarks.
 
-Usage (pod GPU):
+Usage (GPU instance):
     python train_detect.py --device 0
 
     # Mac (MPS) — slower but fine for yolov8n:
@@ -16,8 +16,15 @@ Usage (pod GPU):
     # Quick smoke test:
     python train_detect.py --epochs 10 --name smoke
 
+Writes train_output_dir.txt containing ultralytics' ACTUAL resolved output
+directory once training completes — don't assume it's runs/bow_detect/<name>/
+(project=/name= are hints, not guarantees; observed on RunPod pods landing at
+runs/detect/runs/bow_detect/<name>/ instead, likely from a settings.yaml
+runs_dir override). orchestrate.py reads this file rather than hardcoding a
+path. If running by hand, check the printed "Best weights:" line instead.
+
 Then export on the Mac:
-    python ../export_coreml.py --weights runs/bow_detect/train/weights/best.pt
+    python ../export_coreml.py --weights <path from the "Best weights:" line>
 """
 
 import argparse
@@ -38,7 +45,8 @@ def main():
     parser.add_argument("--resume", default=None, help="Resume from checkpoint .pt")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch", type=int, default=16)
-    parser.add_argument("--name", default="train", help="Run name under runs/bow_detect/")
+    parser.add_argument("--name", default="train", help="Requested run name (see train_output_dir.txt "
+                        "after training for where ultralytics actually put it)")
     parser.add_argument("--device", default=None, help="cpu, mps, or CUDA index like 0")
     parser.add_argument("--workers", type=int, default=8,
                         help="Dataloader workers (ultralytics defaults to 0 on MPS, "
@@ -86,7 +94,11 @@ def main():
             mosaic=1.0,
             project="runs/bow_detect",
             name=args.name,
-            exist_ok=False,
+            # True: reuse/overwrite runs/bow_detect/<name>/ every run instead of
+            # auto-incrementing to <name>2, <name>3, ... on a persistent pod where
+            # a previous (possibly failed) run's directory is often still there —
+            # orchestrate.py always looks at the same fixed path afterward.
+            exist_ok=True,
             save=True,
             save_period=10,
             val=True,
@@ -97,16 +109,22 @@ def main():
             train_kwargs["device"] = args.device
 
         print(f"Training {args.model} ({args.epochs} epochs) on {data_yaml}")
-        print(f"Output: runs/bow_detect/{args.name}/\n")
+        print(f"Requested output dir: runs/bow_detect/{args.name}/ (ultralytics may resolve "
+              "this differently — see the actual path reported below)\n")
         model.train(**train_kwargs)
 
-    best = Path(f"runs/bow_detect/{args.name}/weights/best.pt")
+    # Don't assume project=/name= landed where requested — read ultralytics'
+    # own record of where it actually wrote things (see module docstring).
+    save_dir = Path(model.trainer.save_dir)
+    Path("train_output_dir.txt").write_text(str(save_dir))
+    best = save_dir / "weights" / "best.pt"
     print("\nTraining complete.")
+    print(f"Actual output dir: {save_dir.resolve()}")
     print(f"Best weights: {best.resolve()}")
     print("\nKey metrics to check in the printed summary:")
     print("  - mAP50(bow):    want > 0.85 — the box drives all bow geometry")
     print("  - mAP50(violin): want > 0.80")
-    print("\nNext: copy best.pt to the Mac and export to CoreML (see RUNPOD.md §5).")
+    print("\nNext: copy best.pt to the Mac and export to CoreML (see GCE.md §5).")
 
 
 if __name__ == "__main__":

@@ -130,6 +130,21 @@ export interface LLMFeedback {
   generatedAt: string;
   /** Present only on Edge Function (Claude) responses, not static fallback. */
   phraseFeedback?: LLMPhraseFeedback[];
+  /**
+   * The 1-3 underlying causes tying multiple issues together — the "big picture"
+   * narrative. Always the GROUNDED result of groundCuratedPlan() against this
+   * session's issues, never the raw Claude output; absent on the static fallback
+   * and whenever nothing survived grounding.
+   */
+  rootCauses?: import('../lib/practiceCuration').CuratedRootCause[];
+  /**
+   * Grounded copy for the session-scoped practice plan's blocks (Phase 3.5).
+   * Not persisted on AnalysisResult long-term storage the way the rest of
+   * llmFeedback is expected to be read back — the caller (app/(tabs)/analyze.tsx)
+   * moves this into useCuratedPlanStore keyed by planId immediately, since
+   * that's what usePracticePlan actually reads from.
+   */
+  curatedBlocks?: import('../lib/practiceCuration').CuratedBlockSpec[];
   /** 'claude' = Edge Function; absent/'static' = local template fallback. */
   source?: 'claude' | 'static';
 }
@@ -286,6 +301,9 @@ export interface AnalysisResult {
   vibratoAnalysis?: VibratoAnalysis;
   rhythmAnalysis?: RhythmAnalysis;
   audioQualityWarning?: string;
+  /** Tempo the player set on the metronome for this take, when they used one.
+   *  Recorded intent — rhythm scoring still estimates the played tempo itself. */
+  metronomeBpm?: number;
   videoUri?: string;  // local path to the session video for replay
   noteEvents?: import('../lib/noteFusion').NoteEvent[];
   /** L8 findings that fired. Persisted with the session for L10 coaching. */
@@ -301,6 +319,11 @@ export interface AnalysisResult {
    *  that don't survive JSON serialization; stripped from persistence and from
    *  all but the newest sessionResultCache entry. */
   sessionSignals?: import('./signals').SessionSignals;
+  /** Runtime-only: true while the Pro Claude coaching upgrade is in flight for
+   *  this session (set before the first render, cleared on success/failure by
+   *  app/(tabs)/analyze.tsx). Powers the results screen's coaching-loading
+   *  state; never meaningfully persisted (a reload just means it's absent). */
+  coachingPending?: boolean;
 }
 
 // Raw intermediate signals from audio DSP — consumed by noteFusion.ts

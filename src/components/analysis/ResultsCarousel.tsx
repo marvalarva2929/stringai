@@ -10,26 +10,32 @@ import Animated, {
 } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons, FontAwesome6 } from '@expo/vector-icons';
-import { Audio } from 'expo-av';
 import Svg, { Circle, Line, Polygon, Path, Rect, Text as SvgText } from 'react-native-svg';
 import { useWindowDimensions } from 'react-native';
+import { router } from 'expo-router';
 import { InlineVideoPlayer } from './InlineVideoPlayer';
 import { colors, spacing, radius } from '../../constants/theme';
 import { haptic } from '../../lib/haptics';
+import { useEntitlementStore } from '../../store/useEntitlementStore';
+import { canUseLlmCoaching } from '../../lib/entitlements';
 import {
-  AnalysisResult, MetricScore, MetricKey, FlaggedTimestamp,
+  AnalysisResult, MetricScore, MetricKey, FlaggedTimestamp, TechniqueEvent, ToneFault,
   IntonationAnalysis, VibratoAnalysis, PitchClassIssue, VibratoNoteResult,
   IntonationStabilityNoteResult,
   LLMCoachingItem, DynDebugInfo, RhythmAnalysis,
 } from '../../types/analysis';
-import { getReferenceNoteUri, pitchClassInfo } from '../../lib/referenceNote';
+import { useTuneNote } from '../../hooks/useTuneNote';
+import { TunePracticePanel } from '../practice/TuneNotePanel';
+import {
+  classifyVibratoFaults, hasVibrato, VIBRATO_DISPLAY, VibratoFault,
+} from '../../services/pitchContour';
+import { FAULT_MESSAGE as TONE_FAULT_COPY } from '../../services/toneAnalysis';
 
 // ─────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────
 
 const { width: SCREEN_W } = Dimensions.get('window');
-const GRAPH_H = 72;
 const GRAPH_RANGE = 50;
 const IDEAL_RATE_HZ = 5.5;
 const IDEAL_DEPTH_CENTS = 25;
@@ -76,14 +82,25 @@ function fmtSecs(s: number) {
 const WRIST_THRESHOLD = 160;
 const V_MIN = 85, V_MAX = 185;
 
+// Split in two so the "no usable series" guard runs before any hook does —
+// a metric can gain or lose its time series between renders, and bailing out
+// after the hooks would change the hook count and blow up the results screen.
 function WristAngleGraph({ metric, duration, onTimestampPress }: {
   metric: MetricScore;
   duration: number;
   onTimestampPress?: (s: number) => void;
 }) {
-  const { width: screenW } = useWindowDimensions();
   const series = metric.timeSeries;
   if (!series || series.length < 2) return null;
+  return <WristAngleGraphBody metric={metric} series={series} onTimestampPress={onTimestampPress} />;
+}
+
+function WristAngleGraphBody({ metric, series, onTimestampPress }: {
+  metric: MetricScore;
+  series: NonNullable<MetricScore['timeSeries']>;
+  onTimestampPress?: (s: number) => void;
+}) {
+  const { width: screenW } = useWindowDimensions();
 
   const W = screenW - 48;
   const H = 148;
@@ -173,7 +190,7 @@ function WristAngleGraph({ metric, duration, onTimestampPress }: {
           ))}
         </Svg>
       </Pressable>
-      {metric.measurementQuality === 'low' && (
+      {__DEV__ && metric.measurementQuality === 'low' && (
         <Text style={{ color: '#475569', fontSize: 10, marginTop: 4 }}>
           2D estimate — 3D measurement requires pose_landmarker_full.task
         </Text>
@@ -185,7 +202,7 @@ function WristAngleGraph({ metric, duration, onTimestampPress }: {
 function WristDebugGraphs({ metric }: { metric: MetricScore }) {
   const { width: screenW } = useWindowDimensions();
   const series = metric.debugSeries;
-  if (!series || series.length < 2) return null;
+  if (!__DEV__ || !series || series.length < 2) return null;
 
   const W = screenW - 48;
   const H = 60;
@@ -234,6 +251,106 @@ function WristDebugGraphs({ metric }: { metric: MetricScore }) {
         <SvgText x={PAD_L - 4} y={tyH(20) + 3.5} fontSize={8} fill="#475569" textAnchor="end">20</SvgText>
         {hPoints.length > 1 && <Path d={dH} stroke="#34d399" strokeWidth={1.5} fill="none" strokeLinecap="round" strokeLinejoin="round" />}
       </Svg>
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Bow position graph — contact point u (0=frog, 1=tip) over time
+// ─────────────────────────────────────────────────────────────
+
+function BowPositionGraph({ metric, onTimestampPress }: {
+  metric: MetricScore;
+  onTimestampPress?: (s: number) => void;
+}) {
+  const { width: screenW } = useWindowDimensions();
+  const series = metric.timeSeries;
+  const [scrub, setScrub] = useState<{ x: number; t: number; v: number } | null>(null);
+  const scrubTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  if (!series || series.length < 2) return null;
+
+  const W = screenW - 48;
+  const H = 148;
+  const PAD_L = 34, PAD_R = 8, PAD_T = 10, PAD_B = 22;
+  const plotW = W - PAD_L - PAD_R;
+  const plotH = H - PAD_T - PAD_B;
+
+  const tMin = series[0].t;
+  const tMax = Math.max(series[series.length - 1].t, tMin + 1);
+  const tx = (t: number) => PAD_L + ((t - tMin) / (tMax - tMin)) * plotW;
+  // v=1 (tip) at the top, v=0 (frog) at the bottom
+  const ty = (v: number) => PAD_T + (1 - Math.min(Math.max(v, 0), 1)) * plotH;
+
+  const handleTap = (locationX: number) => {
+    const rawX = locationX - PAD_L;
+    const t = Math.max(tMin, Math.min(tMax, tMin + (rawX / plotW) * (tMax - tMin)));
+    const svgX = tx(t);
+    let nearest = series[0];
+    let minDist = Infinity;
+    for (const p of series) {
+      const d = Math.abs(p.t - t);
+      if (d < minDist) { minDist = d; nearest = p; }
+    }
+    setScrub({ x: svgX, t, v: nearest.v });
+    onTimestampPress?.(t);
+    if (scrubTimer.current) clearTimeout(scrubTimer.current);
+    scrubTimer.current = setTimeout(() => setScrub(null), 2500);
+  };
+
+  const d = series.map((p, i) => `${i === 0 ? 'M' : 'L'}${tx(p.t).toFixed(1)},${ty(p.v).toFixed(1)}`).join(' ');
+  const totalSecs = tMax - tMin;
+  const xStep = totalSecs <= 30 ? 10 : totalSecs <= 90 ? 20 : totalSecs <= 180 ? 30 : totalSecs <= 360 ? 60 : 120;
+  const xLabels: number[] = [];
+  for (let t = Math.ceil((tMin + 1) / xStep) * xStep; t <= tMax - 1; t += xStep) xLabels.push(t);
+  const tooltipLeft = scrub !== null && scrub.x > W / 2;
+
+  return (
+    <View style={{ marginTop: 16 }}>
+      <Text style={{ color: '#94a3b8', fontSize: 10, fontWeight: '700', letterSpacing: 0.8, marginBottom: 8 }}>
+        BOW POSITION OVER TIME
+      </Text>
+      <Pressable onPress={(e) => handleTap(e.nativeEvent.locationX)}>
+        <Svg width={W} height={H}>
+          {/* Zone bands: upper (tip) / middle / lower (frog) thirds */}
+          <Rect x={PAD_L} y={ty(1)} width={plotW} height={plotH / 3} fill="rgba(56,189,248,0.06)" />
+          <Rect x={PAD_L} y={ty(1 / 3)} width={plotW} height={plotH / 3} fill="rgba(56,189,248,0.06)" />
+          {[1 / 3, 2 / 3].map(v => (
+            <Line key={v} x1={PAD_L} y1={ty(v)} x2={W - PAD_R} y2={ty(v)} stroke="#1e293b" strokeWidth={0.75} strokeDasharray="4,3" />
+          ))}
+          {/* Y labels */}
+          <SvgText x={PAD_L - 4} y={ty(1) + 8} fontSize={8} fill="#64748b" textAnchor="end">tip</SvgText>
+          <SvgText x={PAD_L - 4} y={ty(0.5) + 3} fontSize={8} fill="#475569" textAnchor="end">mid</SvgText>
+          <SvgText x={PAD_L - 4} y={ty(0) - 1} fontSize={8} fill="#64748b" textAnchor="end">frog</SvgText>
+          {/* Data line */}
+          <Path d={d} stroke="#38bdf8" strokeWidth={1.5} fill="none" strokeLinecap="round" strokeLinejoin="round" />
+          {/* Scrubber */}
+          {scrub && (
+            <React.Fragment>
+              <Line x1={scrub.x} y1={PAD_T} x2={scrub.x} y2={H - PAD_B} stroke="#fff" strokeWidth={1} opacity={0.6} />
+              <Circle cx={scrub.x} cy={ty(scrub.v)} r={4} fill="#fff" />
+              <SvgText
+                x={tooltipLeft ? scrub.x - 7 : scrub.x + 7}
+                y={PAD_T + 11}
+                fontSize={10}
+                fontWeight="700"
+                fill="#fff"
+                textAnchor={tooltipLeft ? 'end' : 'start'}
+              >
+                {fmtSecs(scrub.t)} · {Math.round(scrub.v * 100)}% toward tip
+              </SvgText>
+            </React.Fragment>
+          )}
+          {/* X axis labels */}
+          {xLabels.map(t => (
+            <SvgText key={t} x={tx(t)} y={H - 5} fontSize={8} fill="#475569" textAnchor="middle">
+              {fmtSecs(t)}
+            </SvgText>
+          ))}
+        </Svg>
+      </Pressable>
+      <Text style={{ color: '#475569', fontSize: 10, marginTop: 4 }}>
+        Where the bow contacts the string — tap to jump the video there
+      </Text>
     </View>
   );
 }
@@ -320,6 +437,54 @@ function RadarChart({ metrics }: { metrics: MetricScore[] }) {
 // Celebration page (first slide)
 // ─────────────────────────────────────────────────────────────
 
+// Leads the results screen for Pro users: the LLM's overall take (and, once
+// grounded, its top root cause) is the first text on screen, above the score
+// reveal — while it's still in flight this shows a loading state instead of
+// silently swapping static→real text later. Free users get a compact upsell
+// strip instead (never the full-page ChatPageLocked treatment here).
+function CoachLeadSection({ result }: { result: AnalysisResult }) {
+  const coachingUnlocked = canUseLlmCoaching(useEntitlementStore((st) => st.entitlement));
+  if (!coachingUnlocked) return <CoachTeaserStrip />;
+
+  if (result.coachingPending) {
+    return (
+      <View style={s.coachLeadCard}>
+        <Text style={s.coachLeadBadge}>AI COACH</Text>
+        <View style={s.coachLeadShimmerLine} />
+        <View style={[s.coachLeadShimmerLine, { width: '65%' }]} />
+        <Text style={s.coachLeadPendingText}>Reviewing your playing…</Text>
+      </View>
+    );
+  }
+
+  const take = result.llmFeedback?.source === 'claude' ? result.llmFeedback.overallTake : undefined;
+  if (!take) return null;
+  const topCause = result.llmFeedback?.rootCauses?.[0];
+
+  return (
+    <View style={s.coachLeadCard}>
+      <Text style={s.coachLeadBadge}>AI COACH</Text>
+      <Text style={s.coachLeadTake}>{take}</Text>
+      {topCause && (
+        <View style={s.coachLeadCause}>
+          <Text style={s.coachLeadCauseLabel}>{topCause.label}</Text>
+          <Text style={s.coachLeadCauseBody}>{topCause.explanation}</Text>
+        </View>
+      )}
+    </View>
+  );
+}
+
+function CoachTeaserStrip() {
+  return (
+    <Pressable style={s.coachTeaserStrip} onPress={() => router.push('/paywall')}>
+      <Ionicons name="sparkles" size={16} color={colors.brand[300]} />
+      <Text style={s.coachTeaserText} numberOfLines={1}>Unlock AI coaching for a deeper breakdown</Text>
+      <Ionicons name="chevron-forward" size={16} color={TEXT_MUTED} />
+    </Pressable>
+  );
+}
+
 function CelebrationPage({ result }: { result: AnalysisResult }) {
   const { scrollRef, showHint, onLayout, onContentSizeChange, onScroll, scrollToEnd } = useScrollHint();
   const [celebScore, setCelebScore] = useState(0);
@@ -382,6 +547,7 @@ function CelebrationPage({ result }: { result: AnalysisResult }) {
       onScroll={onScroll}
       scrollEventThrottle={16}
     >
+      <CoachLeadSection result={result} />
       <View style={s.celebChartArea}>
         <RadarChart metrics={result.metrics} />
       </View>
@@ -413,278 +579,116 @@ function CelebrationPage({ result }: { result: AnalysisResult }) {
   );
 }
 
-// ─────────────────────────────────────────────────────────────
-// Tune-note hook + panel (from CoachingReport)
-// ─────────────────────────────────────────────────────────────
-
-function useTuneNote() {
-  const [playingNote, setPlayingNote] = useState<string | null>(null);
-  const playingRef = useRef<string | null>(null);
-  const soundRef   = useRef<Audio.Sound | null>(null);
-  useEffect(() => () => { soundRef.current?.unloadAsync().catch(() => {}); }, []);
-
-  const stopAll = useCallback(async () => {
-    const sound = soundRef.current;
-    soundRef.current = null; playingRef.current = null; setPlayingNote(null);
-    if (sound) { await sound.stopAsync().catch(() => {}); await sound.unloadAsync().catch(() => {}); }
-  }, []);
-
-  const toggle = useCallback(async (pitchClass: string, midi?: number) => {
-    const prev = playingRef.current;
-    const prevSound = soundRef.current;
-    soundRef.current = null; playingRef.current = null; setPlayingNote(null);
-    if (prevSound) { await prevSound.stopAsync().catch(() => {}); await prevSound.unloadAsync().catch(() => {}); }
-    if (prev === pitchClass) return;
-    playingRef.current = pitchClass; setPlayingNote(pitchClass);
-    try {
-      await Audio.setAudioModeAsync({ allowsRecordingIOS: false, playsInSilentModeIOS: true, staysActiveInBackground: false, shouldDuckAndroid: false });
-      const uri = await getReferenceNoteUri(pitchClass, midi);
-      const { sound } = await Audio.Sound.createAsync({ uri }, { shouldPlay: true, volume: 1.0 });
-      soundRef.current = sound;
-      sound.setOnPlaybackStatusUpdate((st) => {
-        if (st.isLoaded && st.didJustFinish) {
-          if (playingRef.current === pitchClass) { playingRef.current = null; setPlayingNote(null); }
-          sound.unloadAsync().catch(() => {});
-          if (soundRef.current === sound) soundRef.current = null;
-        }
-      });
-    } catch { playingRef.current = null; setPlayingNote(null); }
-  }, []);
-
-  return { playingNote, toggle, stopAll };
-}
-
+// Bottom-sheet chrome shared by VibratoNoteDrawer below (the tune-note panel
+// has its own copy in TuneNotePanel.tsx — this one styles a different drawer).
 const PANEL_H = Math.round(Dimensions.get('window').height * 0.42);
-
-function TunePracticePanel({ pitchClass, midiNote, isPlaying, onToggle, onClose }: {
-  pitchClass: string; midiNote?: number; isPlaying: boolean; onToggle: () => void; onClose: () => void;
-}) {
-  const { freq, description } = pitchClassInfo(pitchClass, midiNote);
-  return (
-    <TouchableWithoutFeedback onPress={onClose}>
-      <View style={ps.backdrop}>
-        <TouchableWithoutFeedback>
-          <View style={ps.sheet}>
-            <View style={ps.pill} />
-            <Text style={ps.noteName}>{pitchClass}</Text>
-            <Text style={ps.noteDesc}>{description}</Text>
-            <Text style={ps.noteFreq}>{freq} Hz</Text>
-            <Text style={ps.instruction}>Play this note on your violin and adjust until the pitches match.</Text>
-            <Pressable style={[ps.playBtn, isPlaying && ps.playBtnActive]} onPress={onToggle}>
-              {isPlaying
-                ? <View style={ps.pauseIcon}><View style={ps.pauseBar} /><View style={ps.pauseBar} /></View>
-                : <Text style={ps.playBtnIcon}>▶</Text>}
-              <Text style={[ps.playBtnText, isPlaying && ps.playBtnTextActive]}>
-                {isPlaying ? 'Stop' : 'Play note'}
-              </Text>
-            </Pressable>
-            <Pressable onPress={onClose} style={ps.doneBtn}>
-              <Text style={ps.doneBtnText}>Done</Text>
-            </Pressable>
-          </View>
-        </TouchableWithoutFeedback>
-      </View>
-    </TouchableWithoutFeedback>
-  );
-}
-
 const ps = StyleSheet.create({
   backdrop: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.45)' },
   sheet: { height: PANEL_H, backgroundColor: '#fff', borderTopLeftRadius: 24, borderTopRightRadius: 24, alignItems: 'center', paddingHorizontal: spacing.xl, paddingBottom: 32, gap: spacing.sm, shadowColor: '#000', shadowOffset: { width: 0, height: -6 }, shadowOpacity: 0.18, shadowRadius: 20, elevation: 20 },
   pill: { width: 36, height: 4, borderRadius: 2, backgroundColor: '#d1d5db', marginTop: 10, marginBottom: 4 },
-  noteName: { fontSize: 52, fontWeight: '800', color: colors.brand[700], lineHeight: 60 },
-  noteDesc: { fontSize: 14, color: colors.text.secondary, fontWeight: '500', textAlign: 'center' },
-  noteFreq: { fontSize: 13, color: colors.text.muted, textAlign: 'center' },
-  instruction: { fontSize: 13, color: colors.text.secondary, textAlign: 'center', lineHeight: 19, paddingHorizontal: spacing.md },
   playBtn: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: colors.brand[600], borderRadius: radius.full, paddingHorizontal: 28, paddingVertical: 14, marginTop: spacing.xs },
-  playBtnActive: { backgroundColor: colors.score.critical },
-  playBtnIcon: { fontSize: 18, color: '#fff' },
-  pauseIcon: { flexDirection: 'row', gap: 4, alignItems: 'center' },
-  pauseBar: { width: 4, height: 17, backgroundColor: '#fff', borderRadius: 1.5 },
   playBtnText: { fontSize: 16, fontWeight: '700', color: '#fff' },
-  playBtnTextActive: {},
   doneBtn: { marginTop: 4 },
   doneBtnText: { fontSize: 14, color: colors.text.muted, fontWeight: '500' },
 });
 
 // ─────────────────────────────────────────────────────────────
-// Intonation cards
-// ─────────────────────────────────────────────────────────────
-
-function IntonationNoteCard({ issue, videoUri, onTimestampPress, onTune, isPlaying }: {
-  issue: PitchClassIssue;
-  videoUri?: string;
-  onTimestampPress?: (s: number) => void;
-  onTune?: (pitchClass: string, midi?: number) => void;
-  isPlaying?: boolean;
-}) {
-  const tendColor = issue.tendency === 'flat' ? '#3b82f6' : issue.tendency === 'sharp' ? colors.score.needs_attention : colors.text.muted;
-  const arrow = issue.tendency === 'flat' ? '↓' : issue.tendency === 'sharp' ? '↑' : '↕';
-  const tendWord = issue.tendency === 'flat' ? 'flat' : issue.tendency === 'sharp' ? 'sharp' : 'off';
-  const absAvg = Math.abs(issue.avgDeviationCents);
-  const barWidth = Math.min(100, (absAvg / 50) * 100);
-  return (
-    <View style={s.noteCard}>
-      <View style={s.noteCardHero}>
-        <Text style={[s.noteCardArrow, { color: tendColor }]}>{arrow}</Text>
-        <Text style={s.noteCardName}>{issue.pitchClass}</Text>
-      </View>
-      <Text style={[s.noteCardTend, { color: tendColor }]}>
-        {tendWord} by ~{absAvg}¢ on average
-      </Text>
-      <Text style={s.noteCardStat}>
-        Out of tune {issue.outOfTuneCount}× — {Math.round(issue.errorRate * 100)}% error rate
-      </Text>
-      <View style={s.devBarBg}>
-        <View style={[s.devBarFill, { width: `${barWidth}%` as any, backgroundColor: tendColor }]} />
-      </View>
-      <View style={s.noteCardActions}>
-        {videoUri && (issue.exampleTimestamps?.length ?? 0) > 0 && onTimestampPress && (
-          <Pressable style={s.seekBtn} onPress={() => onTimestampPress(issue.exampleTimestamps![0].startSeconds)}>
-            <Ionicons name="play" size={13} color="#38bdf8" />
-            <Text style={s.seekBtnText}>Seek to example</Text>
-          </Pressable>
-        )}
-        {onTune && (
-          <Pressable style={[s.tuneBtn, isPlaying && s.tuneBtnActive]} onPress={() => onTune(issue.pitchClass, issue.representativeMidi)}>
-            <Ionicons name="musical-note" size={13} color={isPlaying ? '#fff' : '#38bdf8'} />
-            <Text style={[s.tuneBtnText, isPlaying && s.tuneBtnTextActive]}>
-              {isPlaying ? 'Stop' : 'Tune this note'}
-            </Text>
-          </Pressable>
-        )}
-      </View>
-    </View>
-  );
-}
-
-// ─────────────────────────────────────────────────────────────
 // Vibrato cards
 // ─────────────────────────────────────────────────────────────
 
-function buildPath(cents: number[], w: number, h: number): string {
+function buildPath(cents: number[], w: number, h: number, range: number = GRAPH_RANGE): string {
   if (cents.length < 2) return '';
   const PAD = 4;
   const mh = h - PAD * 2;
   return cents.map((c, i) => {
     const x = (i / Math.max(cents.length - 1, 1)) * w;
-    const clamped = Math.max(-GRAPH_RANGE, Math.min(GRAPH_RANGE, c));
-    const y = PAD + mh / 2 - (clamped / GRAPH_RANGE) * (mh / 2);
+    const clamped = Math.max(-range, Math.min(range, c));
+    const y = PAD + mh / 2 - (clamped / range) * (mh / 2);
     return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)} ${y.toFixed(1)}`;
   }).join(' ');
 }
 
-function VibratoNoteCard({ note, index, onTimestampPress }: {
-  note: VibratoNoteResult; index: number; onTimestampPress?: (s: number) => void;
-}) {
-  const sc = scoreColor(note.noteScore);
-  const graphW = SCREEN_W - 80;
-  const actualPath = buildPath(note.cents, graphW, GRAPH_H);
-  const idealCents = Array.from({ length: note.cents.length }, (_, i) =>
-    IDEAL_DEPTH_CENTS * Math.sin(2 * Math.PI * IDEAL_RATE_HZ * (i / PITCH_HOP_HZ))
-  );
-  const idealPath = buildPath(idealCents, graphW, GRAPH_H);
-  const cy = 4 + (GRAPH_H - 8) / 2;
-  return (
-    <View style={s.noteCard}>
-      <View style={s.vibratoHeader}>
-        <Text style={s.vibratoTime}>Note {index + 1} — {fmtSecs(note.startS)}–{fmtSecs(note.endS)}</Text>
-        <View style={[s.vibratoBadge, { backgroundColor: sc }]}>
-          <Text style={s.vibratoBadgeText}>{note.noteScore}</Text>
-        </View>
-      </View>
-      <View style={s.vibratoStats}>
-        <Text style={s.vibratoStat}>{note.rateHz} Hz</Text>
-        <Text style={s.vibratoStatSep}>·</Text>
-        <Text style={s.vibratoStat}>±{note.depthCents}¢</Text>
-        <Text style={s.vibratoStatSep}>·</Text>
-        <Text style={s.vibratoStat}>AC {note.periodicityScore.toFixed(2)}</Text>
-      </View>
-      {note.cents.length > 1 && (
-        <View style={s.vibratoGraph}>
-          <Svg width={graphW} height={GRAPH_H}>
-            <Line x1={0} y1={cy} x2={graphW} y2={cy} stroke="rgba(0,0,0,0.1)" strokeWidth={1} />
-            {idealPath ? <Path d={idealPath} stroke="rgba(250,180,50,0.5)" strokeWidth={1.5} fill="none" strokeDasharray="5,4" /> : null}
-            {actualPath ? <Path d={actualPath} stroke={sc} strokeWidth={2} fill="none" strokeLinejoin="round" strokeLinecap="round" /> : null}
-          </Svg>
-        </View>
-      )}
-      {note.feedbackNotes.length > 0 && (
-        <View style={s.feedbackTags}>
-          {note.feedbackNotes.map((fb, i) => (
-            <View key={i} style={s.feedbackTag}><Text style={s.feedbackTagText}>{fb}</Text></View>
-          ))}
-        </View>
-      )}
-      {onTimestampPress && (
-        <Pressable style={s.seekBtn} onPress={() => onTimestampPress(note.startS)}>
-          <Ionicons name="play" size={13} color="#38bdf8" />
-          <Text style={s.seekBtnText}>Seek to note</Text>
-        </Pressable>
-      )}
-    </View>
-  );
+/** Stride-samples a series down to at most maxPoints (cents arrays can be hundreds long). */
+function downsample(values: number[], maxPoints: number): number[] {
+  if (values.length <= maxPoints) return values;
+  const stride = values.length / maxPoints;
+  return Array.from({ length: maxPoints }, (_, i) => values[Math.floor(i * stride)]);
 }
+
+const SPARK_W = 64;
+const SPARK_H = 24;
 
 // ─────────────────────────────────────────────────────────────
 // Vibrato issue grouping, drawer, and section
 // ─────────────────────────────────────────────────────────────
 
-type VibratoIssueType = 'shallow' | 'uneven_rhythm' | 'fades' | 'slow_rate' | 'fast_rate' | 'no_vibrato';
-
-interface VibratoIssueGroup {
-  type: VibratoIssueType;
-  notes: Array<{ note: VibratoNoteResult; index: number }>;
+interface VibratoFaultGroup {
+  fault: VibratoFault;
+  notes: Array<{ note: VibratoNoteResult; index: number }>; // worst first (noteScore asc)
+  severity: number; // Σ (100 − noteScore) — combines count and badness for ranking
 }
 
-const VIBRATO_ISSUE_META: Record<VibratoIssueType, { title: string; icon: string }> = {
-  shallow:       { title: 'Shallow depth',  icon: 'trending-down'            },
-  uneven_rhythm: { title: 'Uneven rhythm',  icon: 'pulse'                    },
-  fades:         { title: 'Fades mid-bow',  icon: 'remove-outline'           },
-  slow_rate:     { title: 'Slow rate',      icon: 'hourglass-outline'        },
-  fast_rate:     { title: 'Fast / tense',   icon: 'flash-outline'            },
-  no_vibrato:    { title: 'No vibrato',     icon: 'radio-button-off-outline' },
+const VIBRATO_FAULT_META: Record<VibratoFault, { title: string; icon: string; tip: string }> = {
+  none:    { title: 'No vibrato',    icon: 'radio-button-off-outline',
+             tip: 'Start with a slow, measured wrist rock — two pulses per beat on a long note — then gradually speed up.' },
+  shallow: { title: 'Shallow depth', icon: 'trending-down',
+             tip: 'Let the fingertip roll further back — practice exaggerated, slow swings, then rein them in.' },
+  wide:    { title: 'Too wide',      icon: 'resize-outline',
+             tip: 'Rein in the swing — keep the roll well inside a semitone and re-center with slow metronome pulses.' },
+  slow:    { title: 'Slow rate',     icon: 'hourglass-outline',
+             tip: 'With a metronome at 60, play 4 pulses per click, then 5, then 6 — building toward 5–6 per second.' },
+  fast:    { title: 'Fast / tense',  icon: 'flash-outline',
+             tip: 'Relax the hand and broaden the motion — a narrow, rapid shake usually means tension.' },
+  uneven:  { title: 'Uneven rhythm', icon: 'pulse',
+             tip: 'Practice rhythmic vibrato: lock the pulse to a subdivision until it feels metronomic, then free it.' },
+  fades:   { title: 'Fades mid-bow', icon: 'remove-outline',
+             tip: 'Keep the wrist moving through the whole bow stroke — especially into and out of bow changes.' },
 };
 
-function classifyFeedbackNote(fb: string): VibratoIssueType | null {
-  if (fb.includes('shallow'))    return 'shallow';
-  if (fb.includes('uneven'))     return 'uneven_rhythm';
-  if (fb.includes('fades'))      return 'fades';
-  if (fb.includes('a bit slow')) return 'slow_rate';
-  if (fb.includes('touch fast')) return 'fast_rate';
-  if (fb.includes('no vibrato')) return 'no_vibrato';
-  return null;
-}
-
-function groupVibratoIssues(notes: VibratoNoteResult[]): VibratoIssueGroup[] {
-  const map = new Map<VibratoIssueType, VibratoIssueGroup>();
+// Each note joins exactly ONE group — its primary fault — so headline counts
+// ("6 of 9 notes") stay honest. Healthy notes join nothing.
+function buildVibratoFaultGroups(notes: VibratoNoteResult[]): VibratoFaultGroup[] {
+  const map = new Map<VibratoFault, VibratoFaultGroup>();
   notes.forEach((note, index) => {
-    const seen = new Set<VibratoIssueType>();
-    for (const fb of note.feedbackNotes) {
-      const type = classifyFeedbackNote(fb);
-      if (type && !seen.has(type)) {
-        seen.add(type);
-        if (!map.has(type)) map.set(type, { type, notes: [] });
-        map.get(type)!.notes.push({ note, index });
-      }
-    }
+    const fault = classifyVibratoFaults(note)[0];
+    if (!fault) return;
+    if (!map.has(fault)) map.set(fault, { fault, notes: [], severity: 0 });
+    const group = map.get(fault)!;
+    group.notes.push({ note, index });
+    group.severity += 100 - note.noteScore;
   });
-  return [...map.values()].sort((a, b) => b.notes.length - a.notes.length);
+  for (const group of map.values()) group.notes.sort((a, b) => a.note.noteScore - b.note.noteScore);
+  return [...map.values()].sort((a, b) => b.severity - a.severity);
 }
 
-function buildVibratoDrawerMessage(issueType: VibratoIssueType, note: VibratoNoteResult): string {
-  switch (issueType) {
+function vibratoHeadline(fault: VibratoFault, count: number, total: number): string {
+  const D = VIBRATO_DISPLAY;
+  switch (fault) {
+    case 'none':    return `Main issue: no vibrato — ${count} of ${total} long notes had none`;
+    case 'shallow': return `Main issue: too shallow — ${count} of ${total} notes under ${D.DEPTH_TARGET_LO}¢ depth`;
+    case 'wide':    return `Main issue: too wide — ${count} of ${total} notes over ${D.DEPTH_TARGET_HI}¢ depth`;
+    case 'slow':    return `Main issue: too slow — ${count} of ${total} notes under ${D.RATE_TARGET_LO} Hz`;
+    case 'fast':    return `Main issue: too fast — ${count} of ${total} notes over ${D.RATE_TARGET_HI} Hz`;
+    case 'uneven':  return `Main issue: uneven rhythm — irregular oscillation on ${count} of ${total} notes`;
+    case 'fades':   return `Main issue: fades mid-note — depth didn't hold on ${count} of ${total} notes`;
+  }
+}
+
+function buildVibratoDrawerMessage(fault: VibratoFault, note: VibratoNoteResult): string {
+  switch (fault) {
     case 'shallow':
       return `Your depth was ±${note.depthCents}¢. The ideal range is 18–40¢ (shown in yellow) — aim for a wider, more relaxed arm swing.`;
-    case 'slow_rate':
+    case 'wide':
+      return `Your depth was ±${note.depthCents}¢ — wider than the 18–40¢ ideal. Keep the roll compact and centered on the pitch.`;
+    case 'slow':
       return `Your rate was ${note.rateHz} Hz. The ideal is 5–7 Hz (shown in yellow) — try a slightly faster wrist impulse.`;
-    case 'fast_rate':
+    case 'fast':
       return `Your rate was ${note.rateHz} Hz. The ideal is 5–7 Hz (shown in yellow) — slow it down by broadening the arm motion.`;
-    case 'uneven_rhythm':
+    case 'uneven':
       return `Your vibrato rhythm was irregular. The yellow line shows what a steady oscillation looks like — focus on an even wrist pulse.`;
     case 'fades':
       return `Your vibrato faded mid-stroke. Aim for the consistent depth shown in yellow throughout the whole bow stroke.`;
-    case 'no_vibrato':
+    case 'none':
       return `No vibrato was detected here. The yellow line shows what a gentle vibrato looks like — try adding a wrist motion on longer notes.`;
     default:
       return '';
@@ -697,7 +701,7 @@ const DRAWER_GRAPH_H = 108;
 function VibratoNoteDrawer({ note, noteIndex, issueType, onClose, onSeek }: {
   note: VibratoNoteResult;
   noteIndex: number;
-  issueType: VibratoIssueType;
+  issueType: VibratoFault;
   onClose: () => void;
   onSeek?: (s: number) => void;
 }) {
@@ -777,13 +781,49 @@ function VibratoNoteDrawer({ note, noteIndex, issueType, onClose, onSeek }: {
   );
 }
 
-function VibratoIssueCard({ group, onNotePress }: {
-  group: VibratoIssueGroup;
+// Horizontal "you vs target" axis: shaded target band + a dot at the session average.
+function TargetStrip({ label, unit, axisMin, axisMax, axisMaxLabel, bandLo, bandHi, value }: {
+  label: string; unit: string;
+  axisMin: number; axisMax: number; axisMaxLabel?: string;
+  bandLo: number; bandHi: number; value: number;
+}) {
+  const pct = (v: number) => ((Math.min(Math.max(v, axisMin), axisMax) - axisMin) / (axisMax - axisMin)) * 100;
+  const inBand = value >= bandLo && value <= bandHi;
+  const dotColor = inBand ? colors.score.excellent : colors.score.needs_attention;
+  const fmt = (v: number) => (Number.isInteger(v) ? `${v}` : v.toFixed(1));
+  return (
+    <View style={s.stripRow}>
+      <View style={s.stripLabelRow}>
+        <Text style={s.stripLabel}>{label}</Text>
+        <Text style={[s.stripValue, { color: dotColor }]}>{fmt(value)} {unit}</Text>
+      </View>
+      <View style={s.stripTrack}>
+        <View style={[s.stripBand, { left: `${pct(bandLo)}%`, width: `${pct(bandHi) - pct(bandLo)}%` }]} />
+        <View style={[s.stripDot, { left: `${pct(value)}%`, backgroundColor: dotColor }]} />
+      </View>
+      <View style={s.stripTicks}>
+        <Text style={s.stripTick}>{fmt(axisMin)}</Text>
+        <Text style={s.stripTick}>target {fmt(bandLo)}–{fmt(bandHi)} {unit}</Text>
+        <Text style={s.stripTick}>{axisMaxLabel ?? fmt(axisMax)}</Text>
+      </View>
+    </View>
+  );
+}
+
+const FIX_SHOW_COUNT = 2;
+
+function VibratoFixGroupCard({ group, onNotePress }: {
+  group: VibratoFaultGroup;
   onNotePress: (note: VibratoNoteResult, noteIndex: number) => void;
 }) {
-  const meta = VIBRATO_ISSUE_META[group.type];
+  const [showAll, setShowAll] = useState(false);
+  const meta = VIBRATO_FAULT_META[group.fault];
+  const avg = Math.round(group.notes.reduce((a, n) => a + n.note.noteScore, 0) / group.notes.length);
+  const accent = scoreColor(avg);
+  const visible = showAll ? group.notes : group.notes.slice(0, FIX_SHOW_COUNT);
+  const hiddenCount = group.notes.length - FIX_SHOW_COUNT;
   return (
-    <View style={s.noteCard}>
+    <View style={[s.noteCard, { borderLeftWidth: 3, borderLeftColor: accent }]}>
       <View style={s.vibratoIssueHeader}>
         <Ionicons name={meta.icon as any} size={20} color="#f59e0b" />
         <Text style={s.vibratoIssueTitle}>{meta.title}</Text>
@@ -791,20 +831,38 @@ function VibratoIssueCard({ group, onNotePress }: {
           <Text style={s.vibratoIssueBadgeText}>{group.notes.length}×</Text>
         </View>
       </View>
+      <Text style={s.rhythmFixTip}>{meta.tip}</Text>
       <View style={s.vibratoIssueNoteList}>
-        {group.notes.map(({ note, index }) => (
+        {visible.map(({ note, index }) => (
           <Pressable
             key={index}
             style={s.vibratoIssueNoteRow}
             onPress={() => { haptic.light(); onNotePress(note, index); }}
           >
+            {note.cents && note.cents.length > 1 && (
+              <Svg width={SPARK_W} height={SPARK_H} style={{ marginRight: spacing.sm }}>
+                <Path
+                  d={buildPath(downsample(note.cents, 48), SPARK_W, SPARK_H)}
+                  stroke={scoreColor(note.noteScore)} strokeWidth={1.5} fill="none"
+                  strokeLinejoin="round" strokeLinecap="round"
+                />
+              </Svg>
+            )}
             <Text style={s.vibratoIssueNoteLabel}>
               Note {index + 1}  ·  {fmtSecs(note.startS)}–{fmtSecs(note.endS)}
             </Text>
-            <Ionicons name="chevron-forward" size={15} color="rgba(255,255,255,0.3)" />
+            <View style={[s.vibratoBadge, { backgroundColor: scoreColor(note.noteScore) }]}>
+              <Text style={s.vibratoBadgeText}>{note.noteScore}</Text>
+            </View>
+            <Ionicons name="chevron-forward" size={15} color="rgba(255,255,255,0.3)" style={{ marginLeft: 4 }} />
           </Pressable>
         ))}
       </View>
+      {!showAll && hiddenCount > 0 && (
+        <Pressable onPress={() => { haptic.light(); setShowAll(true); }} style={s.rhythmShowMoreBtn}>
+          <Text style={s.rhythmShowMoreText}>Show {hiddenCount} more</Text>
+        </Pressable>
+      )}
     </View>
   );
 }
@@ -813,18 +871,46 @@ function VibratoSection({ analysis, onTimestampPress }: {
   analysis: VibratoAnalysis;
   onTimestampPress: (s: number) => void;
 }) {
-  const [drawer, setDrawer] = useState<{ note: VibratoNoteResult; noteIndex: number; issueType: VibratoIssueType } | null>(null);
-  const issueGroups = groupVibratoIssues(analysis.notes);
+  const [drawer, setDrawer] = useState<{ note: VibratoNoteResult; noteIndex: number; fault: VibratoFault } | null>(null);
+  const groups = React.useMemo(() => buildVibratoFaultGroups(analysis.notes), [analysis.notes]);
+  const withVibrato = React.useMemo(() => analysis.notes.filter(hasVibrato), [analysis.notes]);
+  const avgRate = withVibrato.length > 0 ? withVibrato.reduce((a, n) => a + n.rateHz, 0) / withVibrato.length : 0;
+  const avgDepth = withVibrato.length > 0 ? withVibrato.reduce((a, n) => a + n.depthCents, 0) / withVibrato.length : 0;
+  const top = groups[0];
+  const D = VIBRATO_DISPLAY;
   return (
     <>
-      {issueGroups.length > 0 ? (
+      {groups.length > 0 ? (
         <>
-          <Text style={s.vibratoSectionLabel}>Issues to address</Text>
-          {issueGroups.map(group => (
-            <VibratoIssueCard
-              key={group.type}
+          <View style={s.vibratoDiagnosisCard}>
+            <Text style={s.vibratoHeadline}>{vibratoHeadline(top.fault, top.notes.length, analysis.notes.length)}</Text>
+            {withVibrato.length > 0 && (
+              <View style={s.stripsBlock}>
+                <TargetStrip
+                  label="RATE" unit="Hz"
+                  axisMin={D.RATE_AXIS_MIN} axisMax={D.RATE_AXIS_MAX}
+                  bandLo={D.RATE_TARGET_LO} bandHi={D.RATE_TARGET_HI} value={avgRate}
+                />
+                <TargetStrip
+                  label="DEPTH" unit="¢"
+                  axisMin={D.DEPTH_MIN} axisMax={D.DEPTH_TARGET_HI + 8} axisMaxLabel={`${D.DEPTH_TARGET_HI + 8}+`}
+                  bandLo={D.DEPTH_TARGET_LO} bandHi={D.DEPTH_TARGET_HI} value={avgDepth}
+                />
+                <View style={s.stripLegend}>
+                  <View style={s.stripLegendDot} />
+                  <Text style={s.stripLegendText}>you</Text>
+                  <View style={s.stripLegendBand} />
+                  <Text style={s.stripLegendText}>target zone</Text>
+                </View>
+              </View>
+            )}
+          </View>
+          <Text style={s.sectionLabel}>Fix these first</Text>
+          {groups.map(group => (
+            <VibratoFixGroupCard
+              key={group.fault}
               group={group}
-              onNotePress={(note, noteIndex) => setDrawer({ note, noteIndex, issueType: group.type })}
+              onNotePress={(note, noteIndex) => setDrawer({ note, noteIndex, fault: group.fault })}
             />
           ))}
         </>
@@ -839,7 +925,7 @@ function VibratoSection({ analysis, onTimestampPress }: {
           <VibratoNoteDrawer
             note={drawer.note}
             noteIndex={drawer.noteIndex}
-            issueType={drawer.issueType}
+            issueType={drawer.fault}
             onClose={() => setDrawer(null)}
             onSeek={onTimestampPress}
           />
@@ -929,6 +1015,35 @@ function combinedDriftSentence(
   return `Averaged ${tend}, but drifted ${driftDir}`;
 }
 
+// Compact session-level intonation stats shown above the per-note cards.
+function IntonationSummaryHeader({ analysis }: { analysis: IntonationAnalysis }) {
+  if (analysis.totalNoteEvents === 0) return null;
+  const pctInTune = Math.round(analysis.inTuneRate * 100);
+  const tend = analysis.overallTendency;
+  const badgeColor = tend === 'neutral' ? 'rgba(255,255,255,0.15)' : tend === 'sharp' ? '#f97316' : '#3b82f6';
+  const badgeLabel = tend === 'neutral' ? 'Centered' : `${Math.abs(Math.round(analysis.tendencyCents))}¢ ${tend} overall`;
+  return (
+    <View style={s.intoSummaryRow}>
+      <View style={s.rhythmStat}>
+        <Text style={s.rhythmStatValue}>{pctInTune}%</Text>
+        <Text style={s.rhythmStatLabel}>in tune</Text>
+      </View>
+      <View style={[s.tendencyBadge, { backgroundColor: badgeColor }]}>
+        <Text style={s.tendencyBadgeText}>{badgeLabel}</Text>
+      </View>
+      <View style={s.rhythmStat}>
+        <Text style={s.rhythmStatValue}>
+          {analysis.inTuneCount}
+          <Text style={{ fontSize: 14, fontWeight: '600', color: TEXT_MUTED }}>/{analysis.totalNoteEvents}</Text>
+        </Text>
+        <Text style={s.rhythmStatLabel}>notes</Text>
+      </View>
+    </View>
+  );
+}
+
+const INTO_CHART_H = 48;
+
 function CombinedIntonationCard({ issue, videoUri, onSegmentPress, onTune, isPlaying }: {
   issue: CombinedNoteIssue;
   videoUri?: string;
@@ -937,6 +1052,7 @@ function CombinedIntonationCard({ issue, videoUri, onSegmentPress, onTune, isPla
   isPlaying?: boolean;
 }) {
   const { accuracy, stability } = issue;
+  const { width: screenW } = useWindowDimensions();
   const exampleTs = accuracy?.exampleTimestamps?.[0] ?? (stability ? { startSeconds: stability.startS, endSeconds: stability.endS } : null);
 
   const tend = accuracy?.tendency ?? 'mixed';
@@ -947,6 +1063,33 @@ function CombinedIntonationCard({ issue, videoUri, onSegmentPress, onTune, isPla
     ? `${absAvg}¢ ${tend === 'flat' ? 'flat' : tend === 'sharp' ? 'sharp' : 'off pitch'}`
     : null;
   const driftSentence = combinedDriftSentence(accuracy, stability);
+
+  // Mini drift chart: the vibrato-removed center line shows the drift shape.
+  // Range adapts to the data — the fixed ±50¢ vibrato range would flatten
+  // the 9–17¢ drifts that trigger stability flags.
+  const centerCents = stability?.centerCents;
+  const hasChart = (centerCents?.length ?? 0) > 1;
+  const chartW = screenW - 2 * spacing.lg - 2 * spacing.md - 12;
+  let chartEls: React.ReactNode = null;
+  if (hasChart && centerCents) {
+    const range = Math.max(15, Math.max(...centerCents.map(Math.abs)) * 1.2);
+    const centerPath = buildPath(centerCents, chartW, INTO_CHART_H, range);
+    const rawPath = (stability!.cents?.length ?? 0) > 1
+      ? buildPath(downsample(stability!.cents, Math.floor(chartW / 2)), chartW, INTO_CHART_H, range)
+      : '';
+    const cy = 4 + (INTO_CHART_H - 8) / 2;
+    const lineColor = tend === 'mixed' ? colors.score.needs_attention : tendColor;
+    chartEls = (
+      <View style={s.intoChartWrap}>
+        <Svg width={chartW} height={INTO_CHART_H}>
+          <Line x1={0} y1={cy} x2={chartW - 18} y2={cy} stroke="rgba(255,255,255,0.12)" strokeWidth={1} strokeDasharray="4,3" />
+          <SvgText x={chartW - 2} y={cy + 3} fontSize={8} fill="rgba(255,255,255,0.45)" textAnchor="end">0¢</SvgText>
+          {rawPath ? <Path d={rawPath} stroke="rgba(255,255,255,0.18)" strokeWidth={1} fill="none" /> : null}
+          {centerPath ? <Path d={centerPath} stroke={lineColor} strokeWidth={2} fill="none" strokeLinejoin="round" strokeLinecap="round" /> : null}
+        </Svg>
+      </View>
+    );
+  }
 
   return (
     <View style={s.noteCard}>
@@ -960,6 +1103,7 @@ function CombinedIntonationCard({ issue, videoUri, onSegmentPress, onTune, isPla
       {driftSentence && (
         <Text style={s.noteCardStat}>{driftSentence}</Text>
       )}
+      {chartEls}
       <View style={s.noteCardActions}>
         {videoUri && exampleTs && onSegmentPress && (
           <Pressable style={s.seekBtn} onPress={() => { haptic.light(); onSegmentPress(exampleTs.startSeconds, exampleTs.endSeconds ?? exampleTs.startSeconds + 4); }}>
@@ -976,6 +1120,218 @@ function CombinedIntonationCard({ issue, videoUri, onSegmentPress, onTune, isPla
           </Pressable>
         )}
       </View>
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Tone quality card — rendered on the Tone category page
+// ─────────────────────────────────────────────────────────────
+
+const TONE_FAULT_META: Record<Exclude<ToneFault, 'clean'>, { title: string; icon: string }> = {
+  scratch:        { title: 'Scratchy / pressed',      icon: 'alert-circle-outline' },
+  rasp:           { title: 'Grainy / rough',          icon: 'reorder-three-outline' },
+  thin:           { title: 'Thin / airy',             icon: 'cloud-outline' },
+  ponticello:     { title: 'Glassy — near bridge',    icon: 'locate-outline' },
+  tasto:          { title: 'Dull — near fingerboard', icon: 'locate-outline' },
+  whistle:        { title: 'Whistles / squeaks',      icon: 'musical-notes-outline' },
+  onset_scratch:  { title: 'Scratchy starts',         icon: 'play-skip-forward-outline' },
+  delayed_speech: { title: 'Late-speaking notes',     icon: 'hourglass-outline' },
+  decay:          { title: 'Fades at note ends',      icon: 'trending-down-outline' },
+  flicker:        { title: 'Uneven pressure',         icon: 'pulse-outline' },
+};
+
+// Graph shading: red = pressure/noise faults, amber = contact-point/airy, slate = temporal.
+const TONE_EVENT_FILL: Record<string, string> = {
+  scratch: 'rgba(239,68,68,0.16)', rasp: 'rgba(239,68,68,0.16)', whistle: 'rgba(239,68,68,0.16)',
+  thin: 'rgba(245,158,11,0.16)', ponticello: 'rgba(245,158,11,0.16)', tasto: 'rgba(245,158,11,0.16)',
+  onset_scratch: 'rgba(148,163,184,0.14)', delayed_speech: 'rgba(148,163,184,0.14)',
+  decay: 'rgba(148,163,184,0.14)', flicker: 'rgba(148,163,184,0.14)',
+};
+
+interface ToneFaultGroup {
+  fault: Exclude<ToneFault, 'clean'>;
+  spans: { startSeconds: number; endSeconds: number }[]; // chronological
+  coveredSecs: number;
+}
+
+function buildToneFaultGroups(events: TechniqueEvent[]): ToneFaultGroup[] {
+  const map = new Map<string, ToneFaultGroup>();
+  for (const e of events) {
+    const fault = e.type as Exclude<ToneFault, 'clean'>;
+    if (!TONE_FAULT_META[fault]) continue;
+    if (!map.has(fault)) map.set(fault, { fault, spans: [], coveredSecs: 0 });
+    const group = map.get(fault)!;
+    group.spans.push({ startSeconds: e.startSeconds, endSeconds: e.endSeconds });
+    group.coveredSecs += Math.max(0, e.endSeconds - e.startSeconds);
+  }
+  for (const group of map.values()) group.spans.sort((a, b) => a.startSeconds - b.startSeconds);
+  return [...map.values()].sort((a, b) => b.coveredSecs - a.coveredSecs);
+}
+
+const TONE_SPAN_SHOW_COUNT = 2;
+
+function ToneFaultGroupCard({ group, onTimestampPress }: {
+  group: ToneFaultGroup;
+  onTimestampPress?: (s: number) => void;
+}) {
+  const [showAll, setShowAll] = useState(false);
+  const meta = TONE_FAULT_META[group.fault];
+  const copy = TONE_FAULT_COPY[group.fault];
+  const tip = copy.cause.charAt(0).toUpperCase() + copy.cause.slice(1);
+  const visible = showAll ? group.spans : group.spans.slice(0, TONE_SPAN_SHOW_COUNT);
+  const hiddenCount = group.spans.length - TONE_SPAN_SHOW_COUNT;
+  return (
+    <View style={[s.noteCard, { borderLeftWidth: 3, borderLeftColor: colors.score.needs_attention }]}>
+      <View style={s.vibratoIssueHeader}>
+        <Ionicons name={meta.icon as any} size={20} color="#f59e0b" />
+        <Text style={s.vibratoIssueTitle}>{meta.title}</Text>
+        <View style={s.vibratoIssueBadge}>
+          <Text style={s.vibratoIssueBadgeText}>{group.spans.length}×</Text>
+        </View>
+      </View>
+      <Text style={s.rhythmFixTip}>{tip}.</Text>
+      <View style={s.vibratoIssueNoteList}>
+        {visible.map((span, i) => (
+          <Pressable
+            key={i}
+            style={s.vibratoIssueNoteRow}
+            onPress={() => { haptic.light(); onTimestampPress?.(span.startSeconds); }}
+          >
+            <Ionicons name="play" size={13} color="#38bdf8" style={{ marginRight: spacing.sm }} />
+            <Text style={s.vibratoIssueNoteLabel}>
+              {fmtSecs(span.startSeconds)}–{fmtSecs(span.endSeconds)}
+            </Text>
+            <Ionicons name="chevron-forward" size={15} color="rgba(255,255,255,0.3)" />
+          </Pressable>
+        ))}
+      </View>
+      {!showAll && hiddenCount > 0 && (
+        <Pressable onPress={() => { haptic.light(); setShowAll(true); }} style={s.rhythmShowMoreBtn}>
+          <Text style={s.rhythmShowMoreText}>Show {hiddenCount} more</Text>
+        </Pressable>
+      )}
+    </View>
+  );
+}
+
+function ToneCard({ metric, onTimestampPress }: {
+  metric: MetricScore;
+  onTimestampPress?: (s: number) => void;
+}) {
+  const { width: screenW } = useWindowDimensions();
+  const groups = React.useMemo(() => buildToneFaultGroups(metric.events), [metric.events]);
+
+  // History sessions restore only score + flaggedTimestamps (events/summary are
+  // runtime-only) — fall back to the ranked labeled stretches, which do persist.
+  if (metric.observationSummary === '') {
+    if (metric.flaggedTimestamps.length === 0) return null;
+    return (
+      <View style={{ gap: spacing.sm }}>
+        <Text style={s.sectionLabel}>Stretches to review</Text>
+        {metric.flaggedTimestamps.map((ts, i) => (
+          <Pressable
+            key={i}
+            style={[s.rhythmFixCard, { borderLeftColor: colors.score.needs_attention }]}
+            onPress={() => { haptic.light(); onTimestampPress?.(ts.startSeconds); }}
+          >
+            <View style={s.rhythmFixHeader}>
+              <Ionicons name="play-circle" size={15} color={colors.score.needs_attention} />
+              <Text style={[s.rhythmFixTimestamp, { color: colors.score.needs_attention }]}>
+                {fmtSecs(ts.startSeconds)}–{fmtSecs(ts.endSeconds)}
+              </Text>
+            </View>
+            {ts.note ? <Text style={s.rhythmFixTip}>{ts.note}</Text> : null}
+          </Pressable>
+        ))}
+      </View>
+    );
+  }
+
+  const cleanPct = Math.max(0, 100 - Math.round(metric.occurrenceRate * 100));
+  const dominant = groups[0];
+  const badgeColor = dominant ? colors.score.needs_attention : colors.score.excellent;
+  const badgeLabel = dominant ? TONE_FAULT_META[dominant.fault].title : 'Clean';
+  const stretchCount = metric.flaggedTimestamps.length;
+
+  const series = metric.timeSeries;
+  const showGraph = (series?.length ?? 0) >= 2;
+  const W = screenW - 2 * spacing.lg - 2 * spacing.md;
+
+  return (
+    <View style={s.toneCard}>
+      <View style={s.rhythmStatsRow}>
+        <View style={s.rhythmStat}>
+          <Text style={s.rhythmStatValue}>{cleanPct}%</Text>
+          <Text style={s.rhythmStatLabel}>clean tone</Text>
+        </View>
+        <View style={[s.tendencyBadge, { backgroundColor: badgeColor }]}>
+          <Text style={s.tendencyBadgeText}>{badgeLabel}</Text>
+        </View>
+        <View style={s.rhythmStat}>
+          <Text style={s.rhythmStatValue}>{stretchCount}</Text>
+          <Text style={s.rhythmStatLabel}>{stretchCount === 1 ? 'stretch' : 'stretches'}</Text>
+        </View>
+      </View>
+
+      {metric.observationSummary ? <Text style={s.rhythmSummary}>{metric.observationSummary}</Text> : null}
+
+      {groups.length > 0 && (
+        <View style={{ gap: spacing.sm }}>
+          <Text style={s.sectionLabel}>Fix these first</Text>
+          {groups.map(group => (
+            <ToneFaultGroupCard key={group.fault} group={group} onTimestampPress={onTimestampPress} />
+          ))}
+        </View>
+      )}
+
+      {showGraph && (() => {
+        const GH = 120;
+        const PAD_L = 30, PAD_R = 8, PAD_T = 10, PAD_B = 22;
+        const plotW = W - PAD_L - PAD_R;
+        const plotH = GH - PAD_T - PAD_B;
+        const tMin = series![0].t;
+        const tMax = Math.max(series![series!.length - 1].t, tMin + 1);
+        const tx = (t: number) => PAD_L + ((t - tMin) / (tMax - tMin)) * plotW;
+        const ty = (v: number) => PAD_T + (1 - Math.min(Math.max(v, 0), 100) / 100) * plotH;
+        const path = series!
+          .map((p, i) => `${i === 0 ? 'M' : 'L'}${tx(p.t).toFixed(1)},${ty(p.v).toFixed(1)}`)
+          .join(' ');
+        const totalSecs = tMax - tMin;
+        const xStep = totalSecs <= 30 ? 10 : totalSecs <= 90 ? 20 : totalSecs <= 180 ? 30 : 60;
+        const xLabels: number[] = [];
+        for (let t = Math.ceil((tMin + 1) / xStep) * xStep; t <= tMax - 1; t += xStep) xLabels.push(t);
+        return (
+          <View style={{ marginTop: 8 }}>
+            <Text style={{ color: TEXT_MUTED, fontSize: 10, fontWeight: '700', letterSpacing: 0.8, marginBottom: 8 }}>
+              TONE OVER SESSION
+            </Text>
+            <Svg width={W} height={GH}>
+              {[50, 75].map(v => (
+                <React.Fragment key={v}>
+                  <Line x1={PAD_L} y1={ty(v)} x2={W - PAD_R} y2={ty(v)} stroke="#1e293b" strokeWidth={0.75} />
+                  <SvgText x={PAD_L - 4} y={ty(v) + 3.5} fontSize={8} fill="#475569" textAnchor="end">{v}</SvgText>
+                </React.Fragment>
+              ))}
+              {metric.events.map((e, i) => {
+                const x0 = tx(Math.max(e.startSeconds, tMin));
+                const x1 = tx(Math.min(e.endSeconds, tMax));
+                if (x1 <= x0) return null;
+                return (
+                  <Rect key={i} x={x0} y={PAD_T} width={Math.max(2, x1 - x0)} height={plotH}
+                    fill={TONE_EVENT_FILL[e.type] ?? 'rgba(148,163,184,0.12)'} />
+                );
+              })}
+              {xLabels.map(t => (
+                <SvgText key={t} x={tx(t)} y={GH - 4} fontSize={8} fill="#475569" textAnchor="middle">
+                  {fmtSecs(t)}
+                </SvgText>
+              ))}
+              <Path d={path} stroke={colors.brand[300]} strokeWidth={2} fill="none" strokeLinecap="round" strokeLinejoin="round" />
+            </Svg>
+          </View>
+        );
+      })()}
     </View>
   );
 }
@@ -1230,7 +1586,10 @@ function DynDebugPanel({ debug }: { debug: DynDebugInfo }) {
 // Overview page
 // ─────────────────────────────────────────────────────────────
 
-function OverviewPage({ result }: { result: AnalysisResult }) {
+function OverviewPage({ result, onTimestampPress }: {
+  result: AnalysisResult;
+  onTimestampPress?: (s: number) => void;
+}) {
   const { scrollRef, showHint, onLayout, onContentSizeChange, onScroll, scrollToEnd } = useScrollHint();
   const catScores = VISIBLE_CATEGORIES.map(c => ({ ...c, score: avgScore(result.metrics, c.keys) }))
     .sort((a, b) => a.score - b.score);
@@ -1258,6 +1617,21 @@ function OverviewPage({ result }: { result: AnalysisResult }) {
           <Text style={s.overviewTakeText}>{result.llmFeedback.overallTake}</Text>
         </View>
       )}
+
+      {/* Cross-referenced "big picture" — several measured issues tied to one
+          underlying cause, grounded against this session's real issue set. */}
+      {result.llmFeedback?.rootCauses && result.llmFeedback.rootCauses.length > 0 && (
+        <View style={s.rootCausesSection}>
+          <Text style={s.findingsTitle}>WHY THIS IS HAPPENING</Text>
+          {result.llmFeedback.rootCauses.map(cause => (
+            <View key={cause.id} style={s.rootCauseCard}>
+              <Text style={s.rootCauseTitle}>{cause.label}</Text>
+              <Text style={s.rootCauseBody}>{cause.explanation}</Text>
+            </View>
+          ))}
+        </View>
+      )}
+
       <View style={s.overviewCatList}>
         {catScores.map(cat => (
           <View key={cat.id} style={s.overviewCatRow}>
@@ -1291,6 +1665,26 @@ function OverviewPage({ result }: { result: AnalysisResult }) {
               <Text style={s.findingText}>{f.summary}</Text>
             </View>
           ))}
+        </View>
+      )}
+
+      {/* L7, grounded — per-phrase musical notes; tap seeks the video to that phrase. */}
+      {result.llmFeedback?.phraseFeedback && result.llmFeedback.phraseFeedback.length > 0 && (
+        <View style={s.phraseFeedbackSection}>
+          <Text style={s.findingsTitle}>PHRASE NOTES</Text>
+          {result.llmFeedback.phraseFeedback.map(pf => {
+            const phrase = result.phraseFeatures?.find(p => p.id === pf.phraseId);
+            return (
+              <Pressable
+                key={pf.phraseId}
+                style={s.phraseFeedbackRow}
+                onPress={phrase ? () => onTimestampPress?.(phrase.start_t) : undefined}
+              >
+                <Text style={s.phraseFeedbackObs}>{pf.observation}</Text>
+                <Text style={s.phraseFeedbackTip}>{pf.tip}</Text>
+              </Pressable>
+            );
+          })}
         </View>
       )}
     </ScrollView>
@@ -1587,29 +1981,32 @@ const { scrollRef, showHint, onLayout, onContentSizeChange, onScroll, scrollToEn
           ))}
         </View>
 
-        {/* Tone quality: acoustic observation summary */}
+        {/* Tone quality: diagnosis card (stats + fault groups + tone-over-time graph) */}
         {catId === 'tone' && (() => {
           const tq = catMetrics.find(m => m.key === 'toneQuality');
-          if (!tq?.observationSummary) return null;
-          return (
-            <View style={s.observationCard}>
-              <Text style={s.observationText}>{tq.observationSummary}</Text>
-            </View>
-          );
+          if (!tq) return null;
+          return <ToneCard metric={tq} onTimestampPress={onTimestampPress} />;
         })()}
 
-        {/* Bow technique: detector-derived observations */}
+        {/* Bow technique: detector-derived observations + position graph */}
         {catId === 'bow' && (() => {
           const lines = catMetrics
             .filter(m => m.measurementQuality !== 'unavailable' && m.observationSummary && m.key !== 'bowSmoothness')
             .map(m => m.observationSummary);
-          if (lines.length === 0) return null;
+          const bowDist = catMetrics.find(m => m.key === 'bowDistribution');
           return (
-            <View style={s.observationCard}>
-              {lines.map((line, i) => (
-                <Text key={i} style={[s.observationText, i > 0 && { marginTop: 6 }]}>{line}</Text>
-              ))}
-            </View>
+            <>
+              {lines.length > 0 && (
+                <View style={s.observationCard}>
+                  {lines.map((line, i) => (
+                    <Text key={i} style={[s.observationText, i > 0 && { marginTop: 6 }]}>{line}</Text>
+                  ))}
+                </View>
+              )}
+              {bowDist?.timeSeries && (
+                <BowPositionGraph metric={bowDist} onTimestampPress={onTimestampPress} />
+              )}
+            </>
           );
         })()}
 
@@ -1625,26 +2022,30 @@ const { scrollRef, showHint, onLayout, onContentSizeChange, onScroll, scrollToEn
           );
         })()}
 
-        {/* Intonation-specific: combined accuracy + stability note cards */}
+        {/* Intonation-specific: session summary + combined accuracy/stability note cards */}
         {catId === 'intonation' && result.intonationAnalysis && (() => {
           const combined = buildCombinedNoteIssues(
             result.intonationAnalysis.problemNotes,
             result.intonationStabilityAnalysis,
           );
-          if (combined.length === 0) return null;
           return (
             <>
-              <Text style={s.vibratoSectionLabel}>Notes to work on</Text>
-              {combined.map(issue => (
-                <CombinedIntonationCard
-                  key={issue.pitchClass}
-                  issue={issue}
-                  videoUri={result.videoUri}
-                  onSegmentPress={onSegmentPress}
-                  onTune={openTune}
-                  isPlaying={playingNote === issue.pitchClass}
-                />
-              ))}
+              <IntonationSummaryHeader analysis={result.intonationAnalysis} />
+              {combined.length > 0 && (
+                <>
+                  <Text style={s.vibratoSectionLabel}>Notes to work on</Text>
+                  {combined.map(issue => (
+                    <CombinedIntonationCard
+                      key={issue.pitchClass}
+                      issue={issue}
+                      videoUri={result.videoUri}
+                      onSegmentPress={onSegmentPress}
+                      onTune={openTune}
+                      isPlaying={playingNote === issue.pitchClass}
+                    />
+                  ))}
+                </>
+              )}
             </>
           );
         })()}
@@ -1664,8 +2065,8 @@ const { scrollRef, showHint, onLayout, onContentSizeChange, onScroll, scrollToEn
           <RhythmCard analysis={result.rhythmAnalysis} onTimestampPress={onTimestampPress} />
         )}
 
-        {/* Generic timestamp chips (non-intonation/vibrato/rhythm) */}
-        {catId !== 'intonation' && catId !== 'vibrato' && catId !== 'rhythm' && allTimestamps.length > 0 && (
+        {/* Generic timestamp chips (categories without a dedicated rich card) */}
+        {catId !== 'intonation' && catId !== 'vibrato' && catId !== 'rhythm' && catId !== 'tone' && allTimestamps.length > 0 && (
           <View style={s.timestampSection}>
             <Text style={s.vibratoSectionLabel}>Moments to review</Text>
             <View style={s.timestampChips}>
@@ -1752,6 +2153,45 @@ function buildChatReply(userText: string, result: AnalysisResult): string {
   return `Based on your session, I'd focus on ${catScores.slice(0, 2).map(c => c.label).join(' and ')}. Ask me about any specific category, what to practise, or how you're progressing.`;
 }
 
+/**
+ * The free tier's Chat page. Shows the opening line of the coaching the user
+ * would get, then covers it — the highest-intent upsell surface in the app, so
+ * it must look like something is actually behind it rather than be hidden.
+ */
+function ChatPageLocked({ result }: { result: AnalysisResult }) {
+  const teaser =
+    result.llmFeedback?.overallTake ??
+    `I've analysed your session — score ${result.overallScore}/100.`;
+
+  return (
+    <View style={s.chatLockedWrap}>
+      <View style={s.chatLockedPreview} pointerEvents="none">
+        <View style={[s.chatBubble, s.chatBubbleCoach]}>
+          <Text style={[s.chatBubbleText, s.chatBubbleTextCoach]} numberOfLines={3}>
+            {teaser}
+          </Text>
+        </View>
+        <View style={[s.chatBubble, s.chatBubbleCoach, s.chatLockedGhost]} />
+        <View style={[s.chatBubble, s.chatBubbleCoach, s.chatLockedGhostShort]} />
+      </View>
+
+      <View style={s.chatLockedCard}>
+        <View style={s.chatLockedIcon}>
+          <Ionicons name="lock-closed" size={20} color={colors.brand[600]} />
+        </View>
+        <Text style={s.chatLockedTitle}>Unlock AI coaching</Text>
+        <Text style={s.chatLockedBody}>
+          Ask Maestro about this session and get personalised coaching from Claude — why each
+          issue happens, and exactly what to practise next.
+        </Text>
+        <Pressable style={s.chatLockedBtn} onPress={() => router.push('/paywall')}>
+          <Text style={s.chatLockedBtnText}>Start 7-day free trial</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
 function ChatPage({ result }: { result: AnalysisResult }) {
   const [messages, setMessages] = useState<ChatMessage[]>([
     { role: 'coach', text: `I've analysed your session — score ${result.overallScore}/100. Ask me anything about your playing, what to practise, or specific categories.` },
@@ -1805,13 +2245,14 @@ function ChatPage({ result }: { result: AnalysisResult }) {
 
 // PageContent owns the title, video player, and seek state so everything
 // slides naturally with the page.
-function PageContent({ idx, result }: {
-  idx: number; result: AnalysisResult;
+function PageContent({ idx, result, isActive }: {
+  idx: number; result: AnalysisResult; isActive: boolean;
 }) {
   const { top } = useSafeAreaInsets();
   const pageId = PAGES[idx];
   const cat = CATEGORIES.find(c => c.id === pageId);
   const showVideo = !!result.videoUri && pageId !== 'celebration' && pageId !== 'chat';
+  const coachingUnlocked = canUseLlmCoaching(useEntitlementStore((st) => st.entitlement));
 
   const pageTitle =
     pageId === 'celebration' ? 'Results' :
@@ -1860,13 +2301,14 @@ function PageContent({ idx, result }: {
             durationSeconds={result.durationSeconds}
             onMarkerPress={handleTimestampPress}
             onTimeUpdate={handleTimeUpdate}
+            active={isActive}
           />
         </View>
       )}
       {pageId === 'celebration' && <CelebrationPage result={result} />}
-      {pageId === 'overview' && <OverviewPage result={result} />}
+      {pageId === 'overview' && <OverviewPage result={result} onTimestampPress={handleTimestampPress} />}
       {cat && <CategoryPage catId={cat.id} result={result} onTimestampPress={handleTimestampPress} onSegmentPress={handleSegmentPress} playbackSeconds={playbackSeconds} />}
-      {pageId === 'chat' && <ChatPage result={result} />}
+      {pageId === 'chat' && (coachingUnlocked ? <ChatPage result={result} /> : <ChatPageLocked result={result} />)}
     </View>
   );
 }
@@ -1988,10 +2430,13 @@ function useScrollHint() {
 
 export interface ResultsCarouselProps {
   result: AnalysisResult;
+  /** Forward action — opens the post-session curated exercises. */
   onDone: () => void;
+  /** Exit action — leaves the results and returns to the home tab. */
+  onHome: () => void;
 }
 
-export function ResultsCarousel({ result, onDone }: ResultsCarouselProps) {
+export function ResultsCarousel({ result, onDone, onHome }: ResultsCarouselProps) {
   const insets = useSafeAreaInsets();
   const { width: screenW } = useWindowDimensions();
 
@@ -2014,10 +2459,10 @@ export function ResultsCarousel({ result, onDone }: ResultsCarouselProps) {
 
   return (
     <View style={s.root}>
-      {/* Home button — absolutely overlaid top-right, same visual row as the title in each slide */}
+      {/* Home button — absolutely overlaid top-right, exits to the home tab */}
       <Pressable
         style={[s.homeBtn, { position: 'absolute', top: insets.top + 8, right: spacing.lg, zIndex: 20 }]}
-        onPress={() => { haptic.light(); onDone(); }}
+        onPress={() => { haptic.light(); onHome(); }}
       >
         <Ionicons name="home" size={14} color="#fff" />
         <Text style={s.homeBtnText}>Home</Text>
@@ -2039,7 +2484,7 @@ export function ResultsCarousel({ result, onDone }: ResultsCarouselProps) {
         >
           {PAGES.map((_, i) => (
             <View key={i} style={{ width: screenW }}>
-              <PageContent idx={i} result={result} />
+              <PageContent idx={i} result={result} isActive={i === pageIdx} />
             </View>
           ))}
         </ScrollView>
@@ -2059,10 +2504,10 @@ export function ResultsCarousel({ result, onDone }: ResultsCarouselProps) {
           ))}
         </View>
         <NavButton
-          label="Next"
+          label={pageIdx === PAGES.length - 1 ? 'Practice' : 'Next'}
           variant="next"
-          onPress={() => navigateTo(pageIdx + 1)}
-          disabled={pageIdx === PAGES.length - 1}
+          onPress={() => (pageIdx === PAGES.length - 1 ? onDone() : navigateTo(pageIdx + 1))}
+          disabled={false}
         />
       </View>
     </View>
@@ -2182,6 +2627,53 @@ const s = StyleSheet.create({
   celebIssueBody: { fontSize: 12, color: TEXT_SECONDARY, lineHeight: 17 },
   celebSwipeHint: { fontSize: 13, color: TEXT_MUTED, marginTop: spacing.sm },
 
+  // Coach lead (first thing a Pro user reads — see CoachLeadSection)
+  coachLeadCard: {
+    width: '100%',
+    backgroundColor: 'rgba(56,189,248,0.12)',
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: 'rgba(56,189,248,0.28)',
+    padding: spacing.lg,
+    gap: 8,
+  },
+  coachLeadBadge: {
+    fontSize: 10,
+    fontWeight: '900',
+    color: '#38bdf8',
+    letterSpacing: 1.2,
+  },
+  coachLeadTake: { fontSize: 16, fontWeight: '600', color: TEXT_PRIMARY, lineHeight: 23 },
+  coachLeadCause: {
+    marginTop: 4,
+    paddingTop: 10,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: 'rgba(255,255,255,0.15)',
+    gap: 3,
+  },
+  coachLeadCauseLabel: { fontSize: 13, fontWeight: '800', color: TEXT_PRIMARY },
+  coachLeadCauseBody: { fontSize: 13, color: TEXT_SECONDARY, lineHeight: 19 },
+  coachLeadShimmerLine: {
+    width: '90%',
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: 'rgba(255,255,255,0.14)',
+  },
+  coachLeadPendingText: { fontSize: 12, color: TEXT_MUTED, marginTop: 2 },
+  coachTeaserStrip: {
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: CARD_BG,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: CARD_BORDER,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 12,
+  },
+  coachTeaserText: { flex: 1, fontSize: 13, fontWeight: '600', color: TEXT_SECONDARY },
+
   // Overview
   overviewContent: { paddingHorizontal: spacing.lg, paddingBottom: spacing.lg, paddingTop: spacing.md, gap: spacing.md },
   overviewTitle: { fontSize: 26, fontWeight: '900', color: TEXT_PRIMARY, lineHeight: 32 },
@@ -2196,6 +2688,35 @@ const s = StyleSheet.create({
   findingRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 8 },
   findingDot: { width: 8, height: 8, borderRadius: 4, marginTop: 6 },
   findingText: { flex: 1, fontSize: 14, color: TEXT_SECONDARY, lineHeight: 21 },
+
+  // Root causes — the "big picture" cross-referenced narrative, distinct from
+  // the raw L8 findings list above (technical detail stays secondary).
+  rootCausesSection: { gap: 10 },
+  rootCauseCard: {
+    backgroundColor: CARD_BG,
+    borderRadius: 14,
+    borderLeftWidth: 3,
+    borderLeftColor: '#38bdf8',
+    borderWidth: 1,
+    borderColor: CARD_BORDER,
+    padding: spacing.md,
+    gap: 4,
+  },
+  rootCauseTitle: { fontSize: 14, fontWeight: '800', color: TEXT_PRIMARY },
+  rootCauseBody: { fontSize: 13, color: TEXT_SECONDARY, lineHeight: 19 },
+
+  // Phrase feedback (L7, grounded — one row per phrase Claude commented on)
+  phraseFeedbackSection: { gap: 10 },
+  phraseFeedbackRow: {
+    backgroundColor: CARD_BG,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: CARD_BORDER,
+    padding: spacing.md,
+    gap: 3,
+  },
+  phraseFeedbackObs: { fontSize: 13, fontWeight: '700', color: TEXT_PRIMARY },
+  phraseFeedbackTip: { fontSize: 13, color: TEXT_SECONDARY, lineHeight: 19 },
   overviewCatList: { gap: spacing.sm },
   overviewCatRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   overviewCatIcon: { width: 28, alignItems: 'center' },
@@ -2241,6 +2762,9 @@ const s = StyleSheet.create({
   rubatoTitle: { fontSize: 13, fontWeight: '700', color: TEXT_PRIMARY, marginBottom: 4 },
   rubatoText: { fontSize: 12, color: TEXT_SECONDARY, lineHeight: 18 },
 
+  // Tone quality card
+  toneCard: { backgroundColor: 'rgba(56,189,248,0.06)', borderRadius: 14, padding: spacing.md, borderWidth: 1, borderColor: 'rgba(56,189,248,0.2)', gap: spacing.md },
+
   // Volume (dynamics) card
   volumeCard: { backgroundColor: 'rgba(245,158,11,0.06)', borderRadius: 14, padding: spacing.md, borderWidth: 1, borderColor: 'rgba(245,158,11,0.25)', gap: spacing.sm },
   volumeCardHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
@@ -2265,10 +2789,9 @@ const s = StyleSheet.create({
   noteCardName: { fontSize: 40, fontWeight: '900', color: TEXT_PRIMARY, lineHeight: 46 },
   noteCardTend: { fontSize: 15, fontWeight: '700' },
   noteCardStat: { fontSize: 13, color: TEXT_MUTED },
-  noteCardCoaching: { fontSize: 14, color: TEXT_SECONDARY, lineHeight: 20 },
-  devBarBg: { height: 6, backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 3, overflow: 'hidden' },
-  devBarFill: { height: '100%', borderRadius: 3 },
   noteCardActions: { flexDirection: 'row', gap: spacing.sm, flexWrap: 'wrap' },
+  intoSummaryRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-around', backgroundColor: CARD_BG, borderRadius: 12, padding: spacing.md, borderWidth: 1, borderColor: CARD_BORDER },
+  intoChartWrap: { backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 10, padding: 6, overflow: 'hidden' },
 
   // Combined intonation card
   seekBtn: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: radius.full, paddingHorizontal: 12, paddingVertical: 7, borderWidth: 1, borderColor: CARD_BORDER },
@@ -2278,8 +2801,26 @@ const s = StyleSheet.create({
   tuneBtnText: { fontSize: 13, fontWeight: '600', color: TEXT_PRIMARY },
   tuneBtnTextActive: { color: '#fff' },
 
-  // Vibrato section label
+  // Vibrato section label (shared big header — also used on the intonation page)
   vibratoSectionLabel: { fontSize: 22, fontWeight: '900', color: TEXT_PRIMARY, letterSpacing: -0.4 },
+
+  // Vibrato diagnosis card + target strips
+  vibratoDiagnosisCard: { backgroundColor: CARD_BG, borderRadius: 12, padding: spacing.md, borderWidth: 1, borderColor: CARD_BORDER, gap: spacing.md },
+  vibratoHeadline: { fontSize: 15, fontWeight: '600', color: TEXT_PRIMARY, lineHeight: 22 },
+  stripsBlock: { gap: spacing.sm },
+  stripRow: { gap: 4 },
+  stripLabelRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  stripLabel: { fontSize: 10, fontWeight: '700', color: TEXT_MUTED, letterSpacing: 0.8 },
+  stripValue: { fontSize: 13, fontWeight: '800' },
+  stripTrack: { height: 10, borderRadius: 5, backgroundColor: 'rgba(255,255,255,0.1)' },
+  stripBand: { position: 'absolute', top: 0, bottom: 0, borderRadius: 5, backgroundColor: 'rgba(34,197,94,0.25)' },
+  stripDot: { position: 'absolute', top: -1, width: 12, height: 12, borderRadius: 6, marginLeft: -6, borderWidth: 2, borderColor: DARK_BG },
+  stripTicks: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  stripTick: { fontSize: 9, color: TEXT_MUTED, fontWeight: '600' },
+  stripLegend: { flexDirection: 'row', alignItems: 'center', gap: 6, justifyContent: 'center', marginTop: 2 },
+  stripLegendDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: colors.score.excellent },
+  stripLegendBand: { width: 14, height: 8, borderRadius: 3, backgroundColor: 'rgba(34,197,94,0.25)', marginLeft: spacing.sm },
+  stripLegendText: { fontSize: 11, color: TEXT_MUTED, fontWeight: '600' },
 
   // Vibrato issue cards
   vibratoIssueHeader: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
@@ -2304,18 +2845,9 @@ const s = StyleSheet.create({
   vibratoDrawerMessage: { fontSize: 14, color: colors.text.secondary, lineHeight: 21, textAlign: 'center', paddingHorizontal: spacing.sm },
   vibratoDrawerActions: { gap: spacing.sm, alignItems: 'center', width: '100%' },
 
-  // Vibrato note cards (kept for reference)
-  vibratoHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  vibratoTime: { fontSize: 14, fontWeight: '700', color: TEXT_PRIMARY },
+  // Per-note score badge (fix-card rows)
   vibratoBadge: { borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3 },
   vibratoBadgeText: { fontSize: 13, fontWeight: '800', color: '#fff' },
-  vibratoStats: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  vibratoStat: { fontSize: 13, fontWeight: '600', color: TEXT_SECONDARY },
-  vibratoStatSep: { fontSize: 13, color: TEXT_MUTED },
-  vibratoGraph: { backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 10, padding: 6, overflow: 'hidden' },
-  feedbackTags: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.xs },
-  feedbackTag: { backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 },
-  feedbackTagText: { fontSize: 11, color: TEXT_SECONDARY, fontWeight: '500' },
 
   // Chat
   chatScroll: { flex: 1 },
@@ -2323,6 +2855,40 @@ const s = StyleSheet.create({
   chatSuggestions: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm, marginBottom: spacing.sm },
   chatChip: { backgroundColor: CARD_BG, borderRadius: radius.full, paddingHorizontal: 14, paddingVertical: 8, borderWidth: 1.5, borderColor: CARD_BORDER },
   chatChipText: { fontSize: 13, fontWeight: '600', color: TEXT_SECONDARY },
+  // Locked chat (free tier)
+  chatLockedWrap: { flex: 1, padding: spacing.md },
+  chatLockedPreview: { gap: spacing.sm, opacity: 0.35 },
+  chatLockedGhost: { height: 46, width: '78%', backgroundColor: CARD_BG },
+  chatLockedGhostShort: { height: 46, width: '55%', backgroundColor: CARD_BG },
+  chatLockedCard: {
+    marginTop: spacing.lg,
+    alignItems: 'center',
+    gap: spacing.sm,
+    padding: spacing.lg,
+    borderRadius: radius.lg,
+    backgroundColor: CARD_BG,
+    borderWidth: 1,
+    borderColor: CARD_BORDER,
+  },
+  chatLockedIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: colors.brand[50],
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  chatLockedTitle: { fontSize: 17, fontWeight: '800', color: colors.text.primary },
+  chatLockedBody: { fontSize: 13, lineHeight: 19, color: colors.text.muted, textAlign: 'center' },
+  chatLockedBtn: {
+    marginTop: spacing.xs,
+    backgroundColor: colors.brand[600],
+    borderRadius: radius.md,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: 12,
+  },
+  chatLockedBtnText: { color: '#fff', fontWeight: '700', fontSize: 14 },
+
   chatBubble: { maxWidth: '85%', borderRadius: 16, paddingHorizontal: 14, paddingVertical: 10 },
   chatBubbleCoach: { alignSelf: 'flex-start', backgroundColor: CARD_BG, borderWidth: 1, borderColor: CARD_BORDER },
   chatBubbleUser: { alignSelf: 'flex-end', backgroundColor: colors.brand[600] },

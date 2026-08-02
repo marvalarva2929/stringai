@@ -16,12 +16,13 @@ import { useAuthStore } from '../../src/store/useAuthStore';
 import { useUserStore } from '../../src/store/useUserStore';
 import { useAnalysisStore } from '../../src/store/useAnalysisStore';
 import { TunerModal } from '../../src/components/tuner/TunerModal';
+import { ScoreGauge } from '../../src/components/ui/ScoreGauge';
 import { WeeklyGoalCard } from '../../src/components/home/WeeklyGoalCard';
 import { minutesPracticedThisWeek } from '../../src/lib/weeklyGoal';
 import { useDailyPracticePlan } from '../../src/hooks/useDailyPracticePlan';
-import { metricLabel, metricIcon } from '../../src/lib/practicePlan';
 import { haptic } from '../../src/lib/haptics';
 import { colors, spacing, radius } from '../../src/constants/theme';
+import { severityFromScore } from '../../src/types/analysis';
 
 const PLAN_DEPTH = 6;
 
@@ -54,17 +55,20 @@ export default function HomeScreen() {
     [sessionHistory],
   );
 
-  // Real "focus areas" derived from analysis — replaces the old hardcoded list.
-  const focusAreas = useMemo(
-    () => dailyPlan.weakAreas.map((w) => ({
-      metricKey: w.metricKey,
-      label: metricLabel(w.metricKey),
-      icon: metricIcon(w.metricKey),
-      count: w.exercises.length,
-      avgScore: Math.round(w.avgScore),
-    })),
-    [dailyPlan.weakAreas],
-  );
+  // One card per piece — the most recent session of each.
+  const recentSessions = useMemo(() => {
+    const latestByPiece = new Map<string | null, typeof sessionHistory[number]>();
+    for (const session of sessionHistory) {
+      const key = session.piece?.id ?? null;
+      const existing = latestByPiece.get(key);
+      if (!existing || session.recordedAt.localeCompare(existing.recordedAt) > 0) {
+        latestByPiece.set(key, session);
+      }
+    }
+    return [...latestByPiece.values()]
+      .sort((a, b) => b.recordedAt.localeCompare(a.recordedAt))
+      .slice(0, 10);
+  }, [sessionHistory]);
 
   const stats = useMemo(() => {
     if (sessionHistory.length === 0) return null;
@@ -87,6 +91,12 @@ export default function HomeScreen() {
   const planOffset = useSharedValue(0);
   const planSurfaceStyle = useAnimatedStyle(() => ({
     transform: [{ translateY: planOffset.value }],
+  }));
+
+  // Record button depth animation — same mechanic as the plan card above.
+  const recordOffset = useSharedValue(0);
+  const recordSurfaceStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: recordOffset.value }],
   }));
 
   return (
@@ -171,15 +181,31 @@ export default function HomeScreen() {
           <Animated.View style={[s.planCardSurface, planSurfaceStyle]}>
             <View style={s.planCardRow}>
               <View style={s.planCardTextWrap}>
-                <Text style={s.planCardTitle}>Daily Practice Plan</Text>
+                <Text style={s.planCardTitle}>Daily Warm-Up</Text>
                 <Text style={s.planCardSub}>{dailyPlan.primaryFocus}</Text>
               </View>
               <FontAwesome6 name="bullseye" size={40} color="rgba(255,255,255,0.9)" />
             </View>
             <View style={s.planCardMeta}>
-              <Text style={s.planCardMetaText}>{dailyPlan.blocks.length} blocks  ·  ~{dailyPlan.durationMinutes} min</Text>
+              <Text style={s.planCardMetaText}>{dailyPlan.blocks.length} exercises  ·  ~{dailyPlan.durationMinutes} min</Text>
               <Text style={s.planCardStart}>Start →</Text>
             </View>
+          </Animated.View>
+        </Pressable>
+
+        {/* ── Record session button ────────────────────── */}
+        <Pressable
+          onPressIn={() => { recordOffset.value = PLAN_DEPTH; haptic.medium(); }}
+          onPressOut={() => { recordOffset.value = 0; }}
+          onPress={() => router.push('/(tabs)/analyze')}
+          style={s.recordButtonOuter}
+        >
+          <View style={s.recordButtonBase} />
+          <Animated.View style={[s.recordButtonSurface, recordSurfaceStyle]}>
+            <FontAwesome6 name="microphone" size={16} color="#fff" />
+            <Text style={s.recordButtonText}>
+              {sessionHistory.length === 0 ? 'Record First Session' : 'Record New Session'}
+            </Text>
           </Animated.View>
         </Pressable>
 
@@ -190,30 +216,36 @@ export default function HomeScreen() {
           onPress={() => router.push('/goal')}
         />
 
-        {/* ── Focus areas (real, from analysis) ────────── */}
-        {focusAreas.length > 0 && (
+        {/* ── Continue recent sessions ─────────────────── */}
+        {recentSessions.length > 0 && (
           <>
-            <Text style={s.orLabel}>Focus areas from your recent sessions</Text>
-            <View style={s.categoryBlock}>
-              {focusAreas.map((area, i) => (
-                <View key={area.metricKey}>
-                  {i > 0 && <View style={s.divider} />}
-                  <Pressable
-                    style={({ pressed }) => [s.categoryRow, pressed && s.categoryRowPressed]}
-                    onPress={() => { haptic.light(); router.push('/(tabs)/train'); }}
-                  >
-                    <View style={s.categoryIconWrap}>
-                      <Text style={s.categoryEmoji}>{area.icon}</Text>
-                    </View>
-                    <View style={s.categoryText}>
-                      <Text style={s.categoryLabel}>{area.label}</Text>
-                      <Text style={s.categorySub}>{area.count} drills · scoring {area.avgScore}</Text>
-                    </View>
-                    <Text style={s.categoryArrow}>›</Text>
-                  </Pressable>
-                </View>
+            <Text style={s.orLabel}>Continue recent sessions</Text>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={s.sessionRow}
+            >
+              {recentSessions.map((session) => (
+                <Pressable
+                  key={session.id}
+                  style={({ pressed }) => [s.sessionCard, pressed && s.sessionCardPressed]}
+                  onPress={() => { haptic.light(); router.push(`/session/${session.id}`); }}
+                >
+                  <ScoreGauge
+                    score={Math.round(session.overallScore)}
+                    severity={severityFromScore(session.overallScore)}
+                    size="sm"
+                    showLabel={false}
+                  />
+                  <Text style={s.sessionDate}>
+                    {new Date(session.recordedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                  </Text>
+                  <Text style={s.sessionSub} numberOfLines={1}>
+                    {session.piece?.title ?? 'General Practice'}
+                  </Text>
+                </Pressable>
               ))}
-            </View>
+            </ScrollView>
           </>
         )}
       </ScrollView>
@@ -380,16 +412,20 @@ const s = StyleSheet.create({
     color: '#fff',
   },
 
-  // Pinned piece card
+  // Pinned piece card — same bordered/pressed popout edge as WeeklyGoalCard
+  // and the pillLight buttons above, so every card on this screen reads as
+  // one consistent "button" language.
   pieceCard: {
-    backgroundColor: colors.brand[50],
-    borderRadius: radius.xl,
+    backgroundColor: '#fff',
+    borderRadius: 16,
     borderWidth: 1.5,
-    borderColor: colors.brand[100],
+    borderColor: '#e5e7eb',
+    borderBottomWidth: 4,
+    borderBottomColor: '#d1d5db',
     padding: spacing.md,
     gap: 4,
   },
-  pieceCardPressed: { opacity: 0.85 },
+  pieceCardPressed: { backgroundColor: '#f9fafb' },
   pieceCardTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   pieceBadge: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   pieceBadgeText: {
@@ -404,6 +440,37 @@ const s = StyleSheet.create({
   pieceGoals: { fontSize: 13, fontStyle: 'italic', color: colors.text.secondary, marginTop: 6 },
   pieceCta: { fontSize: 14, fontWeight: '800', color: colors.brand[700], marginTop: spacing.sm },
 
+  // Record session button — same depth effect (base + animated surface) as
+  // the plan card above, just sized for a single-row button.
+  recordButtonOuter: {
+    height: 56 + PLAN_DEPTH,
+    borderRadius: 22,
+    marginTop: -spacing.lg / 2,
+  },
+  recordButtonBase: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    height: 56,
+    borderRadius: 22,
+    backgroundColor: colors.brand[800],
+  },
+  recordButtonSurface: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    height: 56,
+    borderRadius: 22,
+    backgroundColor: colors.brand[600],
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.sm,
+  },
+  recordButtonText: { fontSize: 15, fontWeight: '800', color: '#fff' },
+
   // Or label
   orLabel: {
     fontSize: 13,
@@ -413,45 +480,34 @@ const s = StyleSheet.create({
     marginVertical: -spacing.sm,
   },
 
-  // Category list
-  categoryBlock: {
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: '#e5e7eb',
-    borderRadius: radius.xl,
-    overflow: 'hidden',
-    backgroundColor: '#fff',
-  },
-  divider: {
-    height: StyleSheet.hairlineWidth,
-    backgroundColor: '#e5e7eb',
-    marginLeft: 56,
-  },
-  categoryRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: spacing.md,
-    paddingHorizontal: spacing.md,
+  // Recent session cards (square, horizontally scrollable, popout style)
+  sessionRow: {
     gap: spacing.sm,
+    paddingRight: spacing.lg,
   },
-  categoryRowPressed: {
-    backgroundColor: '#f9fafb',
+  sessionCard: {
+    width: 108,
+    height: 108,
+    backgroundColor: '#fff',
+    borderRadius: 16,
+    borderWidth: 1.5,
+    borderColor: '#e5e7eb',
+    borderBottomWidth: 4,
+    borderBottomColor: '#d1d5db',
+    padding: spacing.sm,
+    alignItems: 'center',
+    justifyContent: 'space-between',
   },
-  categoryIconWrap: { width: 32, alignItems: 'center' },
-  categoryEmoji: { fontSize: 20 },
-  categoryText: { flex: 1 },
-  categoryLabel: {
-    fontSize: 15,
+  sessionCardPressed: { backgroundColor: '#f9fafb' },
+  sessionDate: {
+    fontSize: 11,
     fontWeight: '700',
-    color: colors.text.primary,
-    marginBottom: 2,
-  },
-  categorySub: {
-    fontSize: 12,
     color: colors.text.muted,
   },
-  categoryArrow: {
-    fontSize: 20,
-    color: colors.text.muted,
-    fontWeight: '300',
+  sessionSub: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: colors.text.secondary,
+    textAlign: 'center',
   },
 });

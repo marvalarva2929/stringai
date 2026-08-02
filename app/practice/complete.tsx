@@ -14,7 +14,8 @@ import { colors, spacing, radius } from '../../src/constants/theme';
 
 export default function PracticeCompleteScreen() {
   const params = useLocalSearchParams<{ sessionId?: string; pieceId?: string }>();
-  const plan = usePracticePlan(scopeFromParams(params));
+  const scope = scopeFromParams(params);
+  const plan = usePracticePlan(scope);
   const completedByPlan = usePracticeProgressStore((st) => st.completedByPlan);
 
   const doneCount = useMemo(() => {
@@ -27,8 +28,16 @@ export default function PracticeCompleteScreen() {
       <View style={s.body}>
         <MaestroAvatar size="lg" bounce message="That's a wrap — you showed up and did the work." />
 
-        <Text style={s.title}>Session complete</Text>
-        <Text style={s.sub}>You worked through today's recommended path.</Text>
+        <Text style={s.title}>
+          {scope.kind === 'session' ? 'Practice session complete' : 'Warm-up complete'}
+        </Text>
+        <Text style={s.sub}>
+          {scope.kind === 'session'
+            ? 'Great work — record again to hear the difference.'
+            : scope.kind === 'piece'
+              ? "You're warmed up — go play your piece."
+              : "You finished today's warm-up."}
+        </Text>
 
         <View style={s.statRow}>
           <View style={s.statCard}>
@@ -45,8 +54,25 @@ export default function PracticeCompleteScreen() {
       </View>
 
       <View style={s.bottomBar}>
-        <DepthButton label="Back to path" icon="arrow-forward" onPress={() => router.replace('/(tabs)/train')} />
-        <DepthButton label="Done for today" icon="home" variant="neutral" onPress={() => router.replace('/(tabs)/home')} />
+        {scope.kind === 'session' ? (
+          <DepthButton label="Record again" icon="videocam" onPress={() => router.replace('/(tabs)/analyze')} />
+        ) : (
+          <DepthButton label="Done" icon="home" onPress={() => router.replace('/(tabs)/home')} />
+        )}
+        {scope.kind === 'session' ? (
+          <DepthButton label="Done" icon="home" variant="neutral" onPress={() => router.replace('/(tabs)/home')} />
+        ) : (
+          <DepthButton
+            label="Back to warm-up"
+            icon="arrow-back"
+            variant="neutral"
+            onPress={() =>
+              scope.kind === 'daily'
+                ? router.replace('/(tabs)/train')
+                : router.replace({ pathname: '/practice/plan', params })
+            }
+          />
+        )}
       </View>
     </SafeAreaView>
   );

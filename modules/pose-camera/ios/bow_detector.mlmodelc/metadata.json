@@ -1,50 +1,61 @@
 [
   {
-    "shortDescription" : "Ultralytics YOLOv8s-pose model trained on \/Users\/joshv\/Projects\/stringai\/ml\/data.yaml",
     "metadataOutputVersion" : "3.0",
+    "storagePrecision" : "Mixed (Float16, Palettized (8 bits))",
     "outputSchema" : [
       {
-        "hasShapeFlexibility" : "0",
-        "isOptional" : "0",
         "dataType" : "Float32",
-        "formattedType" : "MultiArray (Float32 1 × 14 × 8400)",
-        "shortDescription" : "",
-        "shape" : "[1, 14, 8400]",
-        "name" : "var_1031",
-        "type" : "MultiArray"
+        "hasShapeFlexibility" : "1",
+        "isOptional" : "0",
+        "shapeFlexibility" : "0... × 80",
+        "shapeRange" : "[[0, -1], [80, 80]]",
+        "formattedType" : "MultiArray (Float32 0 × 80)",
+        "type" : "MultiArray",
+        "shape" : "[0, 80]",
+        "name" : "confidence",
+        "shortDescription" : "Boxes × Class confidence (see user-defined metadata \"classes\")"
+      },
+      {
+        "dataType" : "Float32",
+        "hasShapeFlexibility" : "1",
+        "isOptional" : "0",
+        "shapeFlexibility" : "0... × 4",
+        "shapeRange" : "[[0, -1], [4, 4]]",
+        "formattedType" : "MultiArray (Float32 0 × 4)",
+        "type" : "MultiArray",
+        "shape" : "[0, 4]",
+        "name" : "coordinates",
+        "shortDescription" : "Boxes × [x, y, width, height] (relative to image size)"
       }
     ],
-    "version" : "8.4.71",
     "modelParameters" : [
 
     ],
-    "author" : "Ultralytics",
     "specificationVersion" : 7,
-    "storagePrecision" : "Mixed (Float16, Palettized (8 bits))",
-    "license" : "AGPL-3.0 License (https:\/\/ultralytics.com\/license)",
     "mlProgramOperationTypeHistogram" : {
-      "Concat" : 19,
-      "Ios16.cast" : 2,
-      "Ios16.mul" : 5,
-      "SliceByIndex" : 2,
-      "Ios16.constexprLutToDense" : 69,
-      "Transpose" : 1,
+      "Ios16.silu" : 56,
+      "Concat" : 17,
+      "Ios16.cast" : 3,
+      "Ios16.mul" : 4,
+      "SliceByIndex" : 1,
+      "Ios16.constexprLutToDense" : 61,
+      "Transpose" : 2,
       "Ios16.sub" : 2,
       "Ios16.maxPool" : 3,
       "UpsampleNearestNeighbor" : 2,
-      "Ios16.conv" : 73,
-      "Ios16.add" : 9,
-      "Ios16.sigmoid" : 2,
+      "Ios16.conv" : 64,
+      "Ios16.add" : 8,
+      "Ios16.sigmoid" : 1,
       "Ios16.softmax" : 1,
-      "Split" : 9,
-      "Ios16.reshape" : 13,
-      "Ios16.silu" : 62
+      "Split" : 10,
+      "Ios16.reshape" : 8,
+      "Pad" : 1
     },
     "computePrecision" : "Mixed (Float16, Float32, Int32)",
+    "isUpdatable" : "0",
     "stateSchema" : [
 
     ],
-    "isUpdatable" : "0",
     "availability" : {
       "macOS" : "13.0",
       "tvOS" : "16.0",
@@ -54,7 +65,15 @@
       "macCatalyst" : "16.0"
     },
     "modelType" : {
-      "name" : "MLModelType_mlProgram"
+      "name" : "MLModelType_pipeline",
+      "structure" : [
+        {
+          "name" : "MLModelType_mlProgram"
+        },
+        {
+          "name" : "MLModelType_nonMaximumSuppression"
+        }
+      ]
     },
     "inputSchema" : [
       {
@@ -66,29 +85,111 @@
         "formattedType" : "Image (Color 640 × 640)",
         "hasSizeFlexibility" : "0",
         "type" : "Image",
-        "shortDescription" : "",
+        "shortDescription" : "Input image",
         "name" : "image"
+      },
+      {
+        "isOptional" : "0",
+        "formattedType" : "Double",
+        "type" : "Double",
+        "name" : "iouThreshold",
+        "shortDescription" : "(optional) IoU threshold override (default: 0.7)"
+      },
+      {
+        "isOptional" : "0",
+        "formattedType" : "Double",
+        "type" : "Double",
+        "name" : "confidenceThreshold",
+        "shortDescription" : "(optional) Confidence threshold override (default: 0.02)"
       }
     ],
-    "userDefinedMetadata" : {
-      "batch" : "1",
-      "docs" : "https:\/\/docs.ultralytics.com",
-      "com.github.apple.coremltools.version" : "9.0",
-      "imgsz" : "[640, 640]",
-      "kpt_names" : "{0: ['0', '1', '2']}",
-      "names" : "{0: 'bow'}",
-      "channels" : "3",
-      "com.github.apple.coremltools.conversion_date" : "2026-06-25",
-      "stride" : "32",
-      "date" : "2026-06-25T13:04:22.780367",
-      "args" : "{'batch': 1, 'half': False, 'int8': True, 'dynamic': False, 'nms': True}",
-      "com.github.apple.coremltools.source_dialect" : "TorchScript",
-      "com.github.apple.coremltools.source" : "torch==2.8.0",
-      "kpt_shape" : "[3, 3]",
-      "task" : "pose",
-      "end2end" : "False"
-    },
+    "classLabels" : [
+      "bow",
+      "violin",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9",
+      "10",
+      "11",
+      "12",
+      "13",
+      "14",
+      "15",
+      "16",
+      "17",
+      "18",
+      "19",
+      "20",
+      "21",
+      "22",
+      "23",
+      "24",
+      "25",
+      "26",
+      "27",
+      "28",
+      "29",
+      "30",
+      "31",
+      "32",
+      "33",
+      "34",
+      "35",
+      "36",
+      "37",
+      "38",
+      "39",
+      "40",
+      "41",
+      "42",
+      "43",
+      "44",
+      "45",
+      "46",
+      "47",
+      "48",
+      "49",
+      "50",
+      "51",
+      "52",
+      "53",
+      "54",
+      "55",
+      "56",
+      "57",
+      "58",
+      "59",
+      "60",
+      "61",
+      "62",
+      "63",
+      "64",
+      "65",
+      "66",
+      "67",
+      "68",
+      "69",
+      "70",
+      "71",
+      "72",
+      "73",
+      "74",
+      "75",
+      "76",
+      "77",
+      "78",
+      "79"
+    ],
     "generatedClassName" : "bow_detector",
+    "userDefinedMetadata" : {
+      "IoU threshold" : "0.7",
+      "Confidence threshold" : "0.02"
+    },
     "method" : "predict"
   }
 ]

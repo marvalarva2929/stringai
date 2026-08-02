@@ -66,9 +66,12 @@ export default function PieceDetailScreen() {
     [sessionHistory, id, isGeneral],
   );
 
-  const piece = isGeneral
-    ? { title: 'General Practice', composer: undefined }
-    : sessions[0]?.piece;
+  // Non-general: the filter above guarantees every session carries this piece,
+  // so sessions[0].piece is present whenever sessions is non-empty. The fallback
+  // only covers the empty case, which renders the empty state below anyway.
+  const piece: { title: string; composer?: string } = isGeneral
+    ? { title: 'General Practice' }
+    : sessions[0]?.piece ?? { title: 'This piece' };
   const scores = sessions.map((s) => s.overallScore);
   const avgScore = scores.length
     ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length)

@@ -141,7 +141,7 @@ export default function MetricDetailScreen() {
         <View style={styles.drillCard}>
           <Text style={styles.drillText}>{meta.drill}</Text>
           <Pressable
-            onPress={() => router.push({ pathname: '/tips', params: { focusMetric: metricKey } })}
+            onPress={() => router.push('/(tabs)/train')}
             style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
           >
             <Text style={styles.drillCTA}>Browse exercises for {meta.label} →</Text>

@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { View, Pressable, StyleSheet, Text, Alert } from 'react-native';
-import * as FileSystem from 'expo-file-system';
+import { File } from 'expo-file-system';
 import { MetricScore } from '../../types/analysis';
 import { colors, spacing } from '../../constants/theme';
 import { VideoReplayModal } from './VideoReplayModal';
@@ -33,8 +33,7 @@ export function AnalysisTimeline({ durationSeconds, metrics, videoUri, onSegment
     // Standalone mode: open internal VideoReplayModal
     if (!videoUri) return;
     if (!videoUri.startsWith('ph://')) {
-      const info = await FileSystem.getInfoAsync(videoUri);
-      if (!info.exists) {
+      if (!new File(videoUri).exists) {
         Alert.alert('Video unavailable', 'The recording file is no longer on this device.');
         return;
       }

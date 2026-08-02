@@ -1,4 +1,5 @@
 import type { CoachIntensity, PracticeBlock, PracticeBlockType, LiveSignal } from './practiceBlocks';
+import { pitchClassInfo, noteNameToMidi } from './pitchNaming';
 
 // Ionicons names used across practice UI. Kept as a local union so this copy
 // module stays free of any UI-library imports.
@@ -23,16 +24,30 @@ export interface RunnerStep {
   icon: IoniconName;
 }
 
-/** One-line description of the concrete musical target of a block. */
+/**
+ * One-line description of the concrete musical target of a block. When a MIDI
+ * note is resolvable, uses the real fingering prose ("B3, 2nd finger on G
+ * string") from referenceNote.ts instead of just the bare note name.
+ */
 export function targetLine(block: PracticeBlock): string {
-  const parts: string[] = [];
-  if (block.target.noteName || block.target.pitchClass) {
-    parts.push(block.target.noteName ?? block.target.pitchClass!);
+  const { target } = block;
+  const midi = target.midiNote ?? (target.noteName ? noteNameToMidi(target.noteName) : null);
+
+  if (midi != null) {
+    const parts = [pitchClassInfo(target.pitchClass ?? target.noteName ?? '', midi).description];
+    if (target.scaleName) parts.push(target.scaleName);
+    if (target.tendency) parts.push(target.tendency);
+    return parts.join(' · ');
   }
-  if (block.target.string) parts.push(`${block.target.string} string`);
-  if (block.target.finger != null) parts.push(`finger ${block.target.finger === 0 ? 'open' : block.target.finger}`);
-  if (block.target.scaleName) parts.push(block.target.scaleName);
-  if (block.target.tendency) parts.push(block.target.tendency);
+
+  const parts: string[] = [];
+  if (target.noteName || target.pitchClass) {
+    parts.push(target.noteName ?? target.pitchClass!);
+  }
+  if (target.string) parts.push(`${target.string} string`);
+  if (target.finger != null) parts.push(`finger ${target.finger === 0 ? 'open' : target.finger}`);
+  if (target.scaleName) parts.push(target.scaleName);
+  if (target.tendency) parts.push(target.tendency);
   return parts.length > 0 ? parts.join(' · ') : block.title;
 }
 

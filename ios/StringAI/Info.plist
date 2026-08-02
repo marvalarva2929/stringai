@@ -4,6 +4,8 @@
 <dict>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
@@ -47,8 +49,6 @@
 	</dict>
 	<key>NSCameraUsageDescription</key>
 	<string>StringAI needs camera access to analyze your playing posture and bow technique.</string>
-	<key>NSFaceIDUsageDescription</key>
-	<string>Allow $(PRODUCT_NAME) to access your Face ID biometric data.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>StringAI needs microphone access to analyze your intonation, tone quality, and rhythm.</string>
 	<key>NSPhotoLibraryUsageDescription</key>

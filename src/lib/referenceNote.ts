@@ -6,63 +6,9 @@
  */
 
 import { File, Paths } from 'expo-file-system';
+import { PITCH_CLASS_MIDI, midiToFreq } from './pitchNaming';
 
-// Default MIDI note per pitch class when no specific octave is known
-const PITCH_CLASS_MIDI: Record<string, number> = {
-  'C':  72, // C5
-  'C#': 73,
-  'D':  62, // D4  (open D)
-  'D#': 63,
-  'E':  76, // E5  (open E)
-  'F':  77,
-  'F#': 66, // F#4 (D string)
-  'G':  55, // G3  (open G)
-  'G#': 56,
-  'A':  69, // A4  (open A)
-  'A#': 70,
-  'B':  71, // B4
-};
-
-// Human-readable violin position descriptions keyed by MIDI note
-const MIDI_DESCRIPTIONS: Record<number, string> = {
-  55: 'Open G string',
-  56: 'G#3 · G string',
-  57: 'A3 · G string, 1st finger',
-  58: 'Bb3 · G string',
-  59: 'B3 · G string, 2nd finger',
-  60: 'C4 · G string, 3rd finger',
-  61: 'C#4 · G string',
-  62: 'Open D string',
-  63: 'Eb4 · D string',
-  64: 'E4 · D string, 1st finger',
-  65: 'F4 · D string',
-  66: 'F#4 · D string, 2nd finger',
-  67: 'G4 · D string, 3rd finger',
-  68: 'G#4 · D string',
-  69: 'Open A string · Concert A',
-  70: 'Bb4 · A string',
-  71: 'B4 · A string, 1st finger',
-  72: 'C5 · A string, 2nd finger',
-  73: 'C#5 · A string',
-  74: 'D5 · A string, 3rd finger',
-  75: 'Eb5 · A string',
-  76: 'Open E string',
-  77: 'F5 · E string',
-  78: 'F#5 · E string, 1st finger',
-  79: 'G5 · E string, 2nd finger',
-  80: 'G#5 · E string',
-  81: 'A5 · E string, 3rd finger',
-};
-
-function midiToFreq(midi: number): number {
-  return 440 * Math.pow(2, (midi - 69) / 12);
-}
-
-function midiToNoteName(midi: number): string {
-  const names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-  const octave = Math.floor(midi / 12) - 1;
-  return `${names[((midi % 12) + 12) % 12]}${octave}`;
-}
+export { pitchClassInfo, noteNameToMidi } from './pitchNaming';
 
 function buildWav(frequency: number): Uint8Array {
   const SR = 22050;
@@ -107,11 +53,4 @@ export async function getReferenceNoteUri(pitchClass: string, midiNote?: number)
   const file = new File(Paths.cache, `ref_${safe}${octave}.wav`);
   await file.write(wav);
   return file.uri;
-}
-
-export function pitchClassInfo(pitchClass: string, midiNote?: number): { freq: number; description: string } {
-  const midi = midiNote ?? (PITCH_CLASS_MIDI[pitchClass] ?? 69);
-  const freq = Math.round(midiToFreq(midi));
-  const description = MIDI_DESCRIPTIONS[midi] ?? midiToNoteName(midi);
-  return { freq, description };
 }

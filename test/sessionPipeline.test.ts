@@ -115,6 +115,29 @@ console.log('\nDegradation: no bow, no pose');
   check('L9: assessment still produced', typeof out.sessionAssessment.playerCategory === 'string');
 }
 
+console.log('\nCalibration: bow contact point is rescaled in session signals');
+{
+  const out = runSessionPipeline({
+    audioOutput: makeAudioOutput(),
+    poseFrames: [],
+    bowFrames: makeBowFrames(),
+    durationSeconds: DURATION,
+    instrument: 'violin',
+    calibration: {
+      frogFraction: 0.2,
+      tipFraction: 0.8,
+      fingerboardFraction: 0.15,
+      bridgeFraction: 0.85,
+      calibratedAt: Date.now(),
+    },
+  });
+  const values = out.signals.bowContactPoint.points
+    .map((p) => p.v)
+    .filter((v): v is number => v !== null);
+  check('calibrated bow contact reaches near frog', Math.min(...values) < 0.05);
+  check('calibrated bow contact reaches near tip', Math.max(...values) > 0.95);
+}
+
 // ─────────────────────────────────────────────────────────────
 console.log('');
 if (failures > 0) {

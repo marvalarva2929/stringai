@@ -32,6 +32,7 @@ import {
   scoreIntonationStability,
   computeIntonationStability,
   classifyVibratoSegment,
+  segmentVibratoNotes,
   VIBRATO_MIN_SEGMENT_S,
   VIBRATO_MIN_FRAMES,
 } from './pitchContour';
@@ -40,7 +41,7 @@ import {
 // WAV Parser
 // ─────────────────────────────────────────────────────────────
 
-interface WavData {
+export interface WavData {
   samples: Float32Array; // mono, normalized to [-1, 1]
   sampleRate: number;
   duration: number; // seconds
@@ -109,6 +110,24 @@ function parseWav(bytes: Uint8Array): WavData | null {
 // the FFT (fftInPlace/magnitudeSpectrum), computeRmsEnvelope, and the two-source
 // onset detector (spectral flux + pitch change + merge/collapse) now live in
 // ./dsp (pure, unit-testable). They are imported at the top of this file.
+
+/** Decode a base64 PCM WAV string (e.g. from the native ring buffer) into samples. */
+export function decodeWavBase64(b64: string): WavData | null {
+  try {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return parseWav(bytes);
+  } catch {
+    return null;
+  }
+}
+
+/** Read a WAV file from disk and decode it into samples. */
+export async function decodeWavFile(uri: string): Promise<WavData | null> {
+  const b64 = await new File(uri).base64();
+  return decodeWavBase64(b64);
+}
 
 // ─────────────────────────────────────────────────────────────
 // Scoring Functions
@@ -841,78 +860,30 @@ function segmentPitchesByOnsets(detected: PitchFrame[], onsets: number[]): Pitch
 
 // classifyVibratoSegment now lives in ./pitchContour (pure, unit-testable).
 
-function scoreVibrato(pitches: PitchFrame[], onsets?: number[]): { metric: MetricScore; analysis: VibratoAnalysis } {
-  const detected = pitches.filter((p) => p.frequency !== null);
-  const audioDuration = detected.length > 0 ? detected[detected.length - 1].timestamp : 0;
+export function scoreVibrato(pitches: PitchFrame[], onsets?: number[]): { metric: MetricScore; analysis: VibratoAnalysis } {
   const emptyAnalysis: VibratoAnalysis = { eligibleCount: 0, avgNoteScore: 0, notes: [] };
+  const detectedCount = pitches.filter((p) => p.frequency !== null).length;
 
-  if (detected.length < 20) {
+  if (detectedCount < VIBRATO_MIN_FRAMES) {
     return { metric: { key: 'vibrato', score: 50, flaggedTimestamps: [], severity: severityFromScore(50), events: [], occurrenceRate: 0.5, observationSummary: 'Insufficient sustained notes to assess vibrato.' }, analysis: emptyAnalysis };
   }
 
-  type SegWithBounds = { frames: PitchFrame[]; startS: number; endS: number };
-  let allSegs: SegWithBounds[];
-  if (onsets && onsets.length > 0) {
-    allSegs = onsets.map((startS, i) => {
-      const endS = onsets[i + 1] ?? audioDuration;
-      return { startS, endS, frames: detected.filter((f) => f.timestamp >= startS && f.timestamp < endS) };
-    });
-  } else {
-    const rawSegs: PitchFrame[][] = [];
-    let current: PitchFrame[] = [detected[0]];
-    for (let i = 1; i < detected.length; i++) {
-      const prev = detected[i - 1];
-      const curr = detected[i];
-      const centsDiff = Math.abs(1200 * Math.log2(curr.frequency! / prev.frequency!));
-      const timeDiff = curr.timestamp - prev.timestamp;
-      if (centsDiff > 100 || timeDiff > 0.2) { rawSegs.push(current); current = [curr]; }
-      else current.push(curr);
-    }
-    rawSegs.push(current);
-    allSegs = rawSegs.map((frames) => ({ frames, startS: frames[0].timestamp, endS: frames[frames.length - 1].timestamp }));
-  }
-
-  const eligible = allSegs.filter((seg) => {
-    const dur = seg.endS - seg.startS;
-    return dur >= VIBRATO_MIN_SEGMENT_S && seg.frames.length >= VIBRATO_MIN_FRAMES;
-  });
-
-  if (eligible.length === 0) {
+  const vibratoNotes = segmentVibratoNotes(pitches, onsets);
+  if (vibratoNotes.length === 0) {
     return { metric: { key: 'vibrato', score: 50, flaggedTimestamps: [], severity: severityFromScore(50), events: [], occurrenceRate: 0.5, observationSummary: 'No sustained notes long enough to detect vibrato.' }, analysis: emptyAnalysis };
   }
 
-  const segResults = eligible.map((seg) => {
-    const freqs = seg.frames.map((f) => f.frequency!);
-    const sorted = [...freqs].sort((a, b) => a - b);
-    const medianFreq = sorted[Math.floor(sorted.length / 2)];
-    // Octave-correct each frame before computing cents deviation.
-    // YIN sometimes returns a frequency an octave too high or too low; without this,
-    // a single octave-flipped frame contributes ±1200¢ to the variance and destroys
-    // the depth and autocorrelation calculations.
-    const corrected = freqs.map((f) => {
-      const dist = Math.abs(1200 * Math.log2(f / medianFreq));
-      if (dist <= 600) return f;
-      const halfDist  = Math.abs(1200 * Math.log2((f / 2) / medianFreq));
-      const doubleDist = Math.abs(1200 * Math.log2((f * 2) / medianFreq));
-      if (halfDist < dist && halfDist <= doubleDist) return f / 2;
-      if (doubleDist < dist) return f * 2;
-      return f;
-    });
-    const devs = corrected.map((f) => 1200 * Math.log2(f / medianFreq));
-    return { seg, devs, result: classifyVibratoSegment(devs, 40) };
-  });
-
   // Duration-weighted average so long sustained notes count more than brief ones
-  const totalDuration = segResults.reduce((a, r) => a + (r.seg.endS - r.seg.startS), 0);
+  const totalDuration = vibratoNotes.reduce((a, n) => a + n.durationS, 0);
   const avgScore = clamp(Math.round(
-    segResults.reduce((a, r) => a + r.result.noteScore * (r.seg.endS - r.seg.startS), 0) / totalDuration,
+    vibratoNotes.reduce((a, n) => a + n.noteScore * n.durationS, 0) / totalDuration,
   ));
 
-  // Collect feedback ranked by how often each message appears across segments, cap at 3
+  // Collect feedback ranked by how often each message appears across notes, cap at 3
   const EXCLUDED_FEEDBACK = new Set(['no vibrato detected', 'vibrato rhythm is too uneven to measure — try for a steadier wrist motion']);
   const feedbackCounts = new Map<string, number>();
-  for (const r of segResults) {
-    for (const msg of r.result.feedbackNotes) {
+  for (const note of vibratoNotes) {
+    for (const msg of note.feedbackNotes) {
       if (!EXCLUDED_FEEDBACK.has(msg)) feedbackCounts.set(msg, (feedbackCounts.get(msg) ?? 0) + 1);
     }
   }
@@ -928,22 +899,9 @@ function scoreVibrato(pitches: PitchFrame[], onsets?: number[]): { metric: Metri
     avgScore >= 20 ? `Vibrato is inconsistent — keep working on evenness and depth. ${uniqueFeedback.slice(0, 2).join(' ')}` :
     'Vibrato mostly absent — try introducing a regular wrist motion.';
 
-  const vibratoNotes: VibratoNoteResult[] = segResults.map(({ seg, devs, result }) => ({
-    startS: Math.round(seg.startS * 100) / 100,
-    endS: Math.round(seg.endS * 100) / 100,
-    durationS: Math.round((seg.endS - seg.startS) * 100) / 100,
-    noteScore: result.noteScore,
-    rateHz: Math.round(result.rate * 10) / 10,
-    depthCents: Math.round(result.depth * 10) / 10,
-    periodicityScore: Math.round(result.periodicityScore * 100) / 100,
-    consistencyOk: result.consistencyOk,
-    feedbackNotes: result.feedbackNotes,
-    cents: devs.map((c) => Math.round(c * 10) / 10),
-  }));
-
   return {
     metric: { key: 'vibrato', score: avgScore, flaggedTimestamps: [], severity: severityFromScore(avgScore), events: [], occurrenceRate, observationSummary },
-    analysis: { eligibleCount: eligible.length, avgNoteScore: avgScore, notes: vibratoNotes },
+    analysis: { eligibleCount: vibratoNotes.length, avgNoteScore: avgScore, notes: vibratoNotes },
   };
 }
 
@@ -1284,11 +1242,7 @@ export async function detectPitchFromFile(uri: string): Promise<number | null> {
         return null;
       }
     }
-    const b64 = await new File(wavUri).base64();
-    const binary = atob(b64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    const wav = parseWav(bytes);
+    const wav = await decodeWavFile(wavUri);
     if (!wav) return null;
     const pitches = detectPitches(wav.samples, wav.sampleRate);
     const detected = pitches.filter((p) => p.frequency !== null).map((p) => p.frequency!);
@@ -1333,14 +1287,7 @@ export async function analyzeWavFile(
   _instrument: InstrumentId,
   _durationSeconds: number,
 ): Promise<AudioAnalysisOutput> {
-  const b64 = await new File(fileUri).base64();
-
-  // Decode base64 → Uint8Array
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-
-  const wav = parseWav(bytes);
+  const wav = await decodeWavFile(fileUri);
   if (!wav) throw new Error('NOT_WAV');
 
   const { samples, sampleRate, duration } = wav;
@@ -1396,15 +1343,8 @@ export async function analyzeWavFile(
  * Returns null when the WAV is malformed or has too little data.
  */
 export function scoreVibratoFromBase64(b64: string): MetricScore | null {
-  try {
-    const binary = atob(b64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    const wav = parseWav(bytes);
-    if (!wav) return null;
-    const pitches = detectPitches(wav.samples, wav.sampleRate);
-    return scoreVibrato(pitches).metric;
-  } catch {
-    return null;
-  }
+  const wav = decodeWavBase64(b64);
+  if (!wav) return null;
+  const pitches = detectPitches(wav.samples, wav.sampleRate);
+  return scoreVibrato(pitches).metric;
 }

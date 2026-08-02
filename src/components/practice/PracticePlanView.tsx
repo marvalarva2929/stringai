@@ -27,11 +27,14 @@ export function PracticePlanView({
   kicker,
   coachMessage,
   scope,
+  title,
 }: {
   plan: PracticePlan;
   kicker: string;
   coachMessage: string;
   scope: PlanScope;
+  /** Overrides the hero title (defaults to the plan's primary focus). */
+  title?: string;
 }) {
   const insets = useSafeAreaInsets();
   const completedByPlan = usePracticeProgressStore((st) => st.completedByPlan);
@@ -68,8 +71,8 @@ export function PracticePlanView({
         >
           <View style={s.hero}>
             <Text style={s.heroKicker}>{kicker}</Text>
-            <Text style={s.heroTitle}>{plan.primaryFocus}</Text>
-            <Text style={s.heroSummary}>{`${total} drills · ~${plan.durationMinutes} min`}</Text>
+            <Text style={s.heroTitle}>{title ?? plan.primaryFocus}</Text>
+            <Text style={s.heroSummary}>{`${total} exercises · ~${plan.durationMinutes} min`}</Text>
 
             <View style={s.progressStrip}>
               <View style={s.progressTrack}>
@@ -81,6 +84,18 @@ export function PracticePlanView({
 
           <View style={s.body}>
             <CoachBubble tone="light" message={coachMessage} />
+
+            {plan.rootCauses && plan.rootCauses.length > 0 && (
+              <View style={s.rootCauses}>
+                <Text style={s.rootCausesLabel}>WHY THIS PLAN</Text>
+                {plan.rootCauses.map((cause) => (
+                  <View key={cause.id} style={s.rootCauseCard}>
+                    <Text style={s.rootCauseTitle}>{cause.label}</Text>
+                    <Text style={s.rootCauseBody}>{cause.explanation}</Text>
+                  </View>
+                ))}
+              </View>
+            )}
 
             <View style={s.path}>
               {plan.blocks.map((block, i) => {
@@ -105,7 +120,7 @@ export function PracticePlanView({
             {allDone && (
               <View style={s.doneBanner}>
                 <Ionicons name="trophy" size={22} color={colors.score.excellent} />
-                <Text style={s.doneBannerText}>Path complete — nice work.</Text>
+                <Text style={s.doneBannerText}>All done — nice work.</Text>
               </View>
             )}
           </View>
@@ -113,7 +128,7 @@ export function PracticePlanView({
 
         <View style={[s.bottomBar, { paddingBottom: Math.max(insets.bottom, spacing.sm) }]}>
           <DepthButton
-            label={allDone ? 'See summary' : doneCount > 0 ? 'Continue path' : 'Start path'}
+            label={allDone ? 'See summary' : doneCount > 0 ? 'Continue' : 'Start'}
             icon={allDone ? 'trophy' : 'arrow-forward'}
             onPress={startNext}
           />
@@ -149,6 +164,23 @@ const s = StyleSheet.create({
   progressFill: { height: '100%', borderRadius: 5, backgroundColor: '#fff' },
   progressLabel: { color: 'rgba(255,255,255,0.9)', fontSize: 12, fontWeight: '800' },
   body: { paddingHorizontal: spacing.lg, gap: spacing.lg },
+  rootCauses: { gap: spacing.sm },
+  rootCausesLabel: {
+    fontSize: 12,
+    fontWeight: '900',
+    color: colors.text.muted,
+    letterSpacing: 0.6,
+  },
+  rootCauseCard: {
+    backgroundColor: colors.surface,
+    borderRadius: radius.lg,
+    borderLeftWidth: 3,
+    borderLeftColor: colors.brand[400],
+    padding: spacing.md,
+    gap: 4,
+  },
+  rootCauseTitle: { fontSize: 15, fontWeight: '800', color: colors.text.primary },
+  rootCauseBody: { fontSize: 13, lineHeight: 19, color: colors.text.secondary },
   path: { marginTop: spacing.xs },
   doneBanner: {
     flexDirection: 'row',

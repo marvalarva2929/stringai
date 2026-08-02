@@ -6,7 +6,7 @@ Runs the bow + violin prompts over every frame and writes a YOLO *detect*
 dataset (class 0 = bow, class 1 = violin) ready for train_detect.py, plus
 annotated previews for human review.
 
-Run on a GPU pod (see RUNPOD.md). Resumable: frames that already have a label
+Run on a GPU instance (see GCE.md). Resumable: frames that already have a label
 file are skipped, so it's safe to Ctrl-C and rerun, or to add more frames later.
 
 Usage:

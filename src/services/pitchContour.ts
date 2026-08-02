@@ -7,7 +7,7 @@
  */
 
 import { severityFromScore } from '../types/analysis';
-import type { MetricScore, FlaggedTimestamp, IntonationFaultType, IntonationStabilityNoteResult, IntonationStabilityAnalysis } from '../types/analysis';
+import type { MetricScore, FlaggedTimestamp, IntonationFaultType, IntonationStabilityNoteResult, IntonationStabilityAnalysis, VibratoNoteResult } from '../types/analysis';
 import { clamp, centsFromNearestNote } from './dsp';
 import type { PitchFrame } from './dsp';
 import { frequencyToNoteInfo } from '../lib/intonationAnalysis';
@@ -416,4 +416,132 @@ export function classifyVibratoSegment(
   const isVibrato = rateInRange && periodicityScore >= acThreshold;
 
   return { rate, depth, periodicityScore, consistencyOk, feedbackNotes, noteScore, isVibrato };
+}
+
+// ─── UI-facing vibrato fault classification ──────────────────────────────────
+// The persisted VibratoNoteResult drops isVibrato/cvMAD, so the UI re-derives
+// faults from the surviving numeric fields. Lives here (not in the component)
+// so the classification shares this module's thresholds and stays Node-testable.
+
+export type VibratoFault = 'none' | 'shallow' | 'wide' | 'slow' | 'fast' | 'uneven' | 'fades';
+
+/** Axis/band numbers for "you vs target" displays — same constants the scorer uses. */
+export const VIBRATO_DISPLAY = {
+  RATE_AXIS_MIN: VIBRATO_RATE_MIN_HZ,
+  RATE_AXIS_MAX: VIBRATO_RATE_MAX_HZ,
+  // rateScore's full-marks band: VIBRATO_RATE_CENTER_HZ ± 1.5. The engine's
+  // "touch fast" feedback string fires at 7.5, but the score sweet spot — and
+  // therefore this classification — ends at 7.0.
+  RATE_TARGET_LO: VIBRATO_RATE_CENTER_HZ - 1.5,
+  RATE_TARGET_HI: VIBRATO_RATE_CENTER_HZ + 1.5,
+  DEPTH_MIN: VIBRATO_DEPTH_MIN_CENTS,
+  DEPTH_TARGET_LO: VIBRATO_DEPTH_SWEET_LOW,
+  DEPTH_TARGET_HI: VIBRATO_DEPTH_SWEET_HIGH,
+} as const;
+
+/** True when a persisted note actually contained measurable vibrato. */
+export function hasVibrato(note: { rateHz: number; depthCents: number }): boolean {
+  return note.rateHz >= VIBRATO_RATE_MIN_HZ &&
+         note.rateHz <= VIBRATO_RATE_MAX_HZ &&
+         note.depthCents >= VIBRATO_DEPTH_MIN_CENTS;
+}
+
+/**
+ * Classifies a persisted note's vibrato faults from its numeric metrics.
+ * Returns faults in priority order ([0] is the primary fault); [] = healthy.
+ * Priority: presence > measurability > depth > rate > periodicity > consistency
+ * (depth first because depthScore carries the highest noteScore weight).
+ */
+export function classifyVibratoFaults(note: {
+  rateHz: number;
+  depthCents: number;
+  periodicityScore: number;
+  consistencyOk: boolean;
+}): VibratoFault[] {
+  // Depth-gate early return in classifyVibratoSegment: rate 0, depth below minimum.
+  if (note.rateHz === 0 || note.depthCents < VIBRATO_DEPTH_MIN_CENTS) return ['none'];
+  // Hard-gate case: rate outside 3–8 Hz means the oscillation couldn't be
+  // measured as vibrato — its rate/depth numbers are unreliable, report only this.
+  if (note.rateHz < VIBRATO_RATE_MIN_HZ || note.rateHz > VIBRATO_RATE_MAX_HZ) return ['uneven'];
+
+  const faults: VibratoFault[] = [];
+  if (note.depthCents < VIBRATO_DEPTH_SWEET_LOW) faults.push('shallow');
+  else if (note.depthCents > VIBRATO_DEPTH_SWEET_HIGH) faults.push('wide');
+  if (note.rateHz < VIBRATO_DISPLAY.RATE_TARGET_LO) faults.push('slow');
+  else if (note.rateHz > VIBRATO_DISPLAY.RATE_TARGET_HI) faults.push('fast');
+  if (note.periodicityScore < VIBRATO_AC_THRESHOLD_NORMAL) faults.push('uneven');
+  if (!note.consistencyOk) faults.push('fades');
+  return faults;
+}
+
+/**
+ * Segments a pitch track into vibrato-eligible notes and classifies each one.
+ * Splits on the provided onsets, or falls back to a pitch-jump/time-gap rule
+ * when none are given. Returns [] when there isn't enough sustained pitch data
+ * — callers decide what "not enough" means for their own messaging.
+ */
+export function segmentVibratoNotes(pitches: PitchFrame[], onsets?: number[]): VibratoNoteResult[] {
+  const detected = pitches.filter((p) => p.frequency !== null) as { frequency: number; timestamp: number; periodicity?: number }[];
+  if (detected.length < VIBRATO_MIN_FRAMES) return [];
+  const audioDuration = detected[detected.length - 1].timestamp;
+
+  type SegWithBounds = { frames: typeof detected; startS: number; endS: number };
+  let allSegs: SegWithBounds[];
+  if (onsets && onsets.length > 0) {
+    allSegs = onsets.map((startS, i) => {
+      const endS = onsets[i + 1] ?? audioDuration;
+      return { startS, endS, frames: detected.filter((f) => f.timestamp >= startS && f.timestamp < endS) };
+    });
+  } else {
+    const rawSegs: (typeof detected)[] = [];
+    let current: typeof detected = [detected[0]];
+    for (let i = 1; i < detected.length; i++) {
+      const prev = detected[i - 1];
+      const curr = detected[i];
+      const centsDiff = Math.abs(1200 * Math.log2(curr.frequency / prev.frequency));
+      const timeDiff = curr.timestamp - prev.timestamp;
+      if (centsDiff > 100 || timeDiff > 0.2) { rawSegs.push(current); current = [curr]; }
+      else current.push(curr);
+    }
+    rawSegs.push(current);
+    allSegs = rawSegs.map((frames) => ({ frames, startS: frames[0].timestamp, endS: frames[frames.length - 1].timestamp }));
+  }
+
+  const eligible = allSegs.filter((seg) => {
+    const dur = seg.endS - seg.startS;
+    return dur >= VIBRATO_MIN_SEGMENT_S && seg.frames.length >= VIBRATO_MIN_FRAMES;
+  });
+
+  return eligible.map((seg) => {
+    const freqs = seg.frames.map((f) => f.frequency);
+    const sorted = [...freqs].sort((a, b) => a - b);
+    const medianFreq = sorted[Math.floor(sorted.length / 2)];
+    // Octave-correct each frame before computing cents deviation.
+    // YIN sometimes returns a frequency an octave too high or too low; without this,
+    // a single octave-flipped frame contributes ±1200¢ to the variance and destroys
+    // the depth and autocorrelation calculations.
+    const corrected = freqs.map((f) => {
+      const dist = Math.abs(1200 * Math.log2(f / medianFreq));
+      if (dist <= 600) return f;
+      const halfDist   = Math.abs(1200 * Math.log2((f / 2) / medianFreq));
+      const doubleDist = Math.abs(1200 * Math.log2((f * 2) / medianFreq));
+      if (halfDist < dist && halfDist <= doubleDist) return f / 2;
+      if (doubleDist < dist) return f * 2;
+      return f;
+    });
+    const devs = corrected.map((f) => 1200 * Math.log2(f / medianFreq));
+    const result = classifyVibratoSegment(devs, 40);
+    return {
+      startS: Math.round(seg.startS * 100) / 100,
+      endS: Math.round(seg.endS * 100) / 100,
+      durationS: Math.round((seg.endS - seg.startS) * 100) / 100,
+      noteScore: result.noteScore,
+      rateHz: Math.round(result.rate * 10) / 10,
+      depthCents: Math.round(result.depth * 10) / 10,
+      periodicityScore: Math.round(result.periodicityScore * 100) / 100,
+      consistencyOk: result.consistencyOk,
+      feedbackNotes: result.feedbackNotes,
+      cents: devs.map((c) => Math.round(c * 10) / 10),
+    };
+  });
 }

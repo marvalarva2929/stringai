@@ -83,10 +83,10 @@ for (const file of readdirSync(dir).filter((f) => MEDIA.test(f) && !f.endsWith('
   const { samples, sampleRate } = readWav(readFileSync(wav));
   const pitches = detectPitches(samples, sampleRate);
   const stats = computeIntonationStability(pitches);
-  const metric = scoreIntonationStability(pitches);
+  const { metric, analysis } = scoreIntonationStability(pitches);
   const drift = stats.mode === 'per-note' ? stats.avgStd : stats.mode === 'short' ? stats.stdCents : NaN;
-  const flags = stats.mode === 'per-note' ? stats.flagged.length : 0;
-  const noteStds = stats.mode === 'per-note' ? stats.noteStdCents : [];
+  const flags = analysis.unsteadyCount;
+  const noteStds = stats.mode === 'per-note' ? stats.notes.map((n) => n.driftCents) : [];
   rows.push({ file, label, drift, noteStds, score: metric.score, flags, mode: stats.mode });
   console.log(`  ${file.padEnd(28)} drift=${Number.isNaN(drift) ? ' n/a' : drift.toFixed(1).padStart(5)}¢  score=${String(metric.score).padStart(3)}  flags=${flags}  [${stats.mode}]`);
 }

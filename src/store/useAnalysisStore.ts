@@ -19,7 +19,7 @@ export type AnalysisPhase =
   | 'piece_input'        // step 1 — type the song name + optional sheet music
   | 'method_select'      // step 2 — choose record in-app or upload video
   | 'camera_tip'       // step 2b — camera position guide before live recording
-  | 'calibrating'      // legacy — no longer used
+  | 'calibrating'      // step 2c — bow reference capture before live recording
   | 'recording'
   | 'processing_audio'
   | 'processing_video'

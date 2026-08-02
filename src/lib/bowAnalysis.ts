@@ -1,68 +1,76 @@
 import { createTimeSeries, type RawBowFrame, type TimeSeries, type TimeSeriesPoint } from '../types/signals';
+import { isClipped } from './bowBoxGeometry';
+import type { BowCalibration } from '../types/calibration';
 
 // ─────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────
 
-const MIN_CONFIDENCE = 0.4;
+export const MIN_CONFIDENCE = 0.4;
 
 // Single-frame spike rejection on tip.y
 const OUTLIER_TIP_THRESHOLD    = 0.15;
 const NEIGHBOR_AGREE_THRESHOLD = 0.08;
+
+// A bow axis shorter than this (normalized) is too foreshortened to trust as a
+// full-bow reference length.
+export const MIN_BOW_LEN = 0.15;
 
 // ─────────────────────────────────────────────────────────────
 // Per-frame geometry
 // ─────────────────────────────────────────────────────────────
 
 interface Point { x: number; y: number; }
+interface Box { x1: number; y1: number; x2: number; y2: number; }
 
-/**
- * Where on the bow (0=frog, 1=tip) the string is currently crossed.
- *
- * Full formula — requires all three keypoints visible:
- *   t = dot(contact − frog, tip − frog) / |tip − frog|²
- */
-function computeContactPoint(tip: Point, frog: Point, contact: Point): number | null {
-  const dx = tip.x - frog.x;
-  const dy = tip.y - frog.y;
-  const len2 = dx * dx + dy * dy;
-  if (len2 < 0.0001) return null;
-  const t = ((contact.x - frog.x) * dx + (contact.y - frog.y) * dy) / len2;
-  return Math.max(0, Math.min(1, t));
+// Box corner ids: 0 = top-left, 1 = top-right, 2 = bottom-left, 3 = bottom-right.
+// The opposite corner across a diagonal is always `3 - id`.
+function boxFromEnds(a: Point, b: Point): Box {
+  return {
+    x1: Math.min(a.x, b.x), y1: Math.min(a.y, b.y),
+    x2: Math.max(a.x, b.x), y2: Math.max(a.y, b.y),
+  };
+}
+function cornerAt(box: Box, id: number): Point {
+  switch (id) {
+    case 0: return { x: box.x1, y: box.y1 };
+    case 1: return { x: box.x2, y: box.y1 };
+    case 2: return { x: box.x1, y: box.y2 };
+    default: return { x: box.x2, y: box.y2 };
+  }
+}
+const oppositeId = (id: number) => 3 - id;
+function cornerIdOf(box: Box, p: Point): number {
+  const left = Math.abs(p.x - box.x1) <= Math.abs(p.x - box.x2);
+  const top = Math.abs(p.y - box.y1) <= Math.abs(p.y - box.y2);
+  return (top ? 0 : 2) + (left ? 0 : 1);
 }
 
 /**
- * Fallback contact point when the frog is off-camera.
+ * Lock the bow's frog corner once, from the modal choice over the first frames.
  *
- * Uses the bow angle and length from the most recent visible-frog frame to
- * reconstruct the bow axis, then projects the contact point onto it.
- *
- * Derivation: the full formula t = dot(contact − frog, u) / bowLength where
- * frog = tip − bowLength * u. Substituting and simplifying:
- *
- *   t = 1 + dot(contact − tip, u) / bowLength
- *
- * where u = (cos θ, sin θ) is the frog→tip unit vector.
- *
- * Accuracy: degrades slowly as the bow arm extends (bow length changes) or
- * rotates (angle changes) relative to the last visible-frog frame. Good for
- * gaps up to ~2 seconds of typical bowing.
- *
- * @param angleDeg  Bow angle in degrees (atan2 convention, frog→tip direction)
- * @param bowLength |tip − frog| in normalized frame coords from last good frame
+ * Each RawBowFrame's (frog, tip) are opposite corners of the bow's bbox, with
+ * the frog set to the box corner nearest the right wrist. That per-frame choice
+ * occasionally jumps to the OTHER diagonal (wrist jitter / box aspect change),
+ * flipping the bow axis mid-clip. Locking the modal corner identity from the
+ * start keeps the axis on one diagonal for the whole session.
  */
-function computeContactPointFallback(
-  tip: Point,
-  contact: Point,
-  angleDeg: number,
-  bowLength: number,
-): number | null {
-  if (bowLength < 0.001) return null;
-  const angleRad = angleDeg * (Math.PI / 180);
-  const ux = Math.cos(angleRad);
-  const uy = Math.sin(angleRad);
-  const dot = (contact.x - tip.x) * ux + (contact.y - tip.y) * uy;
-  return Math.max(0, Math.min(1, 1 + dot / bowLength));
+function lockFrogCorner(frames: RawBowFrame[]): number | null {
+  const LOCK_SAMPLE = 15;
+  const votes = new Map<number, number>();
+  let sampled = 0;
+  for (const f of frames) {
+    const box = boxFromEnds({ x: f.frogX, y: f.frogY }, { x: f.tipX, y: f.tipY });
+    if (box.x2 - box.x1 < 1e-6 && box.y2 - box.y1 < 1e-6) continue;
+    const id = cornerIdOf(box, { x: f.frogX, y: f.frogY });
+    votes.set(id, (votes.get(id) ?? 0) + 1);
+    if (++sampled >= LOCK_SAMPLE) break;
+  }
+  if (sampled === 0) return null;
+  let best: number | null = null;
+  let bestC = -1;
+  for (const [id, c] of votes) if (c > bestC) { bestC = c; best = id; }
+  return best;
 }
 
 /**
@@ -95,18 +103,22 @@ function computeBowSpeed(curr: RawBowFrame, prev: RawBowFrame): number | null {
 // ─────────────────────────────────────────────────────────────
 
 function filterFrames(frames: RawBowFrame[]): RawBowFrame[] {
-  // Keep frames where at least the tip is visible and confidence is acceptable.
-  // Frog-invisible frames are intentionally kept — the fallback formula handles them.
+  // Keep frames where at least one bow end is visible, or where the bow/string
+  // contact is visible. Calibration clips are often framed at the frog or tip,
+  // so both real endpoints may be out of frame even though the visible bow
+  // segment is usable as a raw reference.
   const good = frames.filter(
-    f => f.confidence >= MIN_CONFIDENCE && f.tipVisible,
+    f => f.confidence >= MIN_CONFIDENCE && (f.tipVisible || f.frogVisible || f.contactVisible),
   );
   if (good.length < 3) return good;
 
-  // Spike rejection on tip.y — single-frame detection glitches
+  // Spike rejection on tip.y — single-frame detection glitches. Only meaningful
+  // when the tip is visible across the 3-frame window; otherwise keep the frame.
   return good.filter((f, i) => {
     if (i === 0 || i === good.length - 1) return true;
     const prev = good[i - 1];
     const next = good[i + 1];
+    if (!f.tipVisible || !prev.tipVisible || !next.tipVisible) return true;
     const diffPrev     = Math.abs(f.tipY - prev.tipY);
     const diffNext     = Math.abs(f.tipY - next.tipY);
     const neighborDiff = Math.abs(prev.tipY - next.tipY);
@@ -141,9 +153,126 @@ export interface BowTimeSeries {
    * when the diagonal orientation was unknown or no contact was found.
    */
   stringPos:       TimeSeries<number | null>;
+  /**
+   * True if the whole bow (frog AND tip both on-screen) was seen at least once,
+   * so a real full-bow length could calibrate the contact-point normalization.
+   * When false, bowContactPoint is only a truncated-box estimate and distance-
+   * based bow metrics should be reported as unreliable.
+   */
+  fullBowEverSeen: boolean;
+  /** True when bowContactPoint/stringPos have been rescaled by applyCalibration()
+   *  against a BowCalibration; false for the raw, uncalibrated output of
+   *  deriveBowTimeSeries(). Evaluators that need an absolute reference
+   *  (stringPos, bowDistribution) should gate on this. */
+  calibrated: boolean;
 }
 
 export type BowDirection = -1 | 0 | 1;
+
+// ─────────────────────────────────────────────────────────────
+// Bow usage (contact-point distribution analysis)
+// ─────────────────────────────────────────────────────────────
+
+export type BowZone = 'lower' | 'middle' | 'upper';
+
+export interface BowUsageAnalysis {
+  n: number;
+  /** 5th / 95th percentile of the contact-point parameter u (0=frog, 1=tip) */
+  p05: number;
+  p95: number;
+  /** p95 − p05: outlier-resistant fraction of the bow actually used */
+  robustRange: number;
+  meanU: number;
+  /** Fraction of samples in each third of the bow */
+  zoneShares: Record<BowZone, number>;
+  lowerHalfShare: number;
+  upperHalfShare: number;
+  /** Zone the player camped in (a third or a half dominating the session), or
+   *  null when travel is balanced. Thirds are checked first (more specific). */
+  campedZone: BowZone | 'lower half' | 'upper half' | null;
+  /** Share of samples backing campedZone (0 when campedZone is null) */
+  campedShare: number;
+}
+
+// Dominance thresholds — a third holding ≥70% of samples, or a half holding
+// ≥85%, counts as camping in one region of the bow. Calibrate on real clips.
+const BOW_THIRD_DOMINANCE = 0.7;
+const BOW_HALF_DOMINANCE = 0.85;
+
+export function percentile(sorted: number[], p: number): number {
+  if (sorted.length === 0) return 0;
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.round(p * (sorted.length - 1))));
+  return sorted[idx];
+}
+
+/**
+ * Distribution statistics over the contact-point parameter u.
+ *
+ * Uses percentiles rather than min/max so a handful of glitched detection
+ * frames can't fake full-bow usage, and zone occupancy so "half the bow, all
+ * the time" is visible — raw range alone cannot distinguish strokes centered
+ * mid-bow from strokes camped at the tip.
+ */
+export function analyzeBowUsage(uValues: number[]): BowUsageAnalysis | null {
+  if (uValues.length === 0) return null;
+
+  const sorted = [...uValues].sort((a, b) => a - b);
+  const p05 = percentile(sorted, 0.05);
+  const p95 = percentile(sorted, 0.95);
+  const n = uValues.length;
+
+  let lower = 0, middle = 0, upper = 0, lowerHalf = 0, sum = 0;
+  for (const u of uValues) {
+    sum += u;
+    if (u < 1 / 3) lower++;
+    else if (u < 2 / 3) middle++;
+    else upper++;
+    if (u < 0.5) lowerHalf++;
+  }
+
+  const zoneShares: Record<BowZone, number> = { lower: lower / n, middle: middle / n, upper: upper / n };
+  const lowerHalfShare = lowerHalf / n;
+  const upperHalfShare = 1 - lowerHalfShare;
+
+  let campedZone: BowUsageAnalysis['campedZone'] = null;
+  let campedShare = 0;
+  const thirds: Array<[BowZone, number]> = [['lower', zoneShares.lower], ['middle', zoneShares.middle], ['upper', zoneShares.upper]];
+  const dominantThird = thirds.reduce((a, b) => (b[1] > a[1] ? b : a));
+  if (dominantThird[1] >= BOW_THIRD_DOMINANCE) {
+    campedZone = dominantThird[0];
+    campedShare = dominantThird[1];
+  } else if (lowerHalfShare >= BOW_HALF_DOMINANCE) {
+    campedZone = 'lower half';
+    campedShare = lowerHalfShare;
+  } else if (upperHalfShare >= BOW_HALF_DOMINANCE) {
+    campedZone = 'upper half';
+    campedShare = upperHalfShare;
+  }
+
+  return {
+    n,
+    p05,
+    p95,
+    robustRange: Math.max(0, p95 - p05),
+    meanU: sum / n,
+    zoneShares,
+    lowerHalfShare,
+    upperHalfShare,
+    campedZone,
+    campedShare,
+  };
+}
+
+/** User-facing name for a camped zone. */
+export function bowZoneLabel(zone: NonNullable<BowUsageAnalysis['campedZone']>): string {
+  switch (zone) {
+    case 'lower': return 'lower third of the bow (near the frog)';
+    case 'middle': return 'middle third of the bow';
+    case 'upper': return 'upper third of the bow (near the tip)';
+    case 'lower half': return 'lower half of the bow';
+    case 'upper half': return 'upper half of the bow';
+  }
+}
 
 // ─────────────────────────────────────────────────────────────
 // Bow direction
@@ -261,17 +390,30 @@ function deriveDirectionPoints(
 /**
  * Convert RawBowFrame[] into semantic bow time series.
  *
- * Contact point strategy (in priority order per frame):
- *   1. All three keypoints visible → full projection formula (most accurate)
- *   2. Frog off-camera, tip + contact visible → fallback formula using last
- *      known angle + bow length (see computeContactPointFallback)
- *   3. Contact also not visible → null for this frame
+ * Contact point (bow distribution, 0 = frog, 1 = tip) is measured as the
+ * projection of the contact onto the bow axis, divided by a RUNNING full-bow
+ * length. Two properties make this robust to the bow running off-frame:
  *
- * Angle and bow length are updated only from frames where the frog is visible,
- * so the fallback always uses real geometry, not estimated geometry.
+ *   • The frog/tip corners are locked once (lockFrogCorner) so the axis can't
+ *     flip diagonals mid-clip.
+ *   • The full-bow length is refreshed only on frames where BOTH ends are on-
+ *     screen, and each frame anchors the projection off whichever end is
+ *     visible (frog forward, or tip backward). So a clipped frog OR a clipped
+ *     tip both stay correct — the reading is a fraction of the REAL bow, not of
+ *     the truncated bounding box.
+ *
+ * `fullBowEverSeen` reports whether any frame ever calibrated a real full-bow
+ * length; when false the contact-point values are truncated-box estimates.
+ *
+ * Returns raw, uncalibrated values (`calibrated: false`). Pass the result
+ * through `applyCalibration()` below to rescale `bowContactPoint`/`stringPos`
+ * against a `BowCalibration` — the per-frame geometry here is untouched by
+ * calibration on purpose, so it stays exactly as robust to bow-angle and
+ * violin-orientation changes as it always was.
  */
 export function deriveBowTimeSeries(frames: RawBowFrame[]): BowTimeSeries {
   const filtered = filterFrames(frames);
+  const lockedFrogId = lockFrogCorner(filtered);
 
   const cpPts:    Array<TimeSeriesPoint<number | null>> = [];
   const anglePts: Array<TimeSeriesPoint<number | null>> = [];
@@ -279,40 +421,61 @@ export function deriveBowTimeSeries(frames: RawBowFrame[]): BowTimeSeries {
   const posPts:   Array<TimeSeriesPoint<number | null>> = [];
   const lenVals:  Array<number | null> = [];
 
-  // Carry-forward state for the frog-invisible fallback
-  let lastKnownAngleDeg:    number | null = null;
-  let lastKnownBowLength:   number | null = null;
+  // Running full-bow geometry, refreshed whenever the whole bow is on-screen.
+  let lastKnownAngleDeg:  number | null = null;
+  let lastKnownBowLength: number | null = null;
+  let fullBowEverSeen = false;
 
   for (let i = 0; i < filtered.length; i++) {
-    const f       = filtered[i];
-    const tip     = { x: f.tipX,     y: f.tipY     };
-    const frog    = { x: f.frogX,    y: f.frogY    };
+    const f = filtered[i];
     const contact = { x: f.contactX, y: f.contactY };
 
-    const stickVisible   = f.tipVisible && f.frogVisible;
-    const contactVisible = f.contactVisible;
+    // Re-derive the bow ends on the LOCKED diagonal so the axis never flips.
+    const box = boxFromEnds({ x: f.frogX, y: f.frogY }, { x: f.tipX, y: f.tipY });
+    const frog = lockedFrogId != null ? cornerAt(box, lockedFrogId) : { x: f.frogX, y: f.frogY };
+    const tip  = lockedFrogId != null ? cornerAt(box, oppositeId(lockedFrogId)) : { x: f.tipX, y: f.tipY };
 
-    // ── Update carry-forward state whenever frog is visible ──────────────
-    if (stickVisible) {
+    const frogClipped = isClipped(frog);
+    const tipClipped  = isClipped(tip);
+    const lenThis = computeBowLength(tip, frog);
+
+    // Refresh the running full-bow length only when the whole bow is visible.
+    if (!frogClipped && !tipClipped && lenThis >= MIN_BOW_LEN) {
       lastKnownAngleDeg  = computeBowAngle(tip, frog);
-      lastKnownBowLength = computeBowLength(tip, frog);
+      lastKnownBowLength = lenThis;
+      fullBowEverSeen = true;
     }
 
-    // ── Contact point ─────────────────────────────────────────────────────
+    // ── Contact point (bow distribution) ──────────────────────────────────
+    // Prefer the box path's pre-computed bowPosT (uploaded-video path) so the
+    // metric is identical to the inspector; otherwise reconstruct it here from
+    // the locked axis + running length (live streaming path).
     let cp: number | null = null;
-    if (stickVisible && contactVisible) {
-      // All three keypoints: full formula
-      cp = computeContactPoint(tip, frog, contact);
-    } else if (!f.frogVisible && f.tipVisible && contactVisible &&
-               lastKnownAngleDeg !== null && lastKnownBowLength !== null) {
-      // Frog off-camera: fallback using last known bow geometry
-      cp = computeContactPointFallback(tip, contact, lastKnownAngleDeg, lastKnownBowLength);
+    if (f.bowPosT !== undefined) {
+      cp = f.bowPosT === null ? null : Math.max(0, Math.min(1, f.bowPosT));
+    } else if (f.contactVisible && lenThis > 1e-6) {
+      const ux = (tip.x - frog.x) / lenThis;
+      const uy = (tip.y - frog.y) / lenThis;
+      const L = lastKnownBowLength ?? lenThis; // running length, truncated fallback
+      if (!frogClipped) {
+        cp = ((contact.x - frog.x) * ux + (contact.y - frog.y) * uy) / L;
+      } else if (!tipClipped) {
+        cp = 1 - ((tip.x - contact.x) * ux + (tip.y - contact.y) * uy) / L;
+      } else {
+        // Calibration clips often happen at the frog or tip, where the real
+        // bow endpoint can be out of frame. Use the visible bow segment as a
+        // raw estimate; applyCalibration() remaps this observed range later.
+        cp = ((contact.x - frog.x) * ux + (contact.y - frog.y) * uy) / lenThis;
+      }
+      if (cp !== null) cp = Math.max(0, Math.min(1, cp));
     }
 
-    // ── Angle: always use lastKnownAngleDeg (just updated above if frog visible)
-    const angle: number | null = lastKnownAngleDeg;
+    // ── Angle: locked axis this frame, else last full-bow angle ───────────
+    const angle: number | null = (!frogClipped && !tipClipped)
+      ? computeBowAngle(tip, frog)
+      : lastKnownAngleDeg;
 
-    // ── Speed: tip-only, always available when tip is visible ─────────────
+    // ── Speed: tip-only, available when tip is visible ────────────────────
     const speed = i > 0 ? computeBowSpeed(f, filtered[i - 1]) : null;
 
     cpPts.push(   { t: f.timestamp, v: cp    });
@@ -330,5 +493,37 @@ export function deriveBowTimeSeries(frames: RawBowFrame[]): BowTimeSeries {
     bowSpeed:        createTimeSeries(speedPts),
     bowDirection:    createTimeSeries(dirPts),
     stringPos:       createTimeSeries(posPts),
+    fullBowEverSeen,
+    calibrated: false,
+  };
+}
+
+/**
+ * Rescale a raw BowTimeSeries against a BowCalibration — a linear remap of
+ * bowContactPoint/stringPos using where the calibration positions landed in
+ * deriveBowTimeSeries' own raw output. The single place calibration should be
+ * applied; call it after deriveBowTimeSeries() anywhere a calibrated reading
+ * is needed.
+ */
+export function applyCalibration(series: BowTimeSeries, calibration: BowCalibration | null): BowTimeSeries {
+  if (!calibration) return series;
+
+  const rescale = (lo: number, hi: number) => (raw: number | null): number | null => {
+    if (raw === null) return null;
+    if (Math.abs(hi - lo) < 1e-6) return raw;
+    return Math.max(0, Math.min(1, (raw - lo) / (hi - lo)));
+  };
+  const rescaleContact = rescale(calibration.frogFraction, calibration.tipFraction);
+  const rescaleString = rescale(calibration.fingerboardFraction, calibration.bridgeFraction);
+
+  return {
+    ...series,
+    bowContactPoint: createTimeSeries(
+      series.bowContactPoint.points.map((p) => ({ t: p.t, v: rescaleContact(p.v) })),
+    ),
+    stringPos: createTimeSeries(
+      series.stringPos.points.map((p) => ({ t: p.t, v: rescaleString(p.v) })),
+    ),
+    calibrated: true,
   };
 }

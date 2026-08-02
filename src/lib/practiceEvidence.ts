@@ -32,6 +32,15 @@ export interface PracticeEvidenceTarget {
   startSeconds?: number;
   endSeconds?: number;
   phraseId?: number;
+  /** Detected tempo (BPM) from the flagged session's rhythm analysis — seeds the
+   *  click-track drill at the tempo the player actually struggled at, instead of
+   *  a generic default. */
+  bpmEst?: number;
+  /** Dominant MetricScore.events[].type for this metric (e.g. a ToneFault name)
+   *  — lets the block builder route to a fault-specific exercise instead of
+   *  the generic per-metric one. Undefined when the metric has no events or
+   *  they're not distinguishing. */
+  faultType?: string;
 }
 
 export interface PracticeEvidence {
@@ -70,6 +79,11 @@ export interface PracticeEvidenceResult {
   evidence: PracticeEvidence[];
   allMetricAverages: Partial<Record<MetricKey, number>>;
 }
+
+// Measurement isn't reliable enough yet — excluded from evidence/exercises
+// even if older persisted data still references them (see poseScoring.ts's
+// scorePoseMetrics(), which no longer computes either metric).
+const UNTRACKED_METRICS = new Set<MetricKey>(['bowArmLevel', 'leftHandWrist']);
 
 const FORM_METRICS = new Set<MetricKey>([
   'posture',
@@ -365,6 +379,7 @@ function addRhythmEvidence(byId: Map<string, PracticeEvidence>, session: Analysi
       tendency,
       startSeconds: rhythm?.flaggedRegions[0]?.startSeconds,
       endSeconds: rhythm?.flaggedRegions[0]?.endSeconds,
+      bpmEst: rhythm?.bpmEst,
     },
   });
 }
@@ -399,8 +414,17 @@ function addPatternEvidence(byId: Map<string, PracticeEvidence>, session: Analys
   }
 }
 
+/** Most frequent MetricScore.events[].type, or undefined if there are none. */
+function dominantFaultType(metric: MetricScore): string | undefined {
+  if (!metric.events || metric.events.length === 0) return undefined;
+  const counts = new Map<string, number>();
+  for (const event of metric.events) counts.set(event.type, (counts.get(event.type) ?? 0) + 1);
+  return [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+}
+
 function addMetricEvidence(byId: Map<string, PracticeEvidence>, session: AnalysisResult): void {
   for (const metric of session.metrics) {
+    if (UNTRACKED_METRICS.has(metric.key)) continue;
     if (metric.score >= 78 || !metricMeasurementAvailable(metric)) continue;
     const kind = METRIC_TO_KIND[metric.key] ?? 'metric_fallback';
     const reqs = liveRequirementsForMetric(metric.key);
@@ -423,6 +447,7 @@ function addMetricEvidence(byId: Map<string, PracticeEvidence>, session: Analysi
         metricKey: metric.key,
         startSeconds: metric.flaggedTimestamps[0]?.startSeconds,
         endSeconds: metric.flaggedTimestamps[0]?.endSeconds,
+        faultType: dominantFaultType(metric),
       },
     });
   }
@@ -445,6 +470,7 @@ function addMetricHistoryFallback(
   }
 
   for (const [metricKey, scores] of scoresByMetric.entries()) {
+    if (UNTRACKED_METRICS.has(metricKey)) continue;
     const avgScore = average(scores.map((s) => s.score));
     if (avgScore >= 85) continue;
     const sample = scores[0];

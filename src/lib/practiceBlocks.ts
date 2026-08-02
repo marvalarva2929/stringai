@@ -1,6 +1,7 @@
 import type { MetricKey, PlayerCategory } from '../types/analysis';
 import type { SkillLevel } from '../types/user';
 import type { RankedPracticeEvidence } from './practiceRanking';
+import type { BowGeometryTarget } from './bowGeometryEvaluator';
 import { exercisesForMetric } from '../constants/exercises';
 import { METRIC_META } from '../constants/metricMeta';
 
@@ -44,6 +45,91 @@ export interface PracticeSuccessCriteria {
   durationSeconds?: number;
 }
 
+/**
+ * Which pure evaluator (src/lib/*Evaluator.ts) the runner calls to judge a
+ * captured take, and the thresholds it judges against. Optional on
+ * PracticeBlock so unmigrated blocks keep the self-report result screen.
+ */
+export type EvaluatorId = 'pitchLanding' | 'vibrato' | 'bowGeometry' | 'toneFault' | 'dynamicsShape';
+
+export interface PitchLandingEvaluatorParams {
+  evaluatorId: 'pitchLanding';
+  centsThreshold: number;
+  requiredStreak: number;
+  minConfidence?: number;
+}
+
+export interface VibratoEvaluatorParams {
+  evaluatorId: 'vibrato';
+  minRateHz?: number;
+  maxRateHz?: number;
+  minDepthCents?: number;
+  maxDepthCents?: number;
+  minDurationSeconds?: number;
+  requiredSuccesses: number;
+}
+
+export interface ToneFaultEvaluatorParams {
+  evaluatorId: 'toneFault';
+  disallowedFaults?: Exclude<import('../types/analysis').ToneFault, 'clean'>[];
+  requiredCleanFraction: number;
+  minConfidence?: number;
+}
+
+export interface BowGeometryEvaluatorParams {
+  evaluatorId: 'bowGeometry';
+  target: BowGeometryTarget;
+}
+
+export interface DynamicsShapeEvaluatorParams {
+  evaluatorId: 'dynamicsShape';
+  target: import('./dynamicsEvaluator').DynamicsShapeTarget;
+}
+
+export interface HoldEvaluatorParams {
+  evaluatorId: 'hold';
+  centsThreshold: number;
+  minDurationSeconds: number;
+  minFractionInTolerance: number;
+  requiredSuccesses: number;
+  minConfidence?: number;
+}
+
+export interface ScaleEvaluatorParams {
+  evaluatorId: 'scale';
+  scaleName: string;
+  centsThreshold: number;
+  minConfidence?: number;
+  /** Octave-specific MIDI note of the flagged issue, so the judged sequence is
+   *  rooted in the same register the instructions point to (see scaleNoteSequence). */
+  rootMidiNote?: number;
+}
+
+export interface RhythmEvaluatorParams {
+  evaluatorId: 'rhythm';
+  /** Click track starts here — seeded from the player's own detected tempo when
+   *  available (see PracticeEvidenceTarget.bpmEst), otherwise a generic default. */
+  startBpm: number;
+  minBpm: number;
+  maxBpm: number;
+  /** Clicks per take. */
+  beatCount: number;
+  /** Max onset offset from its click, in ms, to count as on-time. */
+  toleranceMs: number;
+  requiredOnTimeFraction: number;
+  minConfidence?: number;
+}
+
+export type EvaluatorParams =
+  | PitchLandingEvaluatorParams
+  | VibratoEvaluatorParams
+  | ToneFaultEvaluatorParams
+  | BowGeometryEvaluatorParams
+  | DynamicsShapeEvaluatorParams
+  | HoldEvaluatorParams
+  | ScaleEvaluatorParams
+  | RhythmEvaluatorParams;
+
 export interface PracticeTarget {
   metricKey: MetricKey;
   pitchClass?: string;
@@ -69,6 +155,8 @@ export interface PracticeBlock {
   target: PracticeTarget;
   liveMode: PracticeLiveMode;
   successCriteria: PracticeSuccessCriteria;
+  /** How the runner judges a captured take. Absent = self-report fallback. */
+  evaluator?: EvaluatorParams;
   fallbackCriteria: string;
   coachPromptContext: string;
   evidenceRefs: PracticeEvidenceRef[];
@@ -202,6 +290,10 @@ function blocksForEvidence(
     case 'rhythm':
       return [rhythmBlock(evidence, intensity)];
     case 'tone':
+      if (evidence.target.faultType === 'thin') return [toneFaultBlock(evidence, intensity, 'thin')];
+      if (evidence.target.faultType === 'scratch' || evidence.target.faultType === 'rasp') {
+        return [toneFaultBlock(evidence, intensity, 'pressure')];
+      }
       return [toneBlock(evidence, intensity)];
     case 'phrase':
       return [phraseRepairBlock(evidence, intensity)];
@@ -250,7 +342,10 @@ function blockBase(
 function pitchLandingBlock(evidence: RankedPracticeEvidence, intensity: CoachIntensity): PracticeBlock {
   const target = evidence.target.pitchClass ?? evidence.target.noteName ?? 'target note';
   const cents = intensity === 'advanced' ? 8 : intensity === 'balanced' ? 10 : 12;
-  const streak = intensity === 'advanced' ? 7 : intensity === 'balanced' ? 5 : 4;
+  // Consecutive landings, so the streak is the whole point — but it compounds:
+  // at 7-in-a-row a single slip late in the take voids everything before it.
+  // 3-5 still demonstrates control without making one miss cost the take.
+  const streak = intensity === 'advanced' ? 5 : intensity === 'balanced' ? 4 : 3;
   return {
     ...blockBase(evidence, 'pitch_landing', intensity),
     title: `${target} Landing Trainer`,
@@ -274,6 +369,7 @@ function pitchLandingBlock(evidence: RankedPracticeEvidence, intensity: CoachInt
       repetitions: streak,
       centsThreshold: cents,
     },
+    evaluator: { evaluatorId: 'pitchLanding', centsThreshold: cents, requiredStreak: streak },
     fallbackCriteria: `If live pitch confidence is low, play ${target} 10 times against a tuner drone and only count clean attacks.`,
     coachPromptContext: `Coach ${target} pitch landings. Focus on one adjustment at a time and use the evidence: ${evidence.evidenceSummary}`,
   };
@@ -290,11 +386,11 @@ function scaleLockBlock(
   return {
     ...blockBase(evidence, 'scale_lock', intensity),
     title: `${scaleName} Scale Lock-In`,
-    subtitle: 'Loop missed notes inside the scale',
+    subtitle: 'One note per metronome click',
     estimatedMinutes: intensity === 'advanced' ? 8 : 6,
     instructions: [
-      `Play a one-octave ${scaleName} scale slowly.`,
-      `When ${target} misses, loop the neighbor pattern around it before restarting the scale.`,
+      `Warm up the ${scaleName} scale slowly on your own first, especially around ${target}.`,
+      'When you record, a metronome click paces the take — play the note shown on screen on each click, with a clear stop before the next.',
       'Keep the bow speed even so pitch and tone are judged from a stable sound.',
     ],
     target: {
@@ -302,17 +398,18 @@ function scaleLockBlock(
       scaleName,
     },
     liveMode: {
-      label: 'Mic checks each scale degree',
+      label: 'Metronome-paced, mic checks each scale degree',
       signals: ['pitch', 'tone'],
       requiresMic: true,
       requiresCamera: false,
       status: 'ready',
     },
     successCriteria: {
-      summary: `Complete the scale twice with every note inside +/-${cents} cents, looping ${target} whenever it misses.`,
-      repetitions: 2,
+      summary: `Play the ${scaleName} scale in tempo, keeping all but a note or two inside +/-${cents} cents.`,
+      repetitions: 1,
       centsThreshold: cents,
     },
+    evaluator: { evaluatorId: 'scale', scaleName, centsThreshold: cents, rootMidiNote: evidence.target.midiNote },
     fallbackCriteria: `If live note detection is uncertain, play ${scaleName} with a drone and pause on ${target} for two full bows.`,
     coachPromptContext: `Coach a scale lock exercise around ${target}. Keep feedback specific to intonation and tone stability.`,
     evidenceRefs: [ref(evidence)],
@@ -328,9 +425,10 @@ function pitchHoldBlock(evidence: RankedPracticeEvidence, intensity: CoachIntens
     subtitle: 'Steady center line',
     estimatedMinutes: 5,
     instructions: [
-      `Hold ${target} for a slow full bow.`,
+      `Hear the target note and check your string is in tune first.`,
+      `Start the take, then hold ${target} steady on a slow full bow.`,
       'Keep the left hand relaxed and avoid correcting after the sound starts.',
-      'Repeat only when the pitch center stays steady from attack to release.',
+      `The recording stops on its own after ${seconds}s — just hold through it.`,
     ],
     liveMode: {
       label: 'Mic watches pitch drift',
@@ -340,9 +438,16 @@ function pitchHoldBlock(evidence: RankedPracticeEvidence, intensity: CoachIntens
       status: 'ready',
     },
     successCriteria: {
-      summary: `Hold ${target} for ${seconds}s with a stable pitch center on 3 attempts.`,
-      repetitions: 3,
+      summary: `Hold ${target} steady for the full ${seconds}s — recording stops automatically.`,
+      repetitions: 1,
       durationSeconds: seconds,
+    },
+    evaluator: {
+      evaluatorId: 'hold',
+      centsThreshold: 15,
+      minDurationSeconds: seconds,
+      minFractionInTolerance: 0.75,
+      requiredSuccesses: 1,
     },
     fallbackCriteria: `If pitch tracking drops out, use a tuner in strobe mode and repeat ${target} until the needle stays calm.`,
     coachPromptContext: `Coach pitch stability on ${target}; separate left-hand drift from bow-pressure wobble.`,
@@ -369,9 +474,14 @@ function vibratoBlock(evidence: RankedPracticeEvidence, intensity: CoachIntensit
       status: 'ready',
     },
     successCriteria: {
-      summary: `Maintain 4-7 Hz vibrato with consistent depth for 3 held notes of ${seconds}s.`,
-      repetitions: 3,
+      summary: `Maintain 4-7 Hz vibrato with consistent depth for 2 held notes of ${seconds}s.`,
+      repetitions: 2,
       durationSeconds: seconds,
+    },
+    evaluator: {
+      evaluatorId: 'vibrato',
+      minDurationSeconds: seconds,
+      requiredSuccesses: 2,
     },
     fallbackCriteria: 'If live vibrato confidence is low, practice silent wrist waves in rhythm, then record one sustained-note attempt.',
     coachPromptContext: `Coach vibrato using the prior evidence: ${evidence.evidenceSummary}`,
@@ -402,35 +512,49 @@ function bowControlBlock(evidence: RankedPracticeEvidence, intensity: CoachInten
       summary: bowSuccess(evidence.metricKey, intensity),
       repetitions: intensity === 'advanced' ? 8 : 5,
     },
+    evaluator: unavailable ? undefined : { evaluatorId: 'bowGeometry', target: bowGeometryTarget(evidence.metricKey) },
     fallbackCriteria: 'If camera tracking is unavailable, record from the player side and review whether the bow stays parallel to the bridge.',
     coachPromptContext: `Coach bow control from camera evidence. Prior finding: ${evidence.evidenceSummary}`,
   };
 }
 
 function rhythmBlock(evidence: RankedPracticeEvidence, intensity: CoachIntensity): PracticeBlock {
+  // Seed the click track at the tempo the player actually struggled at when
+  // we have it (evidence.target.bpmEst, from their flagged session); otherwise
+  // fall back to an intensity-scaled generic starting tempo.
+  const detected = evidence.target.bpmEst;
+  const startBpm = detected
+    ? Math.round(Math.min(160, Math.max(44, detected)))
+    : intensity === 'advanced' ? 88 : intensity === 'balanced' ? 76 : 66;
+  const minBpm = Math.max(40, startBpm - 30);
+  const maxBpm = Math.min(176, startBpm + 40);
+  const beatCount = intensity === 'advanced' ? 10 : intensity === 'balanced' ? 8 : 6;
+  const toleranceMs = intensity === 'advanced' ? 80 : intensity === 'balanced' ? 110 : 150;
+
   return {
     ...blockBase(evidence, 'rhythm', intensity),
     title: 'Metronome Grid Repair',
-    subtitle: 'Loop the uneven timing',
+    subtitle: 'Lock one note to the click',
     estimatedMinutes: 5,
     instructions: [
-      'Set the metronome slower than the original performance.',
-      'Play the flagged rhythm on one note first, then restore the original notes.',
-      'Count out loud for one pass before playing silently.',
+      'The app plays a click track — play one note on every click, nothing fancier yet.',
+      `Starts at ${startBpm} BPM. Nail it and the tempo climbs; miss it and it eases back down.`,
+      'Once the click feels automatic, bring back the original notes at the tempo you landed on.',
     ],
     liveMode: {
-      label: 'Mic compares attacks to the beat',
-      signals: ['rhythm', 'pitch'],
+      label: 'App plays the click and grades your timing against it',
+      signals: ['rhythm'],
       requiresMic: true,
       requiresCamera: false,
       status: 'ready',
     },
     successCriteria: {
-      summary: 'Play the rhythm twice with steady attacks and no repeated rushing or dragging region.',
-      repetitions: 2,
+      summary: `Land ${Math.round(beatCount * 0.75)} of ${beatCount} clicks within ${toleranceMs}ms, starting at ${startBpm} BPM.`,
+      repetitions: beatCount,
     },
-    fallbackCriteria: 'If onset tracking is noisy, clap the rhythm with a metronome before playing it.',
-    coachPromptContext: `Coach rhythm repair. Evidence: ${evidence.evidenceSummary}`,
+    evaluator: { evaluatorId: 'rhythm', startBpm, minBpm, maxBpm, beatCount, toleranceMs, requiredOnTimeFraction: 0.75 },
+    fallbackCriteria: 'If click detection is noisy, clap along with an external metronome at the same tempo before playing it.',
+    coachPromptContext: `Coach rhythm repair against a click track starting at ${startBpm} BPM. Evidence: ${evidence.evidenceSummary}`,
   };
 }
 
@@ -456,8 +580,40 @@ function toneBlock(evidence: RankedPracticeEvidence, intensity: CoachIntensity):
       summary: 'Produce 5 clean long bows without scratch, thin tone, or delayed note speech.',
       repetitions: 5,
     },
+    evaluator: { evaluatorId: 'toneFault', requiredCleanFraction: 0.7 },
     fallbackCriteria: 'If tone detection is uncertain, record three open-string bows and compare the cleanest one to the others.',
     coachPromptContext: `Coach tone quality with acoustic evidence: ${evidence.evidenceSummary}`,
+  };
+}
+
+// Fine-grained tone drills for the two fault families classifyFrames can
+// actually tell apart (see toneAnalysis.ts) — everything else still falls
+// back to the generic toneBlock above.
+function toneFaultBlock(evidence: RankedPracticeEvidence, intensity: CoachIntensity, fault: 'thin' | 'pressure'): PracticeBlock {
+  const base = toneBlock(evidence, intensity);
+  if (fault === 'thin') {
+    return {
+      ...base,
+      title: 'Bow Weight Trainer',
+      instructions: [
+        'Play slow open-string bows and listen for a full, centered sound.',
+        'Add a little arm weight or slow the bow if the tone feels thin or airy.',
+        'Repeat the best-sounding stroke until it is reproducible.',
+      ],
+      successCriteria: { summary: 'Produce 5 clean long bows with no thin tone.', repetitions: 5 },
+      evaluator: { evaluatorId: 'toneFault', disallowedFaults: ['thin'], requiredCleanFraction: 0.7 },
+    };
+  }
+  return {
+    ...base,
+    title: 'Pressure Release Trainer',
+    instructions: [
+      'Play slow open-string bows starting with slightly more pressure than usual.',
+      'Ease the arm weight until the scratch or roughness clears.',
+      'Repeat the cleared stroke until it is reproducible without pressing.',
+    ],
+    successCriteria: { summary: 'Produce 5 clean long bows with no scratch or rasp.', repetitions: 5 },
+    evaluator: { evaluatorId: 'toneFault', disallowedFaults: ['scratch', 'rasp'], requiredCleanFraction: 0.7 },
   };
 }
 
@@ -551,6 +707,7 @@ function maintenanceBlocks(intensity: CoachIntensity, weeklyGoalMinutes?: number
       summary: 'Produce 5 clean, even long bows with steady tone.',
       repetitions: 5,
     },
+    evaluator: { evaluatorId: 'toneFault', requiredCleanFraction: 0.7 },
     fallbackCriteria: 'If tone tracking is uncertain, record three open-string bows and compare the cleanest.',
     coachPromptContext: 'Coach a maintenance long-tone session; the player had no flagged issues, so reinforce good habits.',
     evidenceRefs: [],
@@ -567,12 +724,13 @@ function maintenanceBlocks(intensity: CoachIntensity, weeklyGoalMinutes?: number
       reason: 'A clean session is the moment to stretch — run a familiar scale and keep every note in tune.',
       estimatedMinutes: 6,
       instructions: [
-        'Play a two-octave scale you know well, slowly.',
-        'Keep bow speed even so pitch and tone stay steady.',
-        'Push tempo only when every note lands in tune.',
+        'Warm up the G major scale slowly on your own first.',
+        'When you record, a metronome click paces the take — play the note shown on screen on each click, with a clear stop before the next.',
+        'Keep the bow speed even so pitch and tone are judged from a stable sound.',
       ],
-      target: { metricKey: 'pitchAccuracy', scaleName: 'a familiar scale' },
-      successCriteria: { summary: 'Complete the scale twice with every note in tune.', repetitions: 2 },
+      target: { metricKey: 'pitchAccuracy', scaleName: 'G major' },
+      successCriteria: { summary: 'Complete the scale, keeping all but a note or two in tune.', repetitions: 1, centsThreshold: 12 },
+      evaluator: { evaluatorId: 'scale', scaleName: 'G major', centsThreshold: 12 },
       coachPromptContext: 'Coach a maintenance scale for a player with no flagged issues; reinforce and gently extend.',
     },
   ];
@@ -638,6 +796,7 @@ function starterBlocks(intensity: CoachIntensity, weeklyGoalMinutes?: number | n
         summary: 'Play 4 clean open-string bows with steady volume and no scratch.',
         repetitions: 4,
       },
+      evaluator: { evaluatorId: 'toneFault', requiredCleanFraction: 0.7 },
       coachPromptContext: 'Coach a simple open-string tone warmup.',
     },
   ];
@@ -675,4 +834,12 @@ function bowSuccess(metricKey: MetricKey, intensity: CoachIntensity): string {
   if (metricKey === 'bowPlacement') return `Keep contact point in the normal lane for ${reps} slow strokes.`;
   if (metricKey === 'bowArmLevel') return `Pre-set the arm level correctly on ${reps} string changes.`;
   return `Complete ${reps} controlled bow strokes with stable camera tracking.`;
+}
+
+// Placeholder thresholds — need calibrating against real footage before shipping.
+function bowGeometryTarget(metricKey: MetricKey): BowGeometryTarget {
+  if (metricKey === 'bowAngle') return { signal: 'bowAngle', minValue: -15, maxValue: 15, requiredGoodFraction: 0.7 };
+  if (metricKey === 'bowPlacement') return { signal: 'stringPos', minValue: 0.35, maxValue: 0.65, requiredGoodFraction: 0.7 };
+  if (metricKey === 'bowDistribution') return { signal: 'bowDistribution', minRobustRange: 0.6 };
+  return { signal: 'bowAngle', minValue: -15, maxValue: 15, requiredGoodFraction: 0.7 };
 }

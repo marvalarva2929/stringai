@@ -396,6 +396,15 @@ coaching_reports (session_id, overall_take, items jsonb, generated_at)
 
 ## Build Status
 
+> **Update**: the table below is a historical snapshot (Jun 2026) and is stale on
+> several rows. In particular, the Supabase Edge Functions and LLM feedback path
+> are no longer stubs — `supabase/functions/analyze-feedback` and `session-chat`
+> are complete, production-quality implementations that call Claude server-side
+> with a real Pro-entitlement gate (they just haven't been deployed yet, see
+> `progress.md`). The pose/bow-detector ML pipeline has also since been trained
+> (see `ml/cloud/pipeline_summary.json`). Treat other rows here as unverified
+> until re-checked against current code.
+
 | Component | Status | Notes |
 |---|---|---|
 | Audio DSP (YIN, FFT, RMS, onset) | ✅ Built | YIN hop still 50ms in audioEngine.ts; reduce to 20ms for fast-passage accuracy |
@@ -404,14 +413,13 @@ coaching_reports (session_id, overall_take, items jsonb, generated_at)
 | `InlineVideoPlayer` (full-featured) | ✅ Built | Speed controls, note marker scrubber, frame-accurate seeks, note overlay |
 | Zustand persist middleware | ✅ Built | phase/currentResult/sessionHistory/metricHistory persist across restarts |
 | `poseScoring.ts` scoring logic | ✅ Built | Needs MediaPipe data wired |
-| MetricScore types and Supabase schema | ✅ Built | Schema not yet run on live project |
-| `llmFeedback.ts` | ✅ Stub | Replace with real edge function |
-| MediaPipe integration | ⏳ Planned | Next major milestone |
-| `src/lib/patternDetection.ts` | ❌ Not built | ~20 statistical tests |
-| Bow detector ML model | ❌ Not built | ~2,000 labeled frames needed |
-| Bridge top detector (CV) | ❌ Not built | Traditional CV, no training data |
-| Supabase `note_events` table | ❌ Not built | New migration needed |
-| Real LLM edge function | ❌ Not built | Replaces local stub |
+| MetricScore types and Supabase schema | ✅ Built | Schema migrations exist under `supabase/migrations/`; confirm they've been run on the live project |
+| `llmFeedback.ts` / Edge Functions | ✅ Built | `analyze-feedback` + `session-chat` Edge Functions call Claude server-side with entitlement gating; pending `supabase functions deploy` |
+| MediaPipe / pose-camera integration | ✅ Built (iOS only) | `modules/pose-camera` — no Android implementation |
+| `src/lib/patternDetection.ts` | ⚠️ Unverified | Status not re-checked since this note was written |
+| Bow detector ML model | ✅ Built | Trained CoreML model bundled in `modules/pose-camera/ios/bow_detector.mlpackage` |
+| Bridge top detector (CV) | ⚠️ Unverified | Status not re-checked since this note was written |
+| Supabase `note_events` table | ⚠️ Unverified | Status not re-checked since this note was written |
 
 ---
 

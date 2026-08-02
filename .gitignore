@@ -48,3 +48,15 @@ ml/cloud/dataset.tar
 ml/cloud/dataset/
 ml/cloud/review_flagged.json
 ml/cloud/dataset_clean/
+ml/cloud/dataset_review.tar
+ml/cloud/review_flagged_current.json
+ml/cloud/train-3/
+ml/cloud/*.log
+
+# Raw source recordings for the detector work (~1.6 GB, individual files up to
+# 477 MB — well past GitHub's 100 MB hard limit). Same rule as the test fixture
+# videos above: these live on local disk and the training host, never in git.
+ml/videos/
+
+# Generated knowledge-graph output — regenerable from source, not source itself.
+graphify-out/

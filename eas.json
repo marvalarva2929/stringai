@@ -1,6 +1,7 @@
 {
   "cli": {
-    "version": ">= 7.0.0"
+    "version": ">= 7.0.0",
+    "appVersionSource": "remote"
   },
   "build": {
     "preview": {
@@ -11,25 +12,30 @@
       "android": {
         "buildType": "apk"
       },
-      "env": {
-        "EXPO_PUBLIC_SUPABASE_URL": "https://ckpvayvocmhidpdxtkqi.supabase.co",
-        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNrcHZheXZvY21oaWRwZHh0a3FpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAwMDAzNjAsImV4cCI6MjA5NTU3NjM2MH0.ks3M6obZQOIPQEIIG5J5_iJxzL3jLVDkgCNeI4hfHkU"
-      }
+      "environment": "preview"
     },
     "production": {
+      "autoIncrement": true,
       "ios": {
         "buildType": "release"
       },
       "android": {
         "buildType": "app-bundle"
       },
-      "env": {
-        "EXPO_PUBLIC_SUPABASE_URL": "https://ckpvayvocmhidpdxtkqi.supabase.co",
-        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNrcHZheXZvY21oaWRwZHh0a3FpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAwMDAzNjAsImV4cCI6MjA5NTU3NjM2MH0.ks3M6obZQOIPQEIIG5J5_iJxzL3jLVDkgCNeI4hfHkU"
-      }
+      "environment": "production"
     }
   },
   "submit": {
-    "production": {}
+    "production": {
+      "ios": {
+        "appleId": "REPLACE_WITH_APPLE_ID_EMAIL",
+        "ascAppId": "REPLACE_WITH_APP_STORE_CONNECT_APP_ID",
+        "appleTeamId": "REPLACE_WITH_APPLE_TEAM_ID"
+      },
+      "android": {
+        "serviceAccountKeyPath": "./play-store-service-account.json",
+        "track": "internal"
+      }
+    }
   }
 }

@@ -1,4 +1,4 @@
-import { MetricKey } from '../types/analysis';
+import type { MetricKey } from '../types/analysis';
 
 export type Difficulty = 'beginner' | 'intermediate' | 'advanced';
 

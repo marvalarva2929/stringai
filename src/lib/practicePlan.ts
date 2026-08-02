@@ -91,6 +91,9 @@ export interface PracticePlan {
   sourceSessionIds: string[];
   weakAreas: WeakArea[];
   allMetricAverages: Partial<Record<MetricKey, number>>;
+  /** Grounded LLM root causes tying blocks together, when available (session
+   *  scope only — see useSessionPracticePlan). Absent = deterministic-only. */
+  rootCauses?: import('./practiceCuration').CuratedRootCause[];
 }
 
 export function computePracticePlan(

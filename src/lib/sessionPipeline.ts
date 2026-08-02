@@ -1,11 +1,12 @@
 import type { AudioAnalysisOutput, MetricScore, MeasurementQuality, SessionAssessment, PlayerCategory } from '../types/analysis';
+import type { BowCalibration } from '../types/calibration';
 import type { InstrumentId } from '../types/instrument';
 import type { RawBowFrame, SessionSignals } from '../types/signals';
 import { POSE, CONFIDENCE_THRESHOLD, scorePoseMetrics, type FrameKeypoints } from './poseScoring';
 import { preparePoseFramesForScoring } from './poseFramePrep';
 import { fuseSignals, detectPhrases, type NoteEvent, type Phrase } from './noteFusion';
 import { buildSessionSignals } from './sessionSignals';
-import { deriveBowTimeSeries } from './bowAnalysis';
+import { deriveBowTimeSeries, applyCalibration } from './bowAnalysis';
 import { runPatternDetection, type StatisticalFinding } from './patternDetection';
 import { buildSessionAssessment } from './sessionAssessment';
 import { groupNotes, type NoteGroup } from './noteGrouping';
@@ -30,6 +31,8 @@ export interface SessionPipelineInput {
   instrument: InstrumentId;
   /** User's self-reported goal from onboarding; falls back to video classification. */
   userCategory?: PlayerCategory;
+  /** Optional bow calibration captured in the same camera position before recording. */
+  calibration?: BowCalibration | null;
 }
 
 export interface SessionPipelineOutput {
@@ -78,10 +81,10 @@ function assessFrameQuality(frames: FrameKeypoints[]): MeasurementQuality {
 }
 
 export function runSessionPipeline(input: SessionPipelineInput): SessionPipelineOutput {
-  const { audioOutput, poseFrames, bowFrames, durationSeconds, instrument, userCategory } = input;
+  const { audioOutput, poseFrames, bowFrames, durationSeconds, instrument, userCategory, calibration } = input;
 
   // ── L1: bow geometry series — computed once, shared by every layer ──
-  const bowSeries = deriveBowTimeSeries(bowFrames);
+  const bowSeries = applyCalibration(deriveBowTimeSeries(bowFrames), calibration ?? null);
 
   // ── L2: note events (bow series enables hybrid onset splitting) ──
   const noteEvents = fuseSignals(audioOutput.rawSignals, poseFrames, { bow: bowSeries });
@@ -114,7 +117,7 @@ export function runSessionPipeline(input: SessionPipelineInput): SessionPipeline
   // ── Pose + bow metric scoring ──
   let videoMetrics: MetricScore[] = [];
   if (poseFrames.length >= 5 && prepared.length >= 5) {
-    videoMetrics = scorePoseMetrics(prepared, bowFrames, instrument, durationSeconds, signals);
+    videoMetrics = scorePoseMetrics(prepared, bowFrames, instrument, durationSeconds, signals, bowSeries);
     if (quality === 'low') {
       videoMetrics = videoMetrics.map((m) =>
         m.measurementQuality === 'unavailable' ? m : { ...m, measurementQuality: 'low' as MeasurementQuality },

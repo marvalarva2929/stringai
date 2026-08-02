@@ -184,29 +184,27 @@ public class PoseCameraModule: Module {
             if !leftHand.isEmpty  { payload["leftHand"]  = leftHand  }
             if !rightHand.isEmpty { payload["rightHand"] = rightHand }
 
-            // Bow detection — runs only if bow_detector.mlpackage is present in bundle.
-            // Frames where the bow is not detected (or model absent) simply omit these
-            // keys; the JS side treats absent keys as null RawBowFrame fields.
+            // Bow + violin detection — runs only if bow_detector.mlpackage is present
+            // in the bundle. Frames where no bow is detected simply omit these keys;
+            // the JS side treats absent keys as no bow data for that frame.
+            // Tip/frog/contact keypoints are derived on the JS side from these boxes
+            // plus the wrist joints (src/lib/bowBoxGeometry.ts).
             if let detector = BowDetector.shared,
-               let bow = detector.detect(in: image),
-               bow.confidence >= BowDetector.confidenceThreshold {
-                payload["bowTip"] = [
-                    "x": Double(bow.tipX), "y": Double(bow.tipY),
-                    "visible": bow.tipVisible,
-                ]
-                payload["bowFrog"] = [
-                    "x": Double(bow.frogX), "y": Double(bow.frogY),
-                    "visible": bow.frogVisible,
-                ]
-                payload["bowContact"] = [
-                    "x": Double(bow.contactX), "y": Double(bow.contactY),
-                    "visible": bow.contactVisible,
-                ]
-                payload["bowBox"] = [
-                    "x1": Double(bow.boxX1), "y1": Double(bow.boxY1),
-                    "x2": Double(bow.boxX2), "y2": Double(bow.boxY2),
-                ]
-                payload["bowConfidence"] = Double(bow.confidence)
+               let detection = detector.detect(in: image) {
+                if let bow = detection.bow {
+                    payload["bowBox"] = [
+                        "x1": Double(bow.x1), "y1": Double(bow.y1),
+                        "x2": Double(bow.x2), "y2": Double(bow.y2),
+                    ]
+                    payload["bowConfidence"] = Double(bow.confidence)
+                }
+                if let violin = detection.violin {
+                    payload["violinBox"] = [
+                        "x1": Double(violin.x1), "y1": Double(violin.y1),
+                        "x2": Double(violin.x2), "y2": Double(violin.y2),
+                    ]
+                    payload["violinConfidence"] = Double(violin.confidence)
+                }
             }
 
             frames.append(payload)

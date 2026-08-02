@@ -3,46 +3,72 @@ import Vision
 import CoreImage
 import UIKit
 
-// MARK: - Output struct
+// MARK: - Output structs
+
+/// One detected box in normalized frame coords [0,1], top-left origin (y grows
+/// downward) — the SAME convention as the pose joints emitted by
+/// PoseCameraModule (which flips Vision's bottom-left origin via y = 1 − vy).
+struct DetectedBox {
+    let x1: Float; let y1: Float
+    let x2: Float; let y2: Float
+    let confidence: Float
+}
 
 struct BowDetection {
-    let tipX:          Float;  let tipY:          Float;  let tipVisible:     Bool
-    let frogX:         Float;  let frogY:         Float;  let frogVisible:    Bool
-    let contactX:      Float;  let contactY:      Float;  let contactVisible: Bool
-    let confidence:    Float
-    // Axis-aligned bounding box in normalized frame coords [0,1], same space as keypoints
-    let boxX1: Float;  let boxY1: Float;  let boxX2: Float;  let boxY2: Float
+    // Each class is reported independently against its own threshold, so the
+    // violin keeps updating when the bow is off-frame (and vice versa). A
+    // detection is returned when at least one class clears its bar.
+    let bow: DetectedBox?
+    let violin: DetectedBox?
 }
 
 // MARK: - BowDetector
 
-/// Runs the YOLOv8n-pose CoreML bow keypoint model on a single CGImage.
-/// The model detects 3 keypoints: tip (KP0), frog (KP1), contact point (KP2).
+/// Runs the 2-class YOLOv8 *detect* CoreML model (class 0 = bow, class 1 = violin)
+/// on a single CGImage and returns the best box per class.
 ///
-/// Model file: bow_detector.mlpackage (placed in modules/pose-camera/ios/ after training).
-/// Model is trained with nms=True and int8=True, so NMS is baked in and we get
-/// at most max_det (default 300) detections. We take the highest-confidence one.
+/// No keypoints: tip/frog/contact are derived geometrically on the JS side
+/// (src/lib/bowBoxGeometry.ts) from the two boxes plus pose wrist landmarks —
+/// frog = bow-box corner nearest the right wrist, tip = opposite corner,
+/// contact = intersection of the bow diagonal with the violin-box diagonal.
 ///
-/// Coordinate system: all returned x/y are normalized [0, 1] in the ORIGINAL frame,
-/// matching the Vision coordinate system used by the rest of PoseCameraModule.
-/// (y=0 = top of frame, matching the flipped Vision output — see PoseCameraModule.swift).
+/// Model file: bow_detector.mlpackage (trained by ml/cloud/train_detect.py on
+/// LocateAnything auto-labels, exported by ml/export_coreml.py).
+///
+/// Because only the single best box per class is needed, no NMS is required —
+/// the parser simply takes the argmax per class. Both the pipeline-NMS export
+/// (nms=True → "confidence"/"coordinates" outputs) and the raw export
+/// (output0) are supported.
 class BowDetector {
     static let shared: BowDetector? = BowDetector()
 
-    private let model:      MLModel
-    private let inputSize:  CGSize = CGSize(width: 640, height: 640)
+    private let model:     MLModel
+    private let inputSize: CGSize = CGSize(width: 640, height: 640)
 
-    // Confidence threshold for reporting a detection. Frames below this are nil.
+    /// Class ids — must match ml/cloud/data_detect.yaml names: ['bow', 'violin']
+    private static let bowClass    = 0
+    private static let violinClass = 1
+    private static let numClasses  = 2
+
+    // Minimum confidence for reporting a box. A frame without a bow ≥ this
+    // threshold returns nil. Violin gets its own, much lower bar — its
+    // confidence is calibrated far below the bow's (LocateAnything auto-labels
+    // for the violin are looser than the bow's, so the model learned to hedge:
+    // mAP50/recall on held-out data are close to the bow's — 0.72/0.75 vs
+    // 0.87/0.85 — but raw confidence rarely clears 0.25). Using the bow's
+    // threshold for both was hiding real, correctly-localized violin boxes.
     static let confidenceThreshold: Float = 0.40
-    // Keypoint visibility threshold: visibility score from model must exceed this.
-    static let visibilityThreshold: Float = 0.50
+    // TEMP: lowered from 0.15 to 0.05 to unblock violin-feature testing — this
+    // surfaces any violin box the model emits above the baked NMS floor (0.10 →
+    // effectively 0.10 is the real floor, since candidates below it are dropped
+    // inside CoreML). Raise back to a calibrated value once verified.
+    static let violinConfidenceThreshold: Float = 0.05
 
     private init?() {
         // The model file is compiled at build time from bow_detector.mlpackage.
         // If the file isn't present yet (pre-training), this init returns nil —
         // all calls to detect() safely return nil.
         guard let url = Bundle.main.url(forResource: "bow_detector", withExtension: "mlmodelc") else {
-            // Model not yet integrated — expected during development before training.
             return nil
         }
         do {
@@ -59,11 +85,11 @@ class BowDetector {
 
     // MARK: - Public API
 
-    /// Detect bow keypoints in a video frame.
+    /// Detect the bow and violin boxes in a video frame.
     ///
     /// - Parameter image: A CGImage at any resolution (letterboxed internally to 640×640).
-    /// - Returns: BowDetection with keypoints in normalized frame coords [0,1],
-    ///            or nil if no bow detected above confidence threshold.
+    /// - Returns: BowDetection with boxes in normalized top-left-origin frame
+    ///            coords, or nil if no bow was detected above the confidence threshold.
     func detect(in image: CGImage) -> BowDetection? {
         let (letterboxed, scale, padX, padY) = letterbox(image: image, to: inputSize)
         guard let pixelBuffer = pixelBuffer(from: letterboxed) else { return nil }
@@ -85,168 +111,146 @@ class BowDetector {
 
     // MARK: - Output parsing
 
-    /// Parse the model output MultiArray into a BowDetection.
-    ///
-    /// YOLOv8-pose CoreML with NMS baked in outputs a MultiArray at key "output0"
-    /// with shape [1, N, 14] where each detection row is:
-    ///   [x1, y1, x2, y2, conf, tip_x, tip_y, tip_v, frog_x, frog_y, frog_v, cx, cy, cv]
-    /// All coordinates are in the letterboxed 640×640 space.
-    ///
-    /// If the output format differs (e.g., different key name or transposed shape),
-    /// this method logs a debug message and returns nil so we can diagnose.
-    private func parseOutput(
-        _ output:         MLFeatureProvider,
-        scale:            CGFloat,
-        padX:             CGFloat,
-        padY:             CGFloat,
-        originalWidth:    CGFloat,
-        originalHeight:   CGFloat
-    ) -> BowDetection? {
-        // Try the standard Ultralytics output key; fall back to scanning all keys.
-        let outputKey = output.featureNames.first(where: { $0.hasPrefix("output") })
-                     ?? output.featureNames.first
+    /// Per-class best candidate accumulator (in letterbox pixel space, xyxy).
+    private struct Candidate {
+        var conf: Float = 0
+        var x1: Float = 0; var y1: Float = 0; var x2: Float = 0; var y2: Float = 0
+    }
 
-        guard let key = outputKey,
-              let featureValue = output.featureValue(for: key),
-              let arr = featureValue.multiArrayValue else {
-            print("[BowDetector] No MultiArray output found. Keys: \(output.featureNames)")
+    private func parseOutput(
+        _ output:       MLFeatureProvider,
+        scale:          CGFloat,
+        padX:           CGFloat,
+        padY:           CGFloat,
+        originalWidth:  CGFloat,
+        originalHeight: CGFloat
+    ) -> BowDetection? {
+        var best = [Candidate(), Candidate()]   // [bow, violin]
+
+        if output.featureNames.contains("confidence"),
+           output.featureNames.contains("coordinates"),
+           let conf = output.featureValue(for: "confidence")?.multiArrayValue,
+           let coords = output.featureValue(for: "coordinates")?.multiArrayValue {
+            // Pipeline-NMS export (nms=True): confidence [N, nc], coordinates [N, 4]
+            // with normalized (cx, cy, w, h) relative to the 640×640 input.
+            accumulatePipeline(conf: conf, coords: coords, into: &best)
+        } else if let key = output.featureNames.first(where: { $0.hasPrefix("output") })
+                        ?? output.featureNames.first,
+                  let arr = output.featureValue(for: key)?.multiArrayValue {
+            let shape = arr.shape.map { $0.intValue }
+            if shape.count == 3 && shape[0] == 1 && shape[1] == 4 + BowDetector.numClasses {
+                // Raw export: [1, 4+nc, N] — rows cx,cy,w,h,conf_bow,conf_violin
+                // in letterbox pixels. Argmax per class replaces NMS.
+                accumulateRawChannelFirst(arr, anchors: shape[2], into: &best)
+            } else if shape.count == 3 && shape[0] == 1 && shape[2] == 6 && shape[1] > 6 {
+                // NMS'd row export: [1, N, 6] — rows x1,y1,x2,y2,conf,cls
+                // in letterbox pixels.
+                accumulateNmsRows(arr, rows: shape[1], into: &best)
+            } else {
+                print("[BowDetector] Unexpected output shape: \(shape). Update parsing logic.")
+                return nil
+            }
+        } else {
+            print("[BowDetector] No parsable output found. Keys: \(output.featureNames)")
             return nil
         }
 
-        // Shape: [1, N, 14] — batch=1, up to N detections, 14 values each.
-        // Also handle transposed [1, 14, N] from non-NMS export.
-        let shape = arr.shape.map { $0.intValue }
+        func toBox(_ c: Candidate) -> DetectedBox {
+            let (nx1, ny1) = fromLetterbox(c.x1, c.y1, scale: scale, padX: padX, padY: padY,
+                                           W: originalWidth, H: originalHeight)
+            let (nx2, ny2) = fromLetterbox(c.x2, c.y2, scale: scale, padX: padX, padY: padY,
+                                           W: originalWidth, H: originalHeight)
+            return DetectedBox(x1: min(nx1, nx2), y1: min(ny1, ny2),
+                               x2: max(nx1, nx2), y2: max(ny1, ny2),
+                               confidence: c.conf)
+        }
 
-        var bestDetection: BowDetection? = nil
-        var bestConf: Float = BowDetector.confidenceThreshold
+        let bowCand    = best[BowDetector.bowClass]
+        let violinCand = best[BowDetector.violinClass]
+        let bow    = bowCand.conf    >= BowDetector.confidenceThreshold       ? toBox(bowCand)    : nil
+        let violin = violinCand.conf >= BowDetector.violinConfidenceThreshold ? toBox(violinCand) : nil
+        guard bow != nil || violin != nil else { return nil }
+        return BowDetection(bow: bow, violin: violin)
+    }
 
-        if shape.count == 3 && shape[0] == 1 {
-            let dim1 = shape[1], dim2 = shape[2]
-
-            if dim2 == 14 {
-                // [1, N, 14] — standard post-NMS layout
-                for i in 0..<dim1 {
-                    let conf = arr[[0, i, 4] as [NSNumber]].floatValue
-                    guard conf >= bestConf else { continue }
-                    let det = extractDetection(arr, row: i, colAxis: 1,
-                                               scale: scale, padX: padX, padY: padY,
-                                               W: originalWidth, H: originalHeight)
-                    if det != nil { bestConf = conf; bestDetection = det }
+    /// Pipeline-NMS layout: confidence [N, nc], coordinates [N, 4] normalized cxcywh.
+    private func accumulatePipeline(conf: MLMultiArray, coords: MLMultiArray,
+                                    into best: inout [Candidate]) {
+        let confShape = conf.shape.map { $0.intValue }
+        guard confShape.count == 2, confShape[1] >= BowDetector.numClasses else {
+            print("[BowDetector] Unexpected confidence shape: \(confShape)")
+            return
+        }
+        let n = confShape[0]
+        let side = Float(inputSize.width)
+        for i in 0..<n {
+            let cx = coords[[i, 0] as [NSNumber]].floatValue * side
+            let cy = coords[[i, 1] as [NSNumber]].floatValue * side
+            let w  = coords[[i, 2] as [NSNumber]].floatValue * side
+            let h  = coords[[i, 3] as [NSNumber]].floatValue * side
+            for cls in 0..<BowDetector.numClasses {
+                let c = conf[[i, cls] as [NSNumber]].floatValue
+                if c > best[cls].conf {
+                    best[cls] = Candidate(conf: c,
+                                          x1: cx - w / 2, y1: cy - h / 2,
+                                          x2: cx + w / 2, y2: cy + h / 2)
                 }
-            } else if dim1 == 14 {
-                // [1, 14, N] — pre-NMS transposed layout; take highest-conf column
-                for j in 0..<dim2 {
-                    let conf = arr[[0, 4, j] as [NSNumber]].floatValue
-                    guard conf >= bestConf else { continue }
-                    let det = extractDetectionTransposed(arr, col: j,
-                                                         scale: scale, padX: padX, padY: padY,
-                                                         W: originalWidth, H: originalHeight)
-                    if det != nil { bestConf = conf; bestDetection = det }
-                }
-            } else {
-                print("[BowDetector] Unexpected output shape: \(shape). Update parsing logic.")
             }
-        } else {
-            print("[BowDetector] Unexpected output dimensions: \(shape).")
         }
-
-        return bestDetection
     }
 
-    /// Extract one detection from a [1, N, 14] array at row `i`.
-    /// Post-NMS layout: cols 0-3 are x1,y1,x2,y2 in letterbox space.
-    private func extractDetection(
-        _ arr: MLMultiArray, row: Int, colAxis: Int,
-        scale: CGFloat, padX: CGFloat, padY: CGFloat,
-        W: CGFloat, H: CGFloat
-    ) -> BowDetection? {
-        let conf = arr[[0, row, 4] as [NSNumber]].floatValue
-        // Bounding box: x1,y1,x2,y2 in letterbox space
-        let bx1 = arr[[0, row, 0] as [NSNumber]].floatValue
-        let by1 = arr[[0, row, 1] as [NSNumber]].floatValue
-        let bx2 = arr[[0, row, 2] as [NSNumber]].floatValue
-        let by2 = arr[[0, row, 3] as [NSNumber]].floatValue
-        let (nx1, ny1) = fromLetterbox(bx1, by1, scale: scale, padX: padX, padY: padY, W: W, H: H)
-        let (nx2, ny2) = fromLetterbox(bx2, by2, scale: scale, padX: padX, padY: padY, W: W, H: H)
-
-        // Keypoints: indices 5-13 (tip: 5-7, frog: 8-10, contact: 11-13)
-        func kp(_ kpIdx: Int) -> (Float, Float, Bool) {
-            let base = 5 + kpIdx * 3
-            let kx = arr[[0, row, base    ] as [NSNumber]].floatValue
-            let ky = arr[[0, row, base + 1] as [NSNumber]].floatValue
-            let kv = arr[[0, row, base + 2] as [NSNumber]].floatValue
-            let (nx, ny) = fromLetterbox(kx, ky, scale: scale, padX: padX, padY: padY, W: W, H: H)
-            return (nx, ny, kv >= BowDetector.visibilityThreshold)
+    /// Raw layout: [1, 4+nc, N] — cx,cy,w,h then one confidence row per class.
+    private func accumulateRawChannelFirst(_ arr: MLMultiArray, anchors: Int,
+                                           into best: inout [Candidate]) {
+        for j in 0..<anchors {
+            for cls in 0..<BowDetector.numClasses {
+                let c = arr[[0, 4 + cls, j] as [NSNumber]].floatValue
+                guard c > best[cls].conf else { continue }
+                let cx = arr[[0, 0, j] as [NSNumber]].floatValue
+                let cy = arr[[0, 1, j] as [NSNumber]].floatValue
+                let w  = arr[[0, 2, j] as [NSNumber]].floatValue
+                let h  = arr[[0, 3, j] as [NSNumber]].floatValue
+                best[cls] = Candidate(conf: c,
+                                      x1: cx - w / 2, y1: cy - h / 2,
+                                      x2: cx + w / 2, y2: cy + h / 2)
+            }
         }
-
-        let (tx, ty, tv) = kp(0)
-        let (fx, fy, fv) = kp(1)
-        let (cx, cy, cv) = kp(2)
-
-        return BowDetection(
-            tipX: tx, tipY: ty, tipVisible: tv,
-            frogX: fx, frogY: fy, frogVisible: fv,
-            contactX: cx, contactY: cy, contactVisible: cv,
-            confidence: conf,
-            boxX1: min(nx1, nx2), boxY1: min(ny1, ny2),
-            boxX2: max(nx1, nx2), boxY2: max(ny1, ny2)
-        )
     }
 
-    /// Extract one detection from a [1, 14, N] array at column `j`.
-    /// Pre-NMS (raw YOLO) layout: rows 0-3 are cx,cy,w,h in letterbox space.
-    private func extractDetectionTransposed(
-        _ arr: MLMultiArray, col: Int,
-        scale: CGFloat, padX: CGFloat, padY: CGFloat,
-        W: CGFloat, H: CGFloat
-    ) -> BowDetection? {
-        let conf = arr[[0, 4, col] as [NSNumber]].floatValue
-
-        // Bounding box: cx,cy,w,h → convert to x1,y1,x2,y2
-        let bcx = arr[[0, 0, col] as [NSNumber]].floatValue
-        let bcy = arr[[0, 1, col] as [NSNumber]].floatValue
-        let bw  = arr[[0, 2, col] as [NSNumber]].floatValue
-        let bh  = arr[[0, 3, col] as [NSNumber]].floatValue
-        let (nx1, ny1) = fromLetterbox(bcx - bw / 2, bcy - bh / 2, scale: scale, padX: padX, padY: padY, W: W, H: H)
-        let (nx2, ny2) = fromLetterbox(bcx + bw / 2, bcy + bh / 2, scale: scale, padX: padX, padY: padY, W: W, H: H)
-
-        func kp(_ kpIdx: Int) -> (Float, Float, Bool) {
-            let base = 5 + kpIdx * 3
-            let kx = arr[[0, base,     col] as [NSNumber]].floatValue
-            let ky = arr[[0, base + 1, col] as [NSNumber]].floatValue
-            let kv = arr[[0, base + 2, col] as [NSNumber]].floatValue
-            let (nx, ny) = fromLetterbox(kx, ky, scale: scale, padX: padX, padY: padY, W: W, H: H)
-            return (nx, ny, kv >= BowDetector.visibilityThreshold)
+    /// NMS'd row layout: [1, N, 6] — x1,y1,x2,y2,conf,cls per row.
+    private func accumulateNmsRows(_ arr: MLMultiArray, rows: Int,
+                                   into best: inout [Candidate]) {
+        for i in 0..<rows {
+            let c = arr[[0, i, 4] as [NSNumber]].floatValue
+            let cls = Int(arr[[0, i, 5] as [NSNumber]].floatValue.rounded())
+            guard cls >= 0, cls < BowDetector.numClasses, c > best[cls].conf else { continue }
+            best[cls] = Candidate(conf: c,
+                                  x1: arr[[0, i, 0] as [NSNumber]].floatValue,
+                                  y1: arr[[0, i, 1] as [NSNumber]].floatValue,
+                                  x2: arr[[0, i, 2] as [NSNumber]].floatValue,
+                                  y2: arr[[0, i, 3] as [NSNumber]].floatValue)
         }
-
-        let (tx, ty, tv) = kp(0)
-        let (fx, fy, fv) = kp(1)
-        let (cx, cy, cv) = kp(2)
-
-        return BowDetection(
-            tipX: tx, tipY: ty, tipVisible: tv,
-            frogX: fx, frogY: fy, frogVisible: fv,
-            contactX: cx, contactY: cy, contactVisible: cv,
-            confidence: conf,
-            boxX1: min(nx1, nx2), boxY1: min(ny1, ny2),
-            boxX2: max(nx1, nx2), boxY2: max(ny1, ny2)
-        )
     }
 
     // MARK: - Coordinate conversion
 
-    /// Convert a keypoint from letterbox 640×640 space back to normalized original frame coords.
-    /// Matches the y-flip convention used by Vision in PoseCameraModule (y=0 = top).
+    /// Convert a point from letterbox 640×640 pixel space back to normalized
+    /// original-frame coords, TOP-LEFT origin (y grows downward).
+    ///
+    /// Image pixel space is already top-left origin, so no y-flip is applied —
+    /// this matches the pose joints, which PoseCameraModule flips out of
+    /// Vision's bottom-left convention with y = 1 − vy. (The old keypoint
+    /// detector flipped y here, which put bow coords in the OPPOSITE space
+    /// from the joints — do not reintroduce that flip.)
     private func fromLetterbox(
-        _ kx: Float, _ ky: Float,
+        _ px: Float, _ py: Float,
         scale: CGFloat, padX: CGFloat, padY: CGFloat,
         W: CGFloat, H: CGFloat
     ) -> (Float, Float) {
-        let origX = (CGFloat(kx) - padX) / scale
-        let origY = (CGFloat(ky) - padY) / scale
-        // Clamp to [0, 1] and flip y to match Vision coordinate convention
+        let origX = (CGFloat(px) - padX) / scale
+        let origY = (CGFloat(py) - padY) / scale
         let nx = Float(max(0, min(1, origX / W)))
-        let ny = Float(max(0, min(1, 1.0 - origY / H)))
+        let ny = Float(max(0, min(1, origY / H)))
         return (nx, ny)
     }
 

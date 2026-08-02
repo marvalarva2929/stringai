@@ -72,7 +72,8 @@ export default function SessionDetailScreen() {
   return (
     <ResultsCarousel
       result={result}
-      onDone={() => router.back()}
+      onDone={() => router.push({ pathname: '/practice/plan', params: { sessionId: result.sessionId } })}
+      onHome={() => router.back()}
     />
   );
 }

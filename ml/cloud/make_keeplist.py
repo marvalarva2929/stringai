@@ -38,6 +38,13 @@ def compute_keeplist(frames: list[dict], review: dict) -> tuple[dict, dict]:
     full_t = float(th["full_frame_area"])
     ratio_k = float(th["violin_ratio"])
     use_median = th.get("baseline") == "median"
+    # Optional: violin-WIDTH outlier filter (distinct from the area-ratio
+    # filter above) — drops frames where the violin box is unusually
+    # narrow/wide vs. the group's median width, in either direction. Off
+    # unless a caller (auto_keeplist.py) sets violin_width_low; the manual
+    # review.py path never does, so this is a no-op there.
+    width_low = th.get("violin_width_low")
+    width_high = th.get("violin_width_high") or (1 / width_low if width_low else None)
     refs = [n for n in review.get("references", [])]
     splits = {c: set(v) for c, v in review.get("splits", {}).items()}
 
@@ -80,10 +87,28 @@ def compute_keeplist(frames: list[dict], review: dict) -> tuple[dict, dict]:
         if rf and rf["violin"] is not None:
             base[rf["segKey"]] = rf["violin"]
 
+    # Per-group violin WIDTH median (always median, per the width filter's
+    # own spec — independent of the `baseline` setting above, which only
+    # governs the area-ratio filter). Same non-flag1 / ★-reference handling.
+    width_base: dict[str, float] = {}
+    if width_low:
+        widths_by_seg: dict[str, list[float]] = {}
+        for f in frames:
+            if not f["flag1"] and f.get("violin_w") is not None:
+                widths_by_seg.setdefault(f["segKey"], []).append(f["violin_w"])
+        for key, widths in widths_by_seg.items():
+            widths.sort()
+            width_base[key] = widths[len(widths) >> 1]
+        for n in refs:
+            rf = by_name.get(n)
+            if rf and rf.get("violin_w") is not None:
+                width_base[rf["segKey"]] = rf["violin_w"]
+
     # Filter 2 + salvage decisions
     keep: dict[str, dict] = {}
     stats = {"total": len(frames), "kept_clean": 0, "salvaged_bow_only": 0,
              "salvaged_violin_only": 0, "dropped_flag2": 0,
+             "dropped_width_outlier": 0,
              "dropped_full_frame": 0}
 
     for f in frames:
@@ -94,6 +119,13 @@ def compute_keeplist(frames: list[dict], review: dict) -> tuple[dict, dict]:
         if flag2:
             stats["dropped_flag2"] += 1
             continue
+
+        wb = width_base.get(f["segKey"]) if width_low else None
+        if not f["flag1"] and wb and f.get("violin_w") is not None:
+            wratio = f["violin_w"] / wb
+            if wratio < width_low or wratio > width_high:
+                stats["dropped_width_outlier"] += 1
+                continue
 
         if not f["flag1"]:
             classes = [c for c in ("bow", "violin") if f[c] is not None]

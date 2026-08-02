@@ -7,16 +7,27 @@ import {
   SafeAreaView,
   Pressable,
   Alert,
+  Linking,
 } from 'react-native';
 import { Ionicons, Octicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { useUserStore } from '../../src/store/useUserStore';
 import { useAuthStore } from '../../src/store/useAuthStore';
-import { signOut } from '../../src/services/auth';
+import { useEntitlementStore } from '../../src/store/useEntitlementStore';
+import { useReminderStore } from '../../src/store/useReminderStore';
+import {
+  FREE_DAILY_ANALYSES,
+  analysesRemaining,
+  isPro,
+  trialDaysRemaining,
+} from '../../src/lib/entitlements';
+import { MANAGE_SUBSCRIPTION_URL, restorePurchases } from '../../src/services/purchases';
+import { signOut, deleteAccount } from '../../src/services/auth';
 import { Card } from '../../src/components/ui/Card';
 import { Button } from '../../src/components/ui/Button';
 import { colors, spacing, radius } from '../../src/constants/theme';
 import { INSTRUMENTS } from '../../src/constants/instruments';
+import { PRIVACY_POLICY_URL, TERMS_OF_SERVICE_URL, SUPPORT_URL } from '../../src/constants/links';
 
 interface SettingsRowProps {
   label: string;
@@ -44,15 +55,44 @@ function SettingsRow({ label, value, onPress, destructive, icon }: SettingsRowPr
 export default function SettingsScreen() {
   const { profile } = useUserStore();
   const { isAuthenticated, signOut: clearAuth } = useAuthStore();
+  const { entitlement, applyCustomerInfo } = useEntitlementStore();
+  const { enabled: remindersEnabled, hour: reminderHour, minute: reminderMinute } = useReminderStore();
+
+  const reminderValue = remindersEnabled
+    ? new Date(2000, 0, 1, reminderHour, reminderMinute).toLocaleTimeString(undefined, {
+        hour: 'numeric',
+        minute: '2-digit',
+      })
+    : 'Off';
 
   const instrumentName = profile?.instrument
     ? INSTRUMENTS[profile.instrument]?.displayName ?? profile.instrument
     : 'Violin';
 
-  const tierLabel =
-    profile?.subscriptionTier === 'monthly' ? 'Monthly ($9.99/mo)'
-    : profile?.subscriptionTier === 'annual' ? 'Annual ($59.99/yr)'
-    : `Free (${2 - (profile?.freeAnalysesUsed ?? 0)} analyses left)`;
+  const pro = isPro(entitlement);
+
+  const tierLabel = !pro
+    ? `Free (${analysesRemaining(entitlement)} of ${FREE_DAILY_ANALYSES} today)`
+    : entitlement.inTrial
+      ? `Pro — trial, ${trialDaysRemaining(entitlement)} day${trialDaysRemaining(entitlement) === 1 ? '' : 's'} left`
+      : entitlement.expiresAt
+        ? `Pro — renews ${new Date(entitlement.expiresAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`
+        : 'Pro';
+
+  const handleRestore = async () => {
+    try {
+      const info = await restorePurchases();
+      if (info) applyCustomerInfo(info);
+      Alert.alert(
+        isPro(useEntitlementStore.getState().entitlement) ? 'Purchases Restored' : 'Nothing to Restore',
+        isPro(useEntitlementStore.getState().entitlement)
+          ? 'Your StringAI Pro subscription is active again.'
+          : 'We could not find an active subscription for this Apple ID.',
+      );
+    } catch (err: any) {
+      Alert.alert('Restore Failed', err?.message ?? 'Something went wrong.');
+    }
+  };
 
   const handleSignOut = () => {
     Alert.alert('Sign Out', 'Are you sure you want to sign out?', [
@@ -69,6 +109,33 @@ export default function SettingsScreen() {
         },
       },
     ]);
+  };
+
+  const handleDeleteAccount = () => {
+    Alert.alert(
+      'Delete Account',
+      'This permanently deletes your account and all of your saved sessions and progress. This cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete Account',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await deleteAccount();
+            } catch (err: any) {
+              Alert.alert(
+                'Could Not Delete Account',
+                err?.message ?? 'Something went wrong. Please try again or contact support.',
+              );
+              return;
+            }
+            clearAuth();
+            router.replace('/(auth)/login');
+          },
+        },
+      ],
+    );
   };
 
   return (
@@ -108,7 +175,7 @@ export default function SettingsScreen() {
         <Text style={styles.sectionHeader}>Subscription</Text>
         <Card padded={false} style={styles.section}>
           <SettingsRow icon={<Octicons name="star-fill" size={18} color="#f59e0b" />} label="Current Plan" value={tierLabel} />
-          {profile?.subscriptionTier === 'free' && (
+          {!pro && (
             <>
               <View style={styles.divider} />
               <SettingsRow
@@ -118,36 +185,75 @@ export default function SettingsScreen() {
               />
             </>
           )}
-          {profile?.subscriptionTier !== 'free' && (
+          {pro && (
             <>
               <View style={styles.divider} />
-              <SettingsRow icon="🚀" label="Manage Subscription" onPress={() => {
-                Alert.alert('Manage Subscription', 'Visit Settings > Apple ID > Subscriptions on your device.');
-              }} />
+              <SettingsRow
+                icon="🚀"
+                label="Manage Subscription"
+                onPress={() => { Linking.openURL(MANAGE_SUBSCRIPTION_URL).catch(() => {}); }}
+              />
             </>
           )}
+          {/* App Store review requires a restore path that is reachable without
+              purchasing, so this row is always present. */}
+          <View style={styles.divider} />
+          <SettingsRow icon="🔄" label="Restore Purchases" onPress={handleRestore} />
         </Card>
 
         {/* App section */}
         <Text style={styles.sectionHeader}>App</Text>
         <Card padded={false} style={styles.section}>
-          <SettingsRow icon="🔔" label="Practice Reminders" onPress={() => {
-            Alert.alert('Coming soon', 'Push notification reminders will be available in a future update.');
-          }} />
+          <SettingsRow
+            icon="🔔"
+            label="Practice Reminders"
+            value={reminderValue}
+            onPress={() => router.push('/reminders')}
+          />
           <View style={styles.divider} />
-          <SettingsRow icon="🔒" label="Privacy Policy" onPress={() => {}} />
+          <SettingsRow
+            icon="💬"
+            label="Help & Support"
+            onPress={() => { Linking.openURL(SUPPORT_URL).catch(() => {}); }}
+          />
           <View style={styles.divider} />
-          <SettingsRow icon="📄" label="Terms of Service" onPress={() => {}} />
+          <SettingsRow
+            icon="🔒"
+            label="Privacy Policy"
+            onPress={() => { Linking.openURL(PRIVACY_POLICY_URL).catch(() => {}); }}
+          />
+          <View style={styles.divider} />
+          <SettingsRow
+            icon="📄"
+            label="Terms of Service"
+            onPress={() => { Linking.openURL(TERMS_OF_SERVICE_URL).catch(() => {}); }}
+          />
         </Card>
 
-        {/* Sign out */}
-        <Button
-          label="Sign Out"
-          onPress={handleSignOut}
-          variant="outline"
-          fullWidth
-          size="md"
-        />
+        {/* Account deletion — App Store Guideline 5.1.1(v). Only shown to signed-in
+            users; a guest has no server-side account to delete. */}
+        {isAuthenticated && (
+          <Card padded={false} style={styles.section}>
+            <SettingsRow
+              icon="🗑️"
+              label="Delete Account"
+              destructive
+              onPress={handleDeleteAccount}
+            />
+          </Card>
+        )}
+
+        {/* Sign out — only meaningful for a signed-in user; a guest has no
+            session to end. */}
+        {isAuthenticated && (
+          <Button
+            label="Sign Out"
+            onPress={handleSignOut}
+            variant="outline"
+            fullWidth
+            size="md"
+          />
+        )}
 
         {__DEV__ && (
           <>

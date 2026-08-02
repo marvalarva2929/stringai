@@ -20,6 +20,9 @@ export interface InlineVideoPlayerProps {
   onMarkerPress?: (seconds: number) => void;
   /** Called at most every 250ms with the current playback position in seconds. */
   onTimeUpdate?: (seconds: number) => void;
+  /** When false, playback is paused. The results carousel mounts one of these per
+   *  page, so the off-screen ones must stop when their page scrolls away. */
+  active?: boolean;
 }
 
 const VIDEO_H = Math.round(Dimensions.get('window').height * 0.28);
@@ -63,7 +66,7 @@ const gs = StyleSheet.create({
 
 // ── Main player ────────────────────────────────────────────────────────────────
 export function InlineVideoPlayer({
-  uri, seekVersion, seekSeconds, seekEndSeconds, fullScreen, noteEvents, durationSeconds, onMarkerPress, onTimeUpdate,
+  uri, seekVersion, seekSeconds, seekEndSeconds, fullScreen, noteEvents, durationSeconds, onMarkerPress, onTimeUpdate, active = true,
 }: InlineVideoPlayerProps) {
   const videoRef  = useRef<Video>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -133,6 +136,13 @@ export function InlineVideoPlayer({
       shouldDuckAndroid: false,
     }).catch(() => {});
   }, []);
+
+  // Pause when this player's carousel page scrolls off-screen. Every page keeps
+  // its own Video mounted so it can slide with the carousel, which means without
+  // this the previous page's video keeps playing after you swipe away.
+  useEffect(() => {
+    if (!active) videoRef.current?.pauseAsync().catch(() => {});
+  }, [active]);
 
   // External seek (coaching card timestamp chips)
   useEffect(() => {

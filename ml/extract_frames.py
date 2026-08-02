@@ -123,46 +123,61 @@ def extract_video(
     return kept, dropped
 
 
-def find_videos(input_path: Path) -> list[Path]:
-    """Find all video files under input_path (file or directory)."""
+def find_videos(input_paths: list[Path]) -> list[Path]:
+    """Find all video files under input_paths (each a file or a directory)."""
     extensions = {".mp4", ".mov", ".avi", ".m4v", ".mkv"}
-    if input_path.is_file():
-        return [input_path] if input_path.suffix.lower() in extensions else []
-    return sorted(p for p in input_path.rglob("*") if p.suffix.lower() in extensions)
+    found: list[Path] = []
+    for input_path in input_paths:
+        if input_path.is_file():
+            if input_path.suffix.lower() in extensions:
+                found.append(input_path)
+        else:
+            found.extend(p for p in input_path.rglob("*") if p.suffix.lower() in extensions)
+    return sorted(set(found))
 
 
-def write_manifest(manifest_rows: list, output_dir: Path) -> None:
+def write_manifest(manifest_rows: list, output_dir: Path, append: bool) -> None:
     manifest_path = output_dir.parent / "manifest.csv"
     if not manifest_rows:
         return
     fieldnames = list(manifest_rows[0].keys())
-    with open(manifest_path, "w", newline="") as f:
+    write_header = not (append and manifest_path.exists())
+    mode = "a" if append else "w"
+    with open(manifest_path, mode, newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+        if write_header:
+            writer.writeheader()
         writer.writerows(manifest_rows)
-    print(f"\nManifest written: {manifest_path}  ({len(manifest_rows)} rows)")
+    verb = "appended to" if append and not write_header else "written"
+    print(f"\nManifest {verb}: {manifest_path}  ({len(manifest_rows)} row(s) this run)")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Extract training frames from violin videos.")
-    parser.add_argument("--input",    required=True,       help="Input video file or directory")
+    parser.add_argument("--input",    required=True, nargs="+",
+                        help="One or more video files and/or directories")
     parser.add_argument("--output",   default="data/raw_frames", help="Output directory for frames")
     parser.add_argument("--fps",      type=float, default=10.0,  help="Target extraction FPS (default: 10)")
     parser.add_argument("--min-diff", type=float, default=8.0,
                         help="Min mean-abs-diff to keep a frame (default: 8.0). "
                              "Higher = fewer frames kept.")
+    parser.add_argument("--append-manifest", action="store_true",
+                        help="Append to an existing manifest.csv instead of overwriting it "
+                             "(use when extracting only newly-added videos)")
     args = parser.parse_args()
 
-    input_path  = Path(args.input)
+    input_paths = [Path(p) for p in args.input]
     output_path = Path(args.output)
 
-    if not input_path.exists():
-        print(f"[ERROR] Input path does not exist: {input_path}", file=sys.stderr)
+    missing = [p for p in input_paths if not p.exists()]
+    if missing:
+        for p in missing:
+            print(f"[ERROR] Input path does not exist: {p}", file=sys.stderr)
         sys.exit(1)
 
-    videos = find_videos(input_path)
+    videos = find_videos(input_paths)
     if not videos:
-        print(f"[ERROR] No video files found under: {input_path}", file=sys.stderr)
+        print(f"[ERROR] No video files found under: {', '.join(str(p) for p in input_paths)}", file=sys.stderr)
         sys.exit(1)
 
     print(f"Found {len(videos)} video(s)  fps={args.fps}  min-diff={args.min_diff}\n")
@@ -182,16 +197,15 @@ def main():
         pct = 100 * kept / total if total > 0 else 0
         print(f"  kept={kept}  dropped={dropped}  retention={pct:.0f}%\n")
 
-    write_manifest(manifest_rows, output_path)
+    write_manifest(manifest_rows, output_path, args.append_manifest)
 
     total = total_kept + total_dropped
     pct = 100 * total_kept / total if total > 0 else 0
     print(f"Done. Total kept={total_kept}  dropped={total_dropped}  "
           f"overall retention={pct:.0f}%")
     print(f"Frames saved to: {output_path.resolve()}")
-    print(f"\nNext step: upload frames from {output_path.resolve()} to Roboflow.")
-    print("Label each frame with 3 keypoints: tip (KP0), frog (KP1), contact point (KP2).")
-    print("See bow_model.md for exact labeling instructions.")
+    print("\nNext step: python cloud/autolabel.py --input raw_frames/ --output dataset/ "
+          "(see GCE.md), or just run cloud/orchestrate.py end to end.")
 
 
 if __name__ == "__main__":

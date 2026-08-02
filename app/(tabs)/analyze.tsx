@@ -21,7 +21,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { CameraView, useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
 import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
-import * as FileSystem from 'expo-file-system';
+import { Directory, File, Paths } from 'expo-file-system';
 import { router, useNavigation } from 'expo-router';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useAnalysisStore } from '../../src/store/useAnalysisStore';
@@ -39,10 +39,19 @@ import {
 } from '../../src/lib/entitlements';
 import { isSupabaseConfigured } from '../../src/services/supabase';
 import { buildCoachingInput, fetchCoachingFeedback } from '../../src/services/llmFeedback';
+import { computePracticePlan } from '../../src/lib/practicePlan';
+import { candidatesFromBlocks } from '../../src/lib/practiceCuration';
+import { useCuratedPlanStore } from '../../src/store/useCuratedPlanStore';
 import { AnalysisTimeline } from '../../src/components/analysis/AnalysisTimeline';
-import { CoachingReport } from '../../src/components/analysis/CoachingReport';
+import { LiveCoachBanner } from '../../src/components/analysis/LiveCoachBanner';
+import { MetronomeSetup } from '../../src/components/analysis/MetronomeSetup';
+import { MetronomeBeatBar } from '../../src/components/analysis/MetronomeBeatBar';
+import { createLiveCoach, COACH_WINDOW_S, type LiveCoach, type LiveCue } from '../../src/lib/liveCoach';
+import { useMetronome } from '../../src/hooks/useMetronome';
+import { useMetronomeStore } from '../../src/store/useMetronomeStore';
 import { InlineVideoPlayer } from '../../src/components/analysis/InlineVideoPlayer';
 import { ResultsCarousel } from '../../src/components/analysis/ResultsCarousel';
+import { BowCalibrationFlow, type CaptureBowClip } from '../../src/components/practice/BowCalibrationFlow';
 import { Button } from '../../src/components/ui/Button';
 import { BigButton } from '../../src/components/ui/BigButton';
 import { MaestroAvatar } from '../../src/components/ui/MaestroAvatar';
@@ -56,28 +65,20 @@ import { INSTRUMENTS } from '../../src/constants/instruments';
 import { PoseSkeleton, PoseJoint, PoseJoints, HandLandmarks, LEFT_HAND_COLOR, RIGHT_HAND_COLOR } from '../../src/components/analysis/PoseSkeleton';
 import { startRecording as poseStartRecording, stopRecording as poseStopRecording, getPoseCameraView, setHomeIndicatorHidden } from 'pose-camera';
 import { FrameKeypoints } from '../../src/lib/poseScoring';
-import { deriveBowFrameFromBoxes } from '../../src/lib/bowBoxGeometry';
+import { createBowGeometryTracker, type NormPoint } from '../../src/lib/bowBoxGeometry';
 import { convertPoseFrame, extractVideoFrames } from '../../src/services/videoAnalysis';
 import { RawBowFrame } from '../../src/types/signals';
 import { debugLogNoteEvents, deriveIntonationAnalysis } from '../../src/lib/noteFusion';
 import { classifyVibratoSegment } from '../../src/services/pitchContour';
 import Svg, { Circle, Line, G, Rect, Path, Polygon, Text as SvgText } from 'react-native-svg';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useCalibrationStore } from '../../src/store/useCalibrationStore';
+import { CALIBRATION_ENABLED } from '../../src/constants/featureFlags';
 
-// Positional thresholds (normalized 0–1 frame coordinates, y increases downward)
-const ARM_TOO_LOW_THRESHOLD = 0.22;   // elbow drops this far below shoulder
-const WRIST_TOO_LOW_THRESHOLD = 0.12; // wrist drops this far below elbow
+// Confidence floor for the debug metrics panel. The live coaching thresholds
+// moved to src/lib/liveCoach.ts, which reads poseScoring's THRESHOLDS so the
+// numbers behind a live tip and behind the report are the same numbers.
 const JOINT_CONF_THRESHOLD = 0;
-// Palm orientation window for reliable wrist collapse detection.
-// palmNormalZ outside this range means the camera angle is off and the user
-// should reposition. Values calibrated from real playing.
-const PALM_NZ_MIN = -0.25;
-const PALM_NZ_MAX = 0;
-// Elbow-bend angle thresholds (shoulder–elbow–wrist, degrees).
-// Used only when hand landmarks are unavailable. "Too straight" is intentionally
-// omitted — the bow arm extends at the tip of every stroke and would false-positive.
-const BOW_ELBOW_MIN_ANGLE = 55;       // over-bent bow arm → wrist break
-const VIOLIN_ELBOW_MIN_ANGLE = 60;    // violin arm too bent → wrist collapse
 
 // Toggle if the skeleton appears mirrored or upside-down in the landscape view.
 const LANDSCAPE_FLIP = true;
@@ -103,19 +104,6 @@ function computeAngleDeg(
   const mag = Math.sqrt((abx ** 2 + aby ** 2) * (cbx ** 2 + cby ** 2));
   if (mag < 0.0001) return 90;
   return (Math.acos(Math.max(-1, Math.min(1, dot / mag))) * 180) / Math.PI;
-}
-
-// Z-component of the palm's unit normal vector (from MediaPipe world coords on PoseJoint).
-// Returns null when world coordinates are unavailable.
-// > 0: palm faces camera; < 0: dorsal (back of hand); ≈ 0: edge-on (unreliable).
-function livePalmNormalZ(hand: HandLandmarks | null): number | null {
-  const w = hand?.wrist, idx = hand?.indexMCP, rng = hand?.ringMCP;
-  if (!w?.wx || !idx?.wx || !rng?.wx) return null;
-  const ax = idx.wx - w.wx, ay = idx.wy! - w.wy!, az = idx.wz! - w.wz!;
-  const bx = rng.wx - w.wx, by = rng.wy! - w.wy!, bz = rng.wz! - w.wz!;
-  const cx = ay * bz - az * by, cy = az * bx - ax * bz, cz = ax * by - ay * bx;
-  const mag = Math.sqrt(cx * cx + cy * cy + cz * cz);
-  return mag < 0.0001 ? null : cz / mag;
 }
 
 // ─── Skeleton smoothing ───────────────────────────────────────────────────────
@@ -218,46 +206,10 @@ function liveWristDebugData(joints: PoseJoints): WristDebug {
   };
 }
 
-function evaluatePoseWarnings(
-  joints: PoseJoints,
-  leftHand: HandLandmarks | null,
-  rightHand: HandLandmarks | null,
-): string[] {
-  const ok = (j: { confidence: number } | undefined) =>
-    j != null && j.confidence >= JOINT_CONF_THRESHOLD;
-
-  const hasBowArm =
-    ok(joints.rightShoulder) && ok(joints.rightElbow) && ok(joints.rightWrist);
-  const hasViolinArm =
-    ok(joints.leftShoulder) && ok(joints.leftElbow) && ok(joints.leftWrist);
-
-  if (!hasBowArm && !hasViolinArm) return ['Move closer to the camera'];
-
-  const warnings: string[] = [];
-
-  if (hasBowArm) {
-    const rS = joints.rightShoulder!;
-    const rE = joints.rightElbow!;
-    const rW = joints.rightWrist!;
-    if (rE.y - rS.y > ARM_TOO_LOW_THRESHOLD) warnings.push('Lift your bow arm');
-    const bowAngle = computeAngleDeg(rS, rE, rW);
-    if (bowAngle < BOW_ELBOW_MIN_ANGLE) warnings.push('Open your bow elbow');
-  }
-
-  if (hasViolinArm) {
-    const pnz = livePalmNormalZ(leftHand);
-    if (pnz !== null && pnz > PALM_NZ_MAX) {
-      warnings.push('Turn slightly to your right');
-    } else if (pnz !== null && pnz < PALM_NZ_MIN) {
-      warnings.push('Turn slightly to your left');
-    } else {
-      const wa = liveWristAngle(joints, leftHand);
-      if (wa !== null && wa < 155) warnings.push('Straighten your left wrist');
-    }
-  }
-
-  return warnings;
-}
+// Live pose warnings used to be evaluated here, from raw joints, and never
+// rendered. They now come from src/lib/liveCoach.ts, which reads the same
+// FrameKeypoints/RawBowFrames the session report is scored from — see
+// LiveCoachBanner for how a cue is shown.
 
 // ─── Debug overlay ────────────────────────────────────────────────────────────
 
@@ -340,28 +292,26 @@ function detectAudioQualityWarning(
   return undefined;
 }
 
-const SESSIONS_DIR = FileSystem.documentDirectory ? FileSystem.documentDirectory + 'sessions/' : null;
+const SESSIONS_DIR = new Directory(Paths.document, 'sessions');
 
-async function pruneOldVideos(): Promise<void> {
-  if (!SESSIONS_DIR) return;
-  const files = await FileSystem.readDirectoryAsync(SESSIONS_DIR).catch(() => [] as string[]);
+function pruneOldVideos(): void {
+  if (!SESSIONS_DIR.exists) return;
+  const files = SESSIONS_DIR.list().filter((entry): entry is File => entry instanceof File);
   if (files.length <= 10) return;
-  const sorted = [...files].sort(); // session_<timestamp>.* — lexicographic = chronological
-  const toDelete = sorted.slice(0, sorted.length - 10);
-  await Promise.all(
-    toDelete.map((name) => FileSystem.deleteAsync(SESSIONS_DIR! + name, { idempotent: true })),
-  );
+  const sorted = [...files].sort((a, b) => a.name.localeCompare(b.name)); // session_<timestamp>.* — lexicographic = chronological
+  for (const stale of sorted.slice(0, sorted.length - 10)) {
+    try { stale.delete(); } catch { /* already gone — nothing to reclaim */ }
+  }
 }
 
-async function persistVideo(tempUri: string): Promise<string> {
+function persistVideo(tempUri: string): string {
   if (tempUri.startsWith('ph://')) return tempUri; // Photos library URI — directly playable
-  if (!SESSIONS_DIR) return tempUri;               // documentDirectory unavailable
   const ext = tempUri.split('.').pop() ?? 'mp4';
-  await FileSystem.makeDirectoryAsync(SESSIONS_DIR, { intermediates: true });
-  await pruneOldVideos();
-  const dest = `${SESSIONS_DIR}session_${Date.now()}.${ext}`;
-  await FileSystem.copyAsync({ from: tempUri, to: dest });
-  return dest;
+  SESSIONS_DIR.create({ intermediates: true, idempotent: true });
+  pruneOldVideos();
+  const dest = new File(SESSIONS_DIR, `session_${Date.now()}.${ext}`);
+  new File(tempUri).copy(dest);
+  return dest.uri;
 }
 
 const PHASE_LABELS: Record<string, string> = {
@@ -641,8 +591,9 @@ export default function AnalyzeScreen() {
     addToHistory, addToMetricHistory, cacheSessionResult, continueWithPiece,
   } = useAnalysisStore();
   const { profile } = useUserStore();
-  const { isAuthenticated, playerCategory } = useAuthStore();
+  const { isAuthenticated, playerCategory, weeklyGoalMinutes } = useAuthStore();
   const { entitlement, tryConsumeAnalysis } = useEntitlementStore();
+  const setCalibration = useCalibrationStore((s) => s.setCalibration);
 
   const liveRecordingUnlocked = canRecordLive(entitlement);
   const remainingToday = analysesRemaining(entitlement);
@@ -724,6 +675,15 @@ export default function AnalyzeScreen() {
   // Accumulated pose + bow frames for post-session scoring
   const poseFramesRef = useRef<FrameKeypoints[]>([]);
   const bowFramesRef  = useRef<RawBowFrame[]>([]);
+  // Owns the once-and-kept bow/string diagonal locks. Reset per session (see
+  // startRecording) so a new setup re-votes rather than inheriting stale corners.
+  const bowGeometryRef = useRef(createBowGeometryTracker());
+  const calibrationCaptureRef = useRef<{
+    frames: RawBowFrame[];
+    startedAt: number;
+    timeout: ReturnType<typeof setTimeout>;
+    resolve: (frames: RawBowFrame[]) => void;
+  } | null>(null);
   // Live detector boxes for the debug overlay (joint-space coords from native;
   // null = no detection yet). Bow is amber, violin cyan — same as the ml tools.
   const [liveBoxes, setLiveBoxes] = useState<{
@@ -732,19 +692,25 @@ export default function AnalyzeScreen() {
     violin: { x1: number; y1: number; x2: number; y2: number } | null;
     violinConf: number;
   } | null>(null);
-  // Last-seen violin box + timestamp. The violin is nearly stationary while
-  // playing but the detector only clears threshold on a minority of frames, so
-  // we hold the most recent box for a short window to give a stable overlay.
+  // Last-seen box + timestamp per class. Detection runs at ~10fps and each
+  // class clears its threshold independently, so each box is held for a short
+  // window to give a stable overlay instead of flickering per detector frame.
+  const lastBowRef = useRef<{ box: { x1: number; y1: number; x2: number; y2: number }; conf: number; t: number } | null>(null);
   const lastViolinRef = useRef<{ box: { x1: number; y1: number; x2: number; y2: number }; conf: number; t: number } | null>(null);
   const recordingStartTimeRef = useRef<number>(0);
-  const poseCheckIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // Warnings surface after appearing in 2 consecutive 1s checks (2s debounce).
-  const prevWarningsRef = useRef<Set<string>>(new Set());
-  // Tracks whether we've received the first pose frame this recording session.
-  const firstPoseRef = useRef(false);
-  const [poseWarnings, setPoseWarnings] = useState<string[]>([]);
+  const coachIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // The live coach's own state (cooldowns, running bow-angle baseline) lives
+  // in the engine; this ref just holds the instance across renders. Built
+  // lazily — this component re-renders at ~60fps while the skeleton animates,
+  // and useRef(createLiveCoach()) would allocate a coach on every one of them.
+  const coachRef = useRef<LiveCoach | null>(null);
+  const getCoach = () => (coachRef.current ??= createLiveCoach());
+  const [liveCue, setLiveCue] = useState<LiveCue | null>(null);
   const [liveVibratoScore, setLiveVibratoScore] = useState<number | null>(null);
   const pitchHistoryRef = useRef<(number | null)[]>([]);
+  // Loudness + tonality rings, aligned sample-for-sample with pitchHistoryRef.
+  const rmsHistoryRef = useRef<number[]>([]);
+  const clarityHistoryRef = useRef<number[]>([]);
   const pitchTickRef = useRef(0);
   const [pitchGraphData, setPitchGraphData] = useState<(number | null)[]>([]);
   const [debugMetrics, setDebugMetrics] = useState<DebugMetrics | null>(null);
@@ -759,12 +725,28 @@ export default function AnalyzeScreen() {
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [micPermission, requestMicPermission] = useMicrophonePermissions();
 
+  // Metronome — configured on the camera-position screen, free-running for the
+  // length of the take (the player decides when to stop, not a beat count).
+  const metronomeSettings = useMetronomeStore();
+  const metronome = useMetronome(
+    metronomeSettings.bpm,
+    Number.POSITIVE_INFINITY,
+    undefined,
+    { muted: !metronomeSettings.sound },
+  );
+  // Read through refs by the recording callbacks, which are memoized with empty
+  // deps so they stay stable across the take.
+  const metronomeRef = useRef(metronome);
+  metronomeRef.current = metronome;
+  const metronomeEnabledRef = useRef(metronomeSettings.enabled);
+  metronomeEnabledRef.current = metronomeSettings.enabled;
+
   const instrument = 'violin';
   const instrumentConfig = INSTRUMENTS[instrument];
 
-  // Hide the tab bar during recording and results so it doesn't overlap the camera/results UI.
+  // Hide the tab bar during recording, calibration, and results so it doesn't overlap the camera/results UI.
   useEffect(() => {
-    const hide = phase === 'recording' || phase === 'done';
+    const hide = phase === 'calibrating' || phase === 'recording' || phase === 'done';
     navigation.setOptions({
       tabBarStyle: hide
         ? { display: 'none' }
@@ -774,61 +756,86 @@ export default function AnalyzeScreen() {
     });
   }, [phase, navigation]);
 
-  // Reset camera-ready flag when we leave the camera phases so the next visit starts fresh.
+  // Pre-write the recording metronome's click WAV while the player reads the
+  // position tips, so the first beat of the take isn't delayed by file I/O.
+  // preload() only writes the file — it does NOT reconfigure the audio session
+  // (that would interrupt the live camera preview, and with it the pose/bow
+  // stream calibration depends on); the session is set up lazily when the
+  // metronome first plays, at recording start.
+  const preloadMetronome = metronome.preload;
   useEffect(() => {
-    const inCameraPhase = phase === 'camera_tip' || phase === 'recording';
+    if (phase === 'camera_tip' && metronomeSettings.enabled) void preloadMetronome();
+  }, [phase, metronomeSettings.enabled, preloadMetronome]);
+
+  // Reset camera-ready flag when we leave the camera phases so the next visit starts fresh.
+  //
+  // The diagonal locks are reset here too — on EXIT, not between phases. Calibration
+  // and the recording that follows it are one camera setup, so they must share one
+  // locked bow axis and string diagonal; re-voting at the start of recording could
+  // land on the other diagonal and invalidate the calibration that was just captured.
+  useEffect(() => {
+    const inCameraPhase = phase === 'camera_tip' || phase === 'calibrating' || phase === 'recording';
     if (!inCameraPhase) {
       cameraReadyRef.current = false;
       pendingRecordingRef.current = false;
+      bowGeometryRef.current.reset();
     }
   }, [phase]);
 
-  // Run a pose check every 1s during recording
+  // Live coaching: 4 Hz is fast enough that a cue lands while the player is
+  // still doing the thing, and slow enough that re-deriving the bow window is
+  // free next to the pose/detector work already running each frame.
   useEffect(() => {
     if (phase !== 'recording') {
-      if (poseCheckIntervalRef.current) {
-        clearInterval(poseCheckIntervalRef.current);
-        poseCheckIntervalRef.current = null;
+      if (coachIntervalRef.current) {
+        clearInterval(coachIntervalRef.current);
+        coachIntervalRef.current = null;
       }
-      setPoseWarnings([]);
+      setLiveCue(null);
       return;
     }
-    poseCheckIntervalRef.current = setInterval(() => {
-      const raw = evaluatePoseWarnings(
-        poseJointsRef.current,
-        leftHandRef.current,
-        rightHandRef.current,
+    coachIntervalRef.current = setInterval(() => {
+      // Nothing to coach on until the take is actually recording frames.
+      if (!recordingActiveRef.current || recordingStartTimeRef.current === 0) return;
+      const t = (Date.now() - recordingStartTimeRef.current) / 1000;
+      const cutoff = t - COACH_WINDOW_S;
+      setLiveCue(
+        getCoach().tick({
+          t,
+          poseFrames: poseFramesRef.current.filter((f) => f.timestamp >= cutoff),
+          bowFrames: bowFramesRef.current.filter((f) => f.timestamp >= cutoff),
+          pitchHz: pitchHistoryRef.current,
+          rms: rmsHistoryRef.current,
+          clarity: clarityHistoryRef.current,
+        }),
       );
-      // "Arm not detected" always shows immediately (structural, not angle-based).
-      // All other warnings require two consecutive checks to surface, which
-      // filters out single-frame projection artifacts from normal bow strokes.
-      const persistent = raw.filter(
-        w => w.includes('not detected') || prevWarningsRef.current.has(w),
-      );
-      prevWarningsRef.current = new Set(raw);
-      setPoseWarnings(persistent);
-    }, 1000);
+    }, 250);
     return () => {
-      if (poseCheckIntervalRef.current) {
-        clearInterval(poseCheckIntervalRef.current);
-        poseCheckIntervalRef.current = null;
+      if (coachIntervalRef.current) {
+        clearInterval(coachIntervalRef.current);
+        coachIntervalRef.current = null;
       }
     };
   }, [phase]);
 
-  // Clear pitch history when recording starts/stops
+  // Clear pitch history when recording starts/stops. Also the backstop that
+  // silences the metronome on any path out of recording — a cancelled take or
+  // a navigation away never reaches onPoseRecordingFinished.
   useEffect(() => {
     if (phase !== 'recording') {
       pitchHistoryRef.current = [];
+      rmsHistoryRef.current = [];
+      clarityHistoryRef.current = [];
       setPitchGraphData([]);
       setLiveVibratoScore(null);
+      metronomeRef.current.stop();
     }
   }, [phase]);
 
   // Animation loop: lerps displayed skeleton toward the 15-fps target at ~60 fps
   // so joints glide smoothly rather than teleporting on each pose event.
   useEffect(() => {
-    if (phase !== 'camera_tip' && phase !== 'recording') {
+    if (phase !== 'camera_tip' && phase !== 'calibrating' && phase !== 'recording') {
       displayJointsRef.current   = {};
       displayLeftHandRef.current  = null;
       displayRightHandRef.current = null;
@@ -905,6 +912,43 @@ export default function AnalyzeScreen() {
     timerRef.current = setInterval(() => { elapsedRef.current++; setElapsed((s) => s + 1); }, 1000);
     await poseStartRecording();
     setHomeIndicatorHidden(true);
+    // Started after the capture is running so the first click lands on a take
+    // that is already recording. The click sound itself was loaded back on the
+    // camera-position screen (MetronomeSetup), not here.
+    if (metronomeEnabledRef.current) void metronomeRef.current.start();
+  }, []);
+
+  const captureBowClip = useCallback<CaptureBowClip>((durationMs) => {
+    return new Promise((resolve) => {
+      const existing = calibrationCaptureRef.current;
+      if (existing) {
+        clearTimeout(existing.timeout);
+        existing.resolve(existing.frames);
+      }
+
+      const timeout = setTimeout(() => {
+        const capture = calibrationCaptureRef.current;
+        calibrationCaptureRef.current = null;
+        resolve(capture?.frames ?? []);
+      }, durationMs);
+
+      calibrationCaptureRef.current = {
+        frames: [],
+        startedAt: Date.now(),
+        timeout,
+        resolve,
+      };
+    });
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      const capture = calibrationCaptureRef.current;
+      if (!capture) return;
+      clearTimeout(capture.timeout);
+      calibrationCaptureRef.current = null;
+      capture.resolve(capture.frames);
+    };
   }, []);
 
   const startRecording = async () => {
@@ -920,10 +964,13 @@ export default function AnalyzeScreen() {
     recordingActiveRef.current   = false;
     elapsedRef.current           = 0;
     setElapsed(0);
-    prevWarningsRef.current       = new Set();
-    firstPoseRef.current          = false;
+    // A new take is a new coaching session: cooldowns and the running bow-angle
+    // baseline must not carry over from the previous one.
+    getCoach().reset();
+    setLiveCue(null);
     poseFramesRef.current         = [];
     bowFramesRef.current          = [];
+    lastBowRef.current            = null;
     lastViolinRef.current         = null;
     setLiveBoxes(null);
     recordingStartTimeRef.current = 0;
@@ -936,8 +983,22 @@ export default function AnalyzeScreen() {
     }
   };
 
+  const startCalibrationOrRecording = async () => {
+    // Calibration is stubbed out (see CALIBRATION_ENABLED) — go straight to recording.
+    if (!usingPoseCamera || !CALIBRATION_ENABLED) {
+      await startRecording();
+      return;
+    }
+    if (!cameraPermission?.granted) {
+      const { granted } = await requestCameraPermission();
+      if (!granted) { Alert.alert('Camera Permission', 'Camera access is needed to calibrate bow placement.'); return; }
+    }
+    haptic.medium();
+    setPhase('calibrating');
+  };
+
   // Called when PoseCameraView signals the camera is ready.
-  // May fire during camera_tip (pre-warm) or during recording (cold start fallback).
+  // May fire during camera_tip/calibrating (pre-warm) or during recording (cold start fallback).
   const onPoseCameraReady = useCallback(async () => {
     cameraReadyRef.current = true;
     if (pendingRecordingRef.current) {
@@ -950,6 +1011,7 @@ export default function AnalyzeScreen() {
   const onPoseRecordingFinished = useCallback(async (e: any) => {
     recordingActiveRef.current = false;
     setHomeIndicatorHidden(false);
+    metronomeRef.current.stop();
     if (timerRef.current) clearInterval(timerRef.current);
     const { uri, error } = e.nativeEvent ?? e;
     if (error || !uri) {
@@ -962,16 +1024,35 @@ export default function AnalyzeScreen() {
 
   const handleStopPoseRecording = useCallback(async () => {
     haptic.medium();
+    // Stopped here as well as in onPoseRecordingFinished, so the clicking ends
+    // the moment the player hits stop rather than when the file finishes writing.
+    metronomeRef.current.stop();
     await poseStopRecording();
   }, []);
 
   const PITCH_HISTORY_SIZE = 80;  // 80 × 50ms = 4 seconds
 
   const onPitchEvent = useCallback((e: any) => {
-    const hz: number | null = e.nativeEvent?.frequency ?? null;
+    const ev = e.nativeEvent ?? e;
+    const hz: number | null = ev?.frequency ?? null;
     const history = pitchHistoryRef.current;
     history.push(hz && hz > 60 && hz < 1600 ? hz : null);
     if (history.length > PITCH_HISTORY_SIZE) history.shift();
+
+    // Loudness + tonality arrive alongside the pitch on builds that carry them.
+    // Older native builds send neither, and the coach falls back to
+    // frequency-only voicing (and skips the tone cues) rather than treating the
+    // take as silent. Pushed together so the two rings stay aligned with pitch.
+    if (typeof ev?.rms === 'number') {
+      const rmsHistory = rmsHistoryRef.current;
+      rmsHistory.push(ev.rms);
+      if (rmsHistory.length > PITCH_HISTORY_SIZE) rmsHistory.shift();
+    }
+    if (typeof ev?.clarity === 'number') {
+      const clarityHistory = clarityHistoryRef.current;
+      clarityHistory.push(ev.clarity);
+      if (clarityHistory.length > PITCH_HISTORY_SIZE) clarityHistory.shift();
+    }
 
     // Update graph + vibrato score every 3 events (~150ms)
     pitchTickRef.current += 1;
@@ -1036,7 +1117,7 @@ export default function AnalyzeScreen() {
     let videoUri: string | undefined;
     if (isVideo) {
       try {
-        videoUri = await persistVideo(uri);
+        videoUri = persistVideo(uri);
       } catch {
         // Copy failed — fall back to original URI (valid for this session)
         videoUri = uri;
@@ -1091,6 +1172,7 @@ export default function AnalyzeScreen() {
             durationSeconds: durationSec,
             instrument,
             userCategory,
+            calibration: useCalibrationStore.getState().calibration,
           })
         : null;
 
@@ -1193,6 +1275,7 @@ export default function AnalyzeScreen() {
         vibratoAnalysis: audioOutput?.vibratoAnalysis,
         rhythmAnalysis: audioOutput?.rhythmAnalysis,
         audioQualityWarning,
+        metronomeBpm: metronomeSettings.enabled ? metronomeSettings.bpm : undefined,
         videoUri,
         noteEvents,
         patternFindings: pipeline?.findings,
@@ -1206,12 +1289,14 @@ export default function AnalyzeScreen() {
       result.sessionEvidence = buildSessionEvidence(result);
 
       // Write wrist debug data to a file so it can be pulled via xcrun devicectl.
-      const wristDbg = videoMetrics.find(m => m.key === 'leftHandWrist')?.debugSeries;
-      if (wristDbg && FileSystem.documentDirectory) {
-        FileSystem.writeAsStringAsync(
-          FileSystem.documentDirectory + 'wrist_debug.json',
-          JSON.stringify(wristDbg),
-        ).catch(() => {});
+      // Dev-only — release builds shouldn't spend I/O on a debugging artifact.
+      if (__DEV__) {
+        const wristDbg = videoMetrics.find(m => m.key === 'leftHandWrist')?.debugSeries;
+        if (wristDbg) {
+          try {
+            new File(Paths.document, 'wrist_debug.json').write(JSON.stringify(wristDbg));
+          } catch { /* debug aid only — never fail the analysis over it */ }
+        }
       }
 
       // Quota was already consumed at the top of processMedia.
@@ -1220,16 +1305,23 @@ export default function AnalyzeScreen() {
       }
       addToHistory(sessionToSummary(result));
       addToMetricHistory({ sessionId, recordedAt, scores: allMetrics, evidence: result.sessionEvidence, pieceId: result.piece?.id });
+
+      // Set before the first render so the results screen shows a coaching
+      // loading state immediately rather than flashing static→loading→real.
+      const willFetchCoaching =
+        canUseLlmCoaching(entitlement) && isAuthenticated && !!profile?.id && isSupabaseConfigured && !!pipeline;
+      result.coachingPending = willFetchCoaching;
       cacheSessionResult(result);
 
       setResult(result);
 
       // L10: upgrade the static feedback with Claude coaching. Non-blocking —
-      // the UI already shows the template feedback; on success the richer
-      // response is merged in and cached on the session row so re-viewing
-      // never re-calls the LLM. Pro only: free users keep the template feedback,
-      // and the Edge Function independently rejects them with a 402.
-      if (canUseLlmCoaching(entitlement) && isAuthenticated && profile?.id && isSupabaseConfigured && pipeline) {
+      // the UI shows a coaching-loading state (coachingPending, set above) until
+      // this resolves; on success the richer response is merged in and cached on
+      // the session row so re-viewing never re-calls the LLM. Pro only: free
+      // users keep the template feedback, and the Edge Function independently
+      // rejects them with a 402.
+      if (willFetchCoaching) {
         const coachingInput = buildCoachingInput(
           allMetrics,
           sessionAssessment.playerCategory,
@@ -1239,16 +1331,44 @@ export default function AnalyzeScreen() {
           pipeline.phraseFeatures,
           result.sessionEvidence,
         );
-        fetchCoachingFeedback(coachingInput)
+        // The deterministic session-scoped plan doubles as the fallback for
+        // grounding Claude's blocks (Phase 3.6) and its `id` is the planId the
+        // curated copy gets stored under — computed once here rather than left
+        // to drift from whatever usePracticePlan computes later at render time.
+        const sessionPlan = computePracticePlan({
+          recentSessions: [result],
+          metricHistory: [],
+          playerCategory: profile?.playerCategory ?? sessionAssessment.playerCategory,
+          weeklyGoalMinutes: profile?.weeklyGoalMinutes ?? weeklyGoalMinutes,
+          skillLevel,
+          sessionWindow: 1,
+          scope: { kind: 'session', sessionId },
+        });
+        const fallbackBlocks = candidatesFromBlocks(sessionPlan.blocks);
+        fetchCoachingFeedback(coachingInput, result.sessionEvidence ?? [], fallbackBlocks)
           .then((claudeFeedback) => {
-            const upgraded: AnalysisResult = { ...result, llmFeedback: claudeFeedback };
+            if (claudeFeedback.curatedBlocks) {
+              useCuratedPlanStore.getState().setCuratedBlocks(sessionPlan.id, claudeFeedback.curatedBlocks);
+            }
+            // curatedBlocks lives in useCuratedPlanStore, not on the persisted
+            // llmFeedback — strip it so re-viewing this session doesn't read a
+            // second, potentially stale copy from AnalysisResult.
+            const { curatedBlocks, ...persistedFeedback } = claudeFeedback;
+            const upgraded: AnalysisResult = { ...result, llmFeedback: persistedFeedback, coachingPending: false };
             cacheSessionResult(upgraded);
             // Only swap the visible result if the user is still on this session
             const { currentResult } = useAnalysisStore.getState();
             if (currentResult?.sessionId === result.sessionId) setResult(upgraded);
-            updateSessionLlmFeedback(result.sessionId, claudeFeedback).catch(() => {});
+            updateSessionLlmFeedback(result.sessionId, persistedFeedback).catch(() => {});
           })
-          .catch(() => {});
+          .catch(() => {
+            // Network/timeout/malformed — keep the static template, just stop
+            // showing the coaching-loading state so it doesn't spin forever.
+            const cleared: AnalysisResult = { ...result, coachingPending: false };
+            cacheSessionResult(cleared);
+            const { currentResult } = useAnalysisStore.getState();
+            if (currentResult?.sessionId === result.sessionId) setResult(cleared);
+          });
       }
     } catch (err: any) {
       setError(err.message ?? 'Analysis failed');
@@ -1296,7 +1416,7 @@ export default function AnalyzeScreen() {
                 showsVerticalScrollIndicator={false}
               >
                 {/* Title */}
-                <Text style={styles.setupTitle}>Start New{'\n'}Session</Text>
+                <Text style={styles.setupTitle}>Start Practice{'\n'}Session</Text>
 
                 {/* Search box */}
                 <View style={styles.searchBox}>
@@ -1505,7 +1625,7 @@ export default function AnalyzeScreen() {
   }
 
   // ── Camera position guide + Calibrating + Recording (shared block so PoseCameraView stays mounted) ──
-  if (phase === 'camera_tip' || phase === 'recording') {
+  if (phase === 'camera_tip' || phase === 'calibrating' || phase === 'recording') {
     const isRecording = phase === 'recording';
     const lsContainer   = {
       position: 'absolute' as const,
@@ -1551,29 +1671,49 @@ export default function AnalyzeScreen() {
 
               // Bow + violin boxes — present only on ~10fps detector frames.
               // Coords arrive already in the joints' space (see PoseCameraView).
+              //
+              // One tracker call per frame produces the overlay lines AND the frame
+              // that gets scored, with both diagonals locked once (see
+              // createBowGeometryTracker) so the bow axis and string line can't flip
+              // mid-session. It also holds the last violin box, since the detector
+              // only clears threshold on a minority of frames.
               const bowBox = ev.bowBox ?? null;
-              if (bowBox) {
-                // TEMP DIAGNOSTIC — surfaces bow/violin detection to the Metro
-                // JS console (native Swift print() does NOT reach Metro). If
-                // violinBox is null the model isn't clearing the NMS floor (0.10).
-                console.log(`[DETECT] bow=${(ev.bowConfidence ?? 0).toFixed(3)} ` +
-                  `violin=${ev.violinBox ? (ev.violinConfidence ?? 0).toFixed(3) : 'NONE'}`);
-                // Persist the violin box: the detector clears threshold on only a
-                // minority of frames, but the violin barely moves — hold the last
-                // box for VIOLIN_HOLD_MS so the overlay stays stable to test with.
-                const VIOLIN_HOLD_MS = 4000;
+              const geometry = bowBox
+                ? bowGeometryRef.current.push({
+                    timestamp: Date.now() / 1000,
+                    bowBox,
+                    bowConfidence: ev.bowConfidence ?? 0,
+                    violinBox: ev.violinBox ?? null,
+                    rightWrist: joints.rightWrist ?? null,
+                    leftWrist: joints.leftWrist ?? null,
+                  })
+                : null;
+
+              if (bowBox || ev.violinBox) {
+                const HOLD_MS = 4000;
                 const nowMs = Date.now();
+                if (bowBox) {
+                  lastBowRef.current = { box: bowBox, conf: ev.bowConfidence ?? 0, t: nowMs };
+                }
                 if (ev.violinBox) {
                   lastViolinRef.current = { box: ev.violinBox, conf: ev.violinConfidence ?? 0, t: nowMs };
                 }
-                const held = lastViolinRef.current;
-                const violinFresh = held && nowMs - held.t < VIOLIN_HOLD_MS;
+                const bowHeld = lastBowRef.current;
+                const violinHeld = lastViolinRef.current;
+                const bowFresh = bowHeld && nowMs - bowHeld.t < HOLD_MS;
+                const violinFresh = violinHeld && nowMs - violinHeld.t < HOLD_MS;
                 setLiveBoxes({
-                  bow: bowBox,
-                  bowConf: ev.bowConfidence ?? 0,
-                  violin: violinFresh ? held!.box : null,
-                  violinConf: violinFresh ? held!.conf : 0,
+                  bow: bowFresh ? bowHeld!.box : null,
+                  bowConf: bowFresh ? bowHeld!.conf : 0,
+                  violin: violinFresh ? violinHeld!.box : null,
+                  violinConf: violinFresh ? violinHeld!.conf : 0,
                 });
+              }
+
+              const calibrationCapture = calibrationCaptureRef.current;
+              if (calibrationCapture && geometry?.bowFrame) {
+                const ts = (Date.now() - calibrationCapture.startedAt) / 1000;
+                calibrationCapture.frames.push({ ...geometry.bowFrame, timestamp: ts });
               }
 
               if (recordingActiveRef.current) {
@@ -1581,21 +1721,8 @@ export default function AnalyzeScreen() {
                   ? (Date.now() - recordingStartTimeRef.current) / 1000
                   : elapsedRef.current;
                 poseFramesRef.current.push(convertPoseFrame(joints, lh, rh, ts));
-                // Derive tip/frog/contact from the boxes + wrists (same space).
-                if (bowBox) {
-                  const bowFrame = deriveBowFrameFromBoxes({
-                    timestamp: ts,
-                    bowBox,
-                    bowConfidence: ev.bowConfidence ?? 0,
-                    violinBox: ev.violinBox ?? null,
-                    rightWrist: joints.rightWrist ?? null,
-                    leftWrist: joints.leftWrist ?? null,
-                  });
-                  if (bowFrame) bowFramesRef.current.push(bowFrame);
-                }
-                if (!firstPoseRef.current) {
-                  firstPoseRef.current = true;
-                  prevWarningsRef.current = new Set(evaluatePoseWarnings(joints, lh, rh));
+                if (geometry?.bowFrame) {
+                  bowFramesRef.current.push({ ...geometry.bowFrame, timestamp: ts });
                 }
               }
             }}
@@ -1708,9 +1835,13 @@ export default function AnalyzeScreen() {
             </View>
           </View>
 
+          {/* Last chance to set a tempo — once recording starts the phone is
+              across the room and out of reach. */}
+          <MetronomeSetup />
+
           <Button
             label="Ready — Start Recording"
-            onPress={startRecording}
+            onPress={startCalibrationOrRecording}
             size="lg"
             fullWidth
           />
@@ -1733,8 +1864,8 @@ export default function AnalyzeScreen() {
           />
         )}
 
-        {/* Arm skeleton overlay — temporarily hidden for bow detection testing */}
-        {false && isRecording && usingPoseCamera && Object.keys(poseJoints).length > 0 && (
+        {/* Arm skeleton overlay */}
+        {isRecording && usingPoseCamera && Object.keys(poseJoints).length > 0 && (
           <PoseSkeleton
             joints={poseJoints}
             leftHand={leftHand}
@@ -1745,8 +1876,9 @@ export default function AnalyzeScreen() {
           />
         )}
 
-        {/* Detector debug overlay — bow (amber) + violin (cyan) boxes only */}
-        {isRecording && usingPoseCamera && liveBoxes && (() => {
+        {/* Detector overlay — bow (amber) + violin (cyan) boxes with confidence,
+            shown during calibration and recording alike */}
+        {(isRecording || phase === 'calibrating') && usingPoseCamera && liveBoxes && (() => {
           const toRect = (b: { x1: number; y1: number; x2: number; y2: number }) => {
             const c1 = jointToScreen(b.x1, b.y1);
             const c2 = jointToScreen(b.x2, b.y2);
@@ -1766,25 +1898,73 @@ export default function AnalyzeScreen() {
             },
           ].filter(Boolean) as Array<{ key: string; r: { x: number; y: number; w: number; h: number }; color: string; label: string }>;
           return (
-            <Svg style={StyleSheet.absoluteFillObject} width={screenWidth} height={screenHeight} pointerEvents="none">
-              {entries.map(({ key, r, color, label }) => (
-                <G key={key}>
-                  <Rect x={r.x} y={r.y} width={r.w} height={r.h}
-                    fill="none" stroke={color} strokeWidth={2.5} rx={4} />
-                  <Rect x={r.x} y={Math.max(r.y - 18, 0)} width={label.length * 7 + 8} height={18}
-                    fill="rgba(0,0,0,0.55)" rx={3} />
-                  <SvgText x={r.x + 4} y={Math.max(r.y - 5, 13)} fontSize={11} fontWeight="700" fill={color}>
-                    {label}
-                  </SvgText>
-                </G>
-              ))}
-            </Svg>
+            // Wrapped in a pointerEvents="none" View — that reliably passes taps
+            // through, whereas the same prop on <Svg> alone is not dependable.
+            <View style={StyleSheet.absoluteFillObject} pointerEvents="none">
+              <Svg style={StyleSheet.absoluteFillObject} width={screenWidth} height={screenHeight}>
+                {entries.map(({ key, r, color, label }) => (
+                  <G key={key}>
+                    <Rect x={r.x} y={r.y} width={r.w} height={r.h}
+                      fill="none" stroke={color} strokeWidth={2.5} rx={4} />
+                    <Rect x={r.x} y={Math.max(r.y - 18, 0)} width={label.length * 7 + 8} height={18}
+                      fill="rgba(0,0,0,0.55)" rx={3} />
+                    <SvgText x={r.x + 4} y={Math.max(r.y - 5, 13)} fontSize={11} fontWeight="700" fill={color}>
+                      {label}
+                    </SvgText>
+                  </G>
+                ))}
+              </Svg>
+            </View>
           );
         })()}
 
-        {/* Recording HUD — pitch graph + wrist angle + vibrato badge + stop button */}
+        {/* Calibration UI — rendered AFTER the detector overlay so it sits on
+            top of it. The overlay is a full-screen <Svg>, and pointerEvents="none"
+            is not reliably honored on react-native-svg's Svg (only on a View), so
+            if the calibration panel were underneath it the Svg would swallow every
+            tap and the "Calibrate" button would do nothing. The recording HUD's
+            stop button works for the same reason — it too renders above the overlay. */}
+        {phase === 'calibrating' && (
+          <View style={lsContainer}>
+            <BowCalibrationFlow
+              captureBowClip={captureBowClip}
+              completeLabel="Start recording"
+              onCancel={() => setPhase('camera_tip')}
+              onSkip={() => { void startRecording(); }}
+              onComplete={(calibration) => {
+                setCalibration(calibration);
+                void startRecording();
+              }}
+            />
+          </View>
+        )}
+
+        {/* Recording HUD — live coaching + metronome + stop button */}
         {isRecording && (
           <View style={lsContainer} pointerEvents="box-none">
+            {/* Metronome beat: a bar across the very top edge, bright on the
+                downbeat. Peripheral vision picks this up without the player
+                having to look away from the bow. */}
+            {metronomeSettings.enabled && (
+              <MetronomeBeatBar beat={metronome.currentBeat} beatInBar={metronome.beatInBar} />
+            )}
+
+            {/* Status chip: elapsed time, plus the tempo when a metronome runs.
+                Bottom corner opposite the stop button — the top strip belongs
+                to the coach banner, and nothing may crowd that. */}
+            <View style={[styles.recStatusChip, { bottom: insets.bottom + 14 }]} pointerEvents="none">
+              <View style={styles.recStatusDot} />
+              <Text style={styles.recStatusText}>
+                {Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, '0')}
+              </Text>
+              {metronomeSettings.enabled && (
+                <Text style={styles.recStatusBpm}>{metronomeSettings.bpm} BPM</Text>
+              )}
+            </View>
+
+            {/* The live coach — one cue at a time, top-centre. */}
+            <LiveCoachBanner cue={liveCue} />
+
             {/* Pitch graph — temporarily hidden for bow detection testing */}
             {false && usingPoseCamera && (
               <View style={styles.recGraphOuter} pointerEvents="none">
@@ -1926,6 +2106,10 @@ export default function AnalyzeScreen() {
           const sessionId = currentResult.sessionId;
           reset();
           router.push({ pathname: '/practice/plan', params: { sessionId } });
+        }}
+        onHome={() => {
+          reset();
+          router.replace('/(tabs)/home');
         }}
       />
     );
@@ -2626,6 +2810,38 @@ const styles = StyleSheet.create({
     position: 'absolute',
     bottom: 0,
     left: 16,
+  },
+
+  // ── Live coaching HUD ──────────────────────────────────────────────────────
+  // The banner itself lives in LiveCoachBanner; these are the two small
+  // persistent pieces that sit alongside it without competing for attention.
+  recStatusChip: {
+    position: 'absolute',
+    right: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: radius.full,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+  },
+  recStatusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: colors.score.critical,
+  },
+  recStatusText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '700',
+    fontVariant: ['tabular-nums'],
+  },
+  recStatusBpm: {
+    color: 'rgba(255,255,255,0.6)',
+    fontSize: 12,
+    fontWeight: '600',
   },
 
   bowBtnRow: {

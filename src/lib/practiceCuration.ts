@@ -2,6 +2,16 @@ import type { PracticeEvidence } from './practiceEvidence';
 import type { PracticeBlock } from './practiceBlocks';
 
 // ─────────────────────────────────────────────────────────────
+// applyCuratedCopy (Phase 3.5 wiring)
+//
+// Curated blocks (CuratedBlockSpec) have no `type`/`target` — they're prose,
+// not runnable drill definitions, so they can never replace a deterministic
+// PracticeBlock outright (the runner in app/practice/[id].tsx needs the real
+// structured target to run the exercise). Instead they overlay better copy
+// (`reason`) onto whichever deterministic block covers the same issue(s).
+// ─────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────
 // LLM curation grounding (Phase 3)
 //
 // The LLM may reorder, merge, and re-word practice blocks, and name root causes
@@ -99,6 +109,27 @@ export function candidatesFromBlocks(blocks: PracticeBlock[]): CuratedBlockSpec[
     issueIds: block.evidenceRefs.map((ref) => ref.evidenceId),
     whyThisDrill: block.reason,
   }));
+}
+
+/**
+ * Overlay curated `whyThisDrill` copy onto the deterministic blocks that cover
+ * the same issue(s), matched by shared evidence id. Everything else about the
+ * block (id, type, target, evaluator, evidenceRefs) is untouched, so the
+ * runner and progress tracking behave exactly as they do for a purely
+ * deterministic plan. Blocks with no curated coverage keep their original
+ * `reason` — this is strictly additive.
+ */
+export function applyCuratedCopy(
+  blocks: PracticeBlock[],
+  curated: CuratedBlockSpec[],
+): PracticeBlock[] {
+  if (curated.length === 0) return blocks;
+  return blocks.map((block) => {
+    const ids = new Set(block.evidenceRefs.map((ref) => ref.evidenceId));
+    const match = curated.find((c) => c.issueIds.some((id) => ids.has(id)));
+    if (!match || !match.whyThisDrill) return block;
+    return { ...block, reason: match.whyThisDrill };
+  });
 }
 
 function qualityOf(issue: PracticeEvidence): 'high' | 'proxy' | 'low' | 'unavailable' {

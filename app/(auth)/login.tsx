@@ -16,6 +16,7 @@ import { signIn, fetchProfile, resetPassword } from '../../src/services/auth';
 import { useAuthStore } from '../../src/store/useAuthStore';
 import { useUserStore } from '../../src/store/useUserStore';
 import { Button } from '../../src/components/ui/Button';
+import { OAuthButtons } from '../../src/components/auth/OAuthButtons';
 import { colors, spacing } from '../../src/constants/theme';
 
 export default function Login() {
@@ -40,6 +41,12 @@ export default function Login() {
 
   const { setAuthenticated } = useAuthStore();
   const { setProfile } = useUserStore();
+
+  const handleOAuthSuccess = () => {
+    // supabase.auth.onAuthStateChange in app/_layout.tsx picks up the new
+    // session (setAuthenticated + fetchProfile) — nothing more to do here.
+    router.replace('/(tabs)/home');
+  };
 
   const handleLogin = async () => {
     if (!email || !password) return;
@@ -74,6 +81,14 @@ export default function Login() {
           <Text style={styles.subtitle}>Sign in to StringAI</Text>
 
           <View style={styles.form}>
+            <OAuthButtons onSuccess={handleOAuthSuccess} />
+
+            <View style={styles.dividerRow}>
+              <View style={styles.dividerLine} />
+              <Text style={styles.dividerText}>or</Text>
+              <View style={styles.dividerLine} />
+            </View>
+
             <Text style={styles.fieldLabel}>Email</Text>
             <TextInput
               style={[styles.input, emailFocused && styles.inputFocused]}
@@ -137,6 +152,9 @@ const styles = StyleSheet.create({
   title: { fontSize: 28, fontWeight: '700', color: '#fff', textAlign: 'center' },
   subtitle: { fontSize: 15, color: 'rgba(255,255,255,0.65)', textAlign: 'center', marginBottom: spacing.xl },
   form: { gap: spacing.sm },
+  dividerRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, marginVertical: spacing.xs },
+  dividerLine: { flex: 1, height: StyleSheet.hairlineWidth, backgroundColor: 'rgba(255,255,255,0.25)' },
+  dividerText: { fontSize: 12, color: 'rgba(255,255,255,0.55)' },
   fieldLabel: { fontSize: 13, fontWeight: '600', color: 'rgba(255,255,255,0.8)', marginBottom: 4 },
   input: {
     backgroundColor: 'rgba(255,255,255,0.12)',

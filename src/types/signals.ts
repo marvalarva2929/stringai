@@ -85,6 +85,12 @@ export interface RawBowFrame {
    *  when the left wrist oriented the diagonal. Placement-scoring proxy until
    *  the bridge detector (Phase 18) exists. */
   stringPosS?: number;
+  /** Pre-computed contact position along the bow (0 = frog, 1 = tip), from the
+   *  box path's locked-diagonal + running-full-bow-length geometry
+   *  (videoAnalysis.ts). When present, deriveBowTimeSeries uses it directly so
+   *  the bowDistribution metric matches the debug inspector exactly. Absent on
+   *  the live streaming path (which reconstructs it from frog/tip instead). */
+  bowPosT?: number | null;
 }
 
 // ─────────────────────────────────────────────────────────────

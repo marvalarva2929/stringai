@@ -57,7 +57,6 @@ export const INSTRUMENTS: Record<string, InstrumentConfig> = {
         vibrato: 0.25,
       },
     },
-    available: true,
   },
 
   viola: {
@@ -116,7 +115,6 @@ export const INSTRUMENTS: Record<string, InstrumentConfig> = {
         vibrato: 0.25,
       },
     },
-    available: false, // coming soon
   },
 
   cello: {
@@ -177,6 +175,5 @@ export const INSTRUMENTS: Record<string, InstrumentConfig> = {
         vibrato: 0.25,
       },
     },
-    available: false, // coming soon
   },
 };

@@ -12,6 +12,8 @@ import Animated, {
 import * as Haptics from 'expo-haptics';
 import { colors } from '../../src/constants/theme';
 import { useAnalysisStore } from '../../src/store/useAnalysisStore';
+import { useEntitlementStore } from '../../src/store/useEntitlementStore';
+import { isPro } from '../../src/lib/entitlements';
 
 type TabDef = {
   name: string;
@@ -65,14 +67,17 @@ function TabButton({
   routeName,
   isFocused,
   onPress,
+  iconOverride,
 }: {
   routeName: string;
   isFocused: boolean;
   onPress: () => void;
+  iconOverride?: (focused: boolean) => React.ReactNode;
 }) {
   const scale = useSharedValue(1);
   const animStyle = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }));
   const tab = TABS.find((t) => t.name === routeName);
+  const renderIcon = iconOverride ?? tab?.renderIcon;
 
   const handlePress = () => {
     scale.value = withSequence(
@@ -86,7 +91,7 @@ function TabButton({
   return (
     <Pressable onPress={handlePress} style={s.tab}>
       <Animated.View style={[s.iconWrap, isFocused && s.iconWrapActive, animStyle]}>
-        {tab?.renderIcon(isFocused)}
+        {renderIcon?.(isFocused)}
       </Animated.View>
     </Pressable>
   );
@@ -126,34 +131,55 @@ function CustomTabBar({
   descriptors: any;
 }) {
   const insets = useSafeAreaInsets();
+  const subscribed = isPro(useEntitlementStore((s) => s.entitlement));
 
   // Respect tabBarStyle: { display: 'none' } set by individual screens
   const currentRoute = state.routes[state.index];
   const currentOptions = descriptors?.[currentRoute?.key]?.options;
   if (currentOptions?.tabBarStyle?.display === 'none') return null;
 
-  const visibleRoutes = state.routes.filter((r: any) => r.name !== 'analyze');
-  const left = visibleRoutes.slice(0, 2);
-  const right = visibleRoutes.slice(2);
+  // 'analyze' has its own center + button; 'train' is reached from the home
+  // screen's practice-plan card, not a tab button. Both stay registered
+  // routes (navigable), just not buttons here. That keeps the visible count
+  // fixed at 4 in every entitlement state, so an even 2/2 split always
+  // centers the + button — no spacer hacks needed.
+  const visibleRoutes = state.routes.filter(
+    (r: any) => r.name !== 'analyze' && r.name !== 'train',
+  );
+  const half = Math.ceil(visibleRoutes.length / 2);
+  const left = visibleRoutes.slice(0, half);
+  const right = visibleRoutes.slice(half);
+
+  const renderRoute = (route: any) => {
+    const isFocused = state.routes[state.index].name === route.name;
+
+    // The subscribe star doubles as the chat entry point once a user is
+    // Pro — there's nothing left to upsell them on, so the slot is repurposed
+    // rather than left empty or permanently hidden.
+    if (route.name === 'subscription' && subscribed) {
+      return (
+        <TabButton
+          key={route.key}
+          routeName={route.name}
+          isFocused={false}
+          onPress={() => router.push('/chat')}
+          iconOverride={() => <Ionicons name="chatbubble-ellipses-outline" size={22} color={colors.muted} />}
+        />
+      );
+    }
+
+    const onPress = () => {
+      if (route.name === 'subscription') { router.push('/paywall'); return; }
+      if (!isFocused) navigation.navigate(route.name);
+    };
+    return <TabButton key={route.key} routeName={route.name} isFocused={isFocused} onPress={onPress} />;
+  };
 
   return (
     <View style={[s.bar, { paddingBottom: insets.bottom }]}>
-      {left.map((route: any) => {
-        const isFocused = state.routes[state.index].name === route.name;
-        const onPress = () => { if (!isFocused) navigation.navigate(route.name); };
-        return <TabButton key={route.key} routeName={route.name} isFocused={isFocused} onPress={onPress} />;
-      })}
-
+      {left.map(renderRoute)}
       <CenterButton />
-
-      {right.map((route: any) => {
-        const isFocused = state.routes[state.index].name === route.name;
-        const onPress = () => {
-          if (route.name === 'subscription') { router.push('/paywall'); return; }
-          if (!isFocused) navigation.navigate(route.name);
-        };
-        return <TabButton key={route.key} routeName={route.name} isFocused={isFocused} onPress={onPress} />;
-      })}
+      {right.map(renderRoute)}
     </View>
   );
 }
@@ -165,6 +191,7 @@ export default function TabsLayout() {
       screenOptions={{ headerShown: false }}
     >
       <Tabs.Screen name="home" />
+      <Tabs.Screen name="train" />
       <Tabs.Screen name="analyze" />
       <Tabs.Screen name="progress" />
       <Tabs.Screen name="subscription" />

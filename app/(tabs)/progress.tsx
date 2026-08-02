@@ -131,7 +131,7 @@ export default function ProgressScreen() {
       <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
 
         {/* Practice plan entry point */}
-        <Pressable style={styles.practiceCard} onPress={() => router.push('/tips')}>
+        <Pressable style={styles.practiceCard} onPress={() => router.push('/(tabs)/train')}>
           <Ionicons name="list" size={24} color={colors.brand[600]} />
           <View style={styles.practiceCardText}>
             <Text style={styles.practiceCardTitle}>Practice Plan</Text>

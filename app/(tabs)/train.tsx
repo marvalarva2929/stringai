@@ -9,10 +9,10 @@ export default function TrainScreen() {
     <PracticePlanView
       plan={plan}
       scope={{ kind: 'daily' }}
-      kicker="Today's practice"
+      kicker="Daily Warm-Up"
       coachMessage={
         isColdStart
-          ? "Record a session and I'll tailor this path to your playing."
+          ? "Record a session and I'll tailor this warm-up to your playing."
           : 'Built from your recent sessions — I grade every take.'
       }
     />

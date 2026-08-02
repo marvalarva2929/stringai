@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-app.py — LocateAnything-3B bow + violin detector web app, built for cloud GPU pods.
+app.py — LocateAnything-3B bow + violin detector web app, built for a cloud GPU instance.
 
-Self-contained: this file + requirements.txt is everything the pod needs.
+Self-contained: this file + requirements.txt is everything the instance needs.
 Upload an image → get bow and violin bounding boxes (annotated image + JSON),
 plus an estimated bow/string contact point from the box-diagonal intersection.
 
-Usage (on the pod):
-    export HF_HOME=/workspace/hf          # cache the 6 GB model on the volume
+Usage (on the instance):
+    export HF_HOME=/workspace/hf          # cache the 6 GB model on the disk
     python app.py                          # listens on 0.0.0.0:7860
 
-    # With basic auth (recommended — the RunPod proxy URL is public):
+    # With basic auth (recommended if reachable beyond an SSH tunnel):
     python app.py --auth josh:somepassword
 
     # Skip model preload at startup (loads lazily on first request instead):
     python app.py --no-preload
 
-See RUNPOD.md in this directory for the full deployment guide.
+See GCE.md in this directory for the full deployment guide.
 """
 
 import argparse

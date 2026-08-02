@@ -674,6 +674,7 @@ export function fuseSignals(
 // ─────────────────────────────────────────────────────────────
 
 export function debugLogNoteEvents(noteEvents: NoteEvent[]): void {
+  if (!__DEV__) return;
   if (noteEvents.length === 0) {
     console.log('[NoteFusion] No note events detected (no pitched audio found in recording)');
     return;

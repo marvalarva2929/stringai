@@ -46,5 +46,4 @@ export interface InstrumentConfig {
     intermediate: SkillWeights;
     advanced: SkillWeights;
   };
-  available: boolean;
 }

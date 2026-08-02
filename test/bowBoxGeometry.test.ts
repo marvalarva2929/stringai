@@ -11,7 +11,7 @@
  * bowAnalysis.ts uses).
  */
 
-import { deriveBowFrameFromBoxes, lineIntersection } from '../src/lib/bowBoxGeometry';
+import { createBowGeometryTracker, deriveBowFrameFromBoxes, lineIntersection } from '../src/lib/bowBoxGeometry';
 import type { NormBox, NormPoint } from '../src/lib/bowBoxGeometry';
 
 let failures = 0;
@@ -217,6 +217,141 @@ console.log('scene: frog/tip orientation follows the right wrist');
     check('frog now at corner a', approx(frame.frogX, a.x) && approx(frame.frogY, a.y));
     check('tip now at corner b', approx(frame.tipX, b.x) && approx(frame.tipY, b.y));
   }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Regression: the diagonals must be decided ONCE and kept.
+//
+// Two ways they used to flip mid-session, both reproduced here:
+//   1. The violin's string diagonal was re-derived every frame by crossDiagonal,
+//      which reads the bow's slope SIGN. A bow sweeping through vertical changes
+//      that sign, so the string diagonal jumped to the other diagonal.
+//   2. The bow's frog corner was the corner nearest the right wrist, recomputed
+//      per frame, so wrist jitter could hop it to the other corner and invert
+//      the bow axis.
+// The tracker locks both, so neither can move once voted.
+// ─────────────────────────────────────────────────────────────
+
+console.log('scene: bow sweeps through vertical — string diagonal must not flip');
+{
+  const scroll: NormPoint = { x: 0.75, y: 0.35 };
+  const tail: NormPoint = { x: 0.45, y: 0.6 };
+  const violinBox = boxAround(scroll, tail);
+  const tracker = createBowGeometryTracker();
+
+  // The bow rotates about a pivot on the strings, from leaning one way, through
+  // vertical, to leaning the other way — i.e. its slope sign changes sign.
+  const pivot: NormPoint = { x: 0.6, y: 0.475 };
+  const angles = [-60, -30, -5, 0, 5, 30, 60].map((d) => (d * Math.PI) / 180);
+
+  const strings: string[] = [];
+  let slopeSignsSeen = new Set<boolean>();
+
+  for (let i = 0; i < angles.length; i++) {
+    // Repeat each pose enough times to get past the lock sample on the first one.
+    const reps = i === 0 ? 20 : 1;
+    for (let r = 0; r < reps; r++) {
+      const a = angles[i];
+      const frog: NormPoint = { x: pivot.x + 0.28 * Math.sin(a), y: pivot.y + 0.28 * Math.cos(a) };
+      const tip: NormPoint = { x: pivot.x - 0.28 * Math.sin(a), y: pivot.y - 0.28 * Math.cos(a) };
+      slopeSignsSeen.add((tip.x - frog.x) * (tip.y - frog.y) > 0);
+
+      const out = tracker.push({
+        timestamp: i * 0.1 + r * 0.001,
+        bowBox: boxAround(frog, tip),
+        bowConfidence: 0.9,
+        violinBox,
+        rightWrist: { x: frog.x + 0.02, y: frog.y + 0.03 },
+        leftWrist: { x: 0.78, y: 0.33 },
+      });
+      if (r === reps - 1 && out.string) {
+        strings.push(`${out.string.a.x.toFixed(3)},${out.string.a.y.toFixed(3)}`);
+      }
+    }
+  }
+
+  check('scene sanity: bow slope sign actually flipped', slopeSignsSeen.size === 2,
+    'the rotation must cross vertical or the test proves nothing');
+  check('string diagonal identical on every frame', new Set(strings).size === 1,
+    `saw ${new Set(strings).size} distinct scroll ends: ${[...new Set(strings)].join(' | ')}`);
+}
+
+console.log('scene: wrist jitter must not flip the locked bow axis');
+{
+  const frog: NormPoint = { x: 0.7, y: 0.8 };
+  const tip: NormPoint = { x: 0.2, y: 0.3 };
+  const bowBox = boxAround(frog, tip);
+  const tracker = createBowGeometryTracker();
+
+  // Lock in the true orientation (wrist by the frog).
+  for (let i = 0; i < 20; i++) {
+    tracker.push({
+      timestamp: i * 0.05,
+      bowBox,
+      bowConfidence: 0.9,
+      rightWrist: { x: 0.72, y: 0.83 },
+    });
+  }
+
+  // Now a bad frame: the wrist reads nearer the TIP corner. Pre-lock this would
+  // have swapped frog and tip and inverted the axis.
+  const out = tracker.push({
+    timestamp: 1.5,
+    bowBox,
+    bowConfidence: 0.9,
+    rightWrist: { x: 0.18, y: 0.28 },
+  });
+
+  check('frame produced', out.bowFrame !== null);
+  if (out.bowFrame) {
+    check('frog stays at the locked corner despite jitter',
+      approx(out.bowFrame.frogX, frog.x) && approx(out.bowFrame.frogY, frog.y),
+      `got (${out.bowFrame.frogX.toFixed(3)}, ${out.bowFrame.frogY.toFixed(3)})`);
+    check('tip stays at the locked corner despite jitter',
+      approx(out.bowFrame.tipX, tip.x) && approx(out.bowFrame.tipY, tip.y));
+  }
+}
+
+console.log('scene: violin box is held across frames where the detector misses it');
+{
+  const scroll: NormPoint = { x: 0.75, y: 0.35 };
+  const tail: NormPoint = { x: 0.45, y: 0.6 };
+  const frog: NormPoint = { x: 0.7, y: 0.8 };
+  const tip: NormPoint = { x: 0.2, y: 0.3 };
+  const tracker = createBowGeometryTracker();
+
+  const seen = tracker.push({
+    timestamp: 0,
+    bowBox: boxAround(frog, tip),
+    bowConfidence: 0.9,
+    violinBox: boxAround(scroll, tail),
+    rightWrist: { x: 0.72, y: 0.83 },
+    leftWrist: { x: 0.78, y: 0.33 },
+  });
+  check('string line present when the violin is detected', seen.string !== null);
+
+  // Next frame: detector found no violin. The line must persist (violin is static).
+  const missed = tracker.push({
+    timestamp: 0.1,
+    bowBox: boxAround(frog, tip),
+    bowConfidence: 0.9,
+    violinBox: null,
+    rightWrist: { x: 0.72, y: 0.83 },
+    leftWrist: { x: 0.78, y: 0.33 },
+  });
+  check('string line survives a frame with no violin detection', missed.string !== null);
+  check('contact still resolves on the held violin box', missed.bowFrame?.contactVisible === true);
+
+  // Long after the hold window, it should lapse rather than go stale forever.
+  const stale = tracker.push({
+    timestamp: 60,
+    bowBox: boxAround(frog, tip),
+    bowConfidence: 0.9,
+    violinBox: null,
+    rightWrist: { x: 0.72, y: 0.83 },
+    leftWrist: { x: 0.78, y: 0.33 },
+  });
+  check('held violin box expires after the hold window', stale.string === null);
 }
 
 console.log('');

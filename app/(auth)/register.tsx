@@ -9,30 +9,41 @@ import {
   Platform,
   ScrollView,
   Alert,
+  Linking,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { router } from 'expo-router';
 import { signUp, updateProfileFields } from '../../src/services/auth';
 import { useAuthStore } from '../../src/store/useAuthStore';
+import { useOnboardingStore } from '../../src/store/useOnboardingStore';
+import { EXPERIENCE_LEVELS } from '../../src/constants/onboardingContent';
 import { Button } from '../../src/components/ui/Button';
+import { OAuthButtons } from '../../src/components/auth/OAuthButtons';
 import { colors, spacing } from '../../src/constants/theme';
-import { SkillLevel } from '../../src/types/user';
-
-const SKILL_OPTIONS: { label: string; value: SkillLevel }[] = [
-  { label: 'Beginner', value: 'beginner' },
-  { label: 'Intermediate', value: 'intermediate' },
-  { label: 'Advanced', value: 'advanced' },
-];
+import { PRIVACY_POLICY_URL, TERMS_OF_SERVICE_URL } from '../../src/constants/links';
 
 export default function Register() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [skillLevel, setSkillLevel] = useState<SkillLevel>('beginner');
   const [loading, setLoading] = useState(false);
   const [emailFocused, setEmailFocused] = useState(false);
   const [passwordFocused, setPasswordFocused] = useState(false);
 
   const { setOnboardingComplete, weeklyGoalMinutes } = useAuthStore();
+  const { experienceId } = useOnboardingStore();
+  // Skill level was collected in onboarding's experience step; this screen
+  // only serves post-onboarding signup now (e.g. from the login screen), so
+  // fall back to 'beginner' if onboarding was never completed on this device.
+  const skillLevel = EXPERIENCE_LEVELS.find((e) => e.id === experienceId)?.skillLevel ?? 'beginner';
+
+  const handleOAuthSuccess = (userId: string) => {
+    setOnboardingComplete();
+    updateProfileFields(userId, {
+      skill_level: skillLevel,
+      ...(weeklyGoalMinutes ? { weekly_goal_minutes: weeklyGoalMinutes } : {}),
+    }).catch(() => {});
+    router.replace('/(tabs)/home');
+  };
 
   const handleRegister = async () => {
     if (!email || !password) return;
@@ -85,6 +96,14 @@ export default function Register() {
           <Text style={styles.subtitle}>Save your progress and access it anywhere</Text>
 
           <View style={styles.form}>
+            <OAuthButtons onSuccess={handleOAuthSuccess} />
+
+            <View style={styles.dividerRow}>
+              <View style={styles.dividerLine} />
+              <Text style={styles.dividerText}>or use email</Text>
+              <View style={styles.dividerLine} />
+            </View>
+
             <Text style={styles.fieldLabel}>Email</Text>
             <TextInput
               style={[styles.input, emailFocused && styles.inputFocused]}
@@ -130,21 +149,6 @@ export default function Register() {
               ))}
             </View>
 
-            <Text style={styles.sectionLabel}>Your skill level</Text>
-            <View style={styles.skillRow}>
-              {SKILL_OPTIONS.map((opt) => (
-                <Pressable
-                  key={opt.value}
-                  style={[styles.skillChip, skillLevel === opt.value && styles.skillChipActive]}
-                  onPress={() => setSkillLevel(opt.value)}
-                >
-                  <Text style={[styles.skillChipText, skillLevel === opt.value && styles.skillChipTextActive]}>
-                    {opt.label}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
-
             <Button
               label="Create Account"
               onPress={handleRegister}
@@ -156,11 +160,11 @@ export default function Register() {
 
           <View style={styles.termsRow}>
             <Text style={styles.terms}>By continuing you agree to our </Text>
-            <Pressable>
+            <Pressable onPress={() => { Linking.openURL(TERMS_OF_SERVICE_URL).catch(() => {}); }}>
               <Text style={styles.termsLink}>Terms of Service</Text>
             </Pressable>
             <Text style={styles.terms}> and </Text>
-            <Pressable>
+            <Pressable onPress={() => { Linking.openURL(PRIVACY_POLICY_URL).catch(() => {}); }}>
               <Text style={styles.termsLink}>Privacy Policy</Text>
             </Pressable>
             <Text style={styles.terms}>.</Text>
@@ -191,8 +195,10 @@ const styles = StyleSheet.create({
   title: { fontSize: 28, fontWeight: '700', color: '#fff', textAlign: 'center' },
   subtitle: { fontSize: 15, color: colors.brand[200], textAlign: 'center', marginBottom: spacing.xl },
   form: { gap: spacing.sm },
+  dividerRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, marginVertical: spacing.xs },
+  dividerLine: { flex: 1, height: StyleSheet.hairlineWidth, backgroundColor: 'rgba(255,255,255,0.25)' },
+  dividerText: { fontSize: 12, color: 'rgba(255,255,255,0.55)' },
   fieldLabel: { fontSize: 13, fontWeight: '600', color: 'rgba(255,255,255,0.8)', marginBottom: 4 },
-  sectionLabel: { fontSize: 13, fontWeight: '600', color: 'rgba(255,255,255,0.8)', marginTop: spacing.sm },
   input: {
     backgroundColor: 'rgba(255,255,255,0.12)',
     borderRadius: 12,
@@ -204,22 +210,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.15)',
   },
-  skillRow: { flexDirection: 'row', gap: spacing.xs, marginBottom: spacing.sm },
-  skillChip: {
-    flex: 1,
-    paddingVertical: 10,
-    paddingHorizontal: spacing.sm,
-    borderRadius: 10,
-    borderWidth: 1.5,
-    borderColor: 'rgba(255,255,255,0.25)',
-    alignItems: 'center',
-  },
-  skillChipActive: {
-    backgroundColor: colors.brand[600],
-    borderColor: colors.brand[400],
-  },
-  skillChipText: { color: 'rgba(255,255,255,0.65)', fontSize: 13 },
-  skillChipTextActive: { color: '#fff', fontWeight: '600' },
   termsRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',

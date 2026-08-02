@@ -426,7 +426,14 @@ function analyzeNote(frames: ToneFrameFeatures[]): ToneNote {
  * fundamental) is checked before the noise labels since high/low F1 is physically
  * distinct from broadband over-pressure scratch.
  */
-function classifyFrames(frames: ToneFrameFeatures[]): Exclude<ToneFault, 'clean'> | null {
+/**
+ * Classifies a window of frames as a sustained fault (scratch/rasp/thin) or
+ * clean. Note: this covers only the pressure/contact faults classifyFrames can
+ * actually decide from spectral-flatness/F1 medians. ponticello/tasto/whistle
+ * and the temporal faults (onset_scratch/delayed_speech/decay/flicker) come
+ * from the separate per-note trajectory analysis below, not from this function.
+ */
+export function classifyFrames(frames: ToneFrameFeatures[]): Exclude<ToneFault, 'clean'> | null {
   const voiced = frames.filter((f) => f.voiced);
   if (voiced.length === 0) return null;
   const rel = voiced.filter((f) => f.pitchReliable);
@@ -491,7 +498,7 @@ function buildSections(notes: ToneNote[]): ToneSection[] {
 // Session scoring + observation text
 // ─────────────────────────────────────────────────────────────
 
-const FAULT_MESSAGE: Record<Exclude<ToneFault, 'clean'>, { symptom: string; cause: string }> = {
+export const FAULT_MESSAGE: Record<Exclude<ToneFault, 'clean'>, { symptom: string; cause: string }> = {
   scratch:        { symptom: 'The tone was scratchy and rough', cause: 'often caused by too much bow pressure for the bow speed — try easing the weight or using more bow' },
   rasp:           { symptom: 'The tone was grainy / slightly noisy', cause: 'usually a touch too much pressure or old rosin/bow hair — lighten the arm weight a little' },
   thin:           { symptom: 'The tone sounded thin and airy', cause: 'usually too little contact (bow too fast/light for the pressure) — add a little arm weight or slow the bow' },
@@ -600,6 +607,12 @@ export function scoreToneQuality(
   const pervasiveAiry = airyPen >= 12;
   const observationSummary = buildObservation(score, sections, duration, pervasiveAiry);
 
+  // Runtime-only tone-score trace for the results graph (voiced frames, capped
+  // point count). Like the other metrics' timeSeries, not persisted to DB.
+  const TS_MAX_POINTS = 240;
+  const stride = Math.max(1, Math.ceil(voiced.length / TS_MAX_POINTS));
+  const timeSeries = voiced.filter((_, i) => i % stride === 0).map((f) => ({ t: f.t, v: f.score }));
+
   return {
     key: 'toneQuality',
     score,
@@ -608,6 +621,7 @@ export function scoreToneQuality(
     events: events.slice(0, 8),
     occurrenceRate,
     observationSummary,
+    timeSeries,
   };
 }
 

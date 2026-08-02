@@ -9,80 +9,25 @@
  *    fails or the user is not authenticated.
  */
 
-import { MetricScore, LLMFeedback, LLMCoachingItem, PlayerCategory, IntonationAnalysis } from '../types/analysis';
+import { LLMFeedback, LLMCoachingItem, PlayerCategory, IntonationAnalysis, MetricScore } from '../types/analysis';
 import { METRIC_META } from '../constants/metricMeta';
 import { EXERCISES } from '../constants/exercises';
 import { Piece } from '../types/piece';
 import { INTONATION_COACHING, PITCH_CLASS_TO_FINGER } from '../constants/intonationSpec';
 import { supabase } from './supabase';
-import type { StatisticalFinding } from '../lib/patternDetection';
-import type { PhraseFeatures } from '../lib/phraseFeatures';
 import type { PracticeEvidence } from '../lib/practiceEvidence';
+import { parseCuratedResponse, groundCuratedPlan, type CuratedBlockSpec } from '../lib/practiceCuration';
+import { issuesForCoaching, buildCoachingInput, type CoachingInput } from '../lib/coachingInput';
 
-/** Compact the frozen issue set into what the coaching model may cite. */
-export function issuesForCoaching(
-  issues: PracticeEvidence[],
-): NonNullable<CoachingInput['issues']> {
-  return issues.map((issue) => ({
-    id: issue.id,
-    summary: `${issue.title}: ${issue.evidenceSummary || issue.reason}`,
-    quality: (issue.measurementQuality === 'proxy' || issue.measurementQuality === 'low'
-      ? issue.measurementQuality
-      : 'high') as 'high' | 'proxy' | 'low',
-  }));
-}
+// issuesForCoaching/buildCoachingInput/CoachingInput live in ../lib/coachingInput
+// (pure, Node-testable) — re-exported here so existing call sites don't change.
+export { issuesForCoaching, buildCoachingInput, type CoachingInput };
 
 // ─────────────────────────────────────────────────────────────
 // Edge Function path (L10 — Claude coaching)
 // ─────────────────────────────────────────────────────────────
 
-export interface CoachingInput {
-  instrument: string;
-  piece?: { title: string; composer?: string };
-  skillLevel: 'beginner' | 'intermediate' | 'advanced';
-  playerCategory: PlayerCategory;
-  metrics: { key: string; score: number; severity: string; observationSummary: string }[];
-  patternFindings: { testId: string; summary: string; evidence: unknown; severity: string }[];
-  phraseFeatures?: PhraseFeatures[];
-  /** The exact issue set the model may cite. Every curated block/root cause must
-   *  reference one of these ids — the client rejects any it invents. */
-  issues?: { id: string; summary: string; quality: 'high' | 'proxy' | 'low' }[];
-}
-
 const EDGE_TIMEOUT_MS = 10_000;
-
-export function buildCoachingInput(
-  metrics: MetricScore[],
-  playerCategory: PlayerCategory,
-  skillLevel: 'beginner' | 'intermediate' | 'advanced',
-  piece?: Piece,
-  findings?: StatisticalFinding[],
-  phraseFeatures?: PhraseFeatures[],
-  issues?: PracticeEvidence[],
-): CoachingInput {
-  return {
-    instrument: 'violin',
-    piece: piece ? { title: piece.title, composer: piece.composer } : undefined,
-    skillLevel,
-    playerCategory,
-    metrics: metrics
-      .filter((m) => m.measurementQuality !== 'unavailable')
-      .map((m) => ({
-        key: m.key,
-        score: m.score,
-        severity: m.severity,
-        observationSummary: m.observationSummary,
-      })),
-    patternFindings: (findings ?? []).map((f) => ({
-      testId: f.testId,
-      summary: f.summary,
-      evidence: f.evidence,
-      severity: f.severity,
-    })),
-    phraseFeatures,
-    issues: issues ? issuesForCoaching(issues) : undefined,
-  };
-}
 
 /** Thrown when the caller is not entitled to Claude coaching (Edge Function 402). */
 export class EntitlementRequiredError extends Error {
@@ -99,8 +44,20 @@ export class EntitlementRequiredError extends Error {
  * A free user reaching this throws EntitlementRequiredError, which callers must
  * swallow silently: free users hit it on every session by design, so surfacing
  * it as an error would mean an error toast after every analysis.
+ *
+ * `issues` (the full, un-compacted evidence set — not the CoachingInput.issues
+ * summary shape) and `fallbackBlocks` (the deterministic session-plan blocks,
+ * already in curated shape via candidatesFromBlocks) ground the raw root_causes
+ * and blocks the model returns before anything is trusted: every id it cites
+ * must exist in `issues`, and a root cause needs at least one high-quality
+ * issue behind it (see groundCuratedPlan). Root causes/blocks that don't
+ * survive grounding are simply absent from the result — never shown raw.
  */
-export async function fetchCoachingFeedback(input: CoachingInput): Promise<LLMFeedback> {
+export async function fetchCoachingFeedback(
+  input: CoachingInput,
+  issues: PracticeEvidence[],
+  fallbackBlocks: CuratedBlockSpec[],
+): Promise<LLMFeedback> {
   const invoke = supabase.functions.invoke('analyze-feedback', { body: input });
   const timeout = new Promise<never>((_, reject) =>
     setTimeout(() => reject(new Error('coaching request timed out')), EDGE_TIMEOUT_MS),
@@ -118,6 +75,12 @@ export async function fetchCoachingFeedback(input: CoachingInput): Promise<LLMFe
     throw new Error('malformed coaching response');
   }
 
+  const grounded = groundCuratedPlan({
+    llm: parseCuratedResponse(data),
+    issues,
+    fallback: fallbackBlocks,
+  });
+
   return {
     overallTake: data.summary,
     items: data.insights.map((i: any): LLMCoachingItem => ({
@@ -127,6 +90,11 @@ export async function fetchCoachingFeedback(input: CoachingInput): Promise<LLMFe
       exercise: i.exercise || undefined,
     })),
     phraseFeedback: Array.isArray(data.phrase_feedback) ? data.phrase_feedback : undefined,
+    rootCauses: grounded.plan.rootCauses.length > 0 ? grounded.plan.rootCauses : undefined,
+    // undefined (not the fallback array) when nothing from the model survived
+    // grounding — the session-plan store already falls back to deterministic
+    // copy on its own, so there's no reason to persist a redundant copy here.
+    curatedBlocks: grounded.usedFallback ? undefined : grounded.plan.blocks,
     generatedAt: new Date().toISOString(),
     source: 'claude',
   };

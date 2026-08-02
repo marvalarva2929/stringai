@@ -127,7 +127,12 @@ public class PoseCameraView: ExpoView,
         if session.canAddOutput(movieOutput) {
             session.addOutput(movieOutput)
             if let conn = movieOutput.connection(with: .video) {
-                if conn.isVideoOrientationSupported { conn.videoOrientation = .landscapeRight }
+                // .landscapeLeft (not .landscapeRight like the preview/frame
+                // outputs) so the saved video is right-side up for the way the
+                // phone is actually held — the other landscape recorded upside
+                // down. This flips only the recorded file; the live preview and
+                // the pose/bow analysis frames keep their orientation.
+                if conn.isVideoOrientationSupported { conn.videoOrientation = .landscapeLeft }
                 if conn.isVideoMirroringSupported   { conn.isVideoMirrored = true }
             }
             if let audioConn = movieOutput.connection(with: .audio) {
@@ -323,20 +328,27 @@ public class PoseCameraView: ExpoView,
         guard pitchAccum.count >= pitchEmitInterval else { return }
         let chunk = Array(pitchAccum.prefix(pitchEmitInterval))
         pitchAccum.removeFirst(pitchEmitInterval)
-        let freq = estimatePitch(from: chunk)
-        let payload: [String: Any] = ["frequency": freq as Any]
+        let (freq, clarity) = estimatePitch(from: chunk)
+        // Loudness + tonality travel with the pitch reading. rms lets the live
+        // coach tell playing from silence and judge evenness; clarity (how
+        // periodic the tone is) lets it tell a clean note from scratchy or thin
+        // bowing. estimatePitch already computes both internally.
+        var sumSq: Float = 0
+        for s in chunk { sumSq += s * s }
+        let rms = sqrt(sumSq / Float(chunk.count))
+        let payload: [String: Any] = ["frequency": freq as Any, "rms": Double(rms), "clarity": clarity]
         DispatchQueue.main.async { self.onPitch(payload) }
     }
 
-    private func estimatePitch(from samples: [Float]) -> Double? {
+    private func estimatePitch(from samples: [Float]) -> (freq: Double?, clarity: Double) {
         let n = samples.count
         var sumSq: Float = 0
         for s in samples { sumSq += s * s }
-        guard sumSq / Float(n) > 0.0001 else { return nil }  // silence
+        guard sumSq / Float(n) > 0.0001 else { return (nil, 0) }  // silence
 
         let minLag = max(1, Int(44100.0 / 1500.0))  // ≤ 1500 Hz
         let maxLag = min(n / 2 - 1, Int(44100.0 / 70.0))   // ≥ 70 Hz
-        guard minLag < maxLag else { return nil }
+        guard minLag < maxLag else { return (nil, 0) }
 
         var bestLag = 0
         var bestCorr: Float = -Float.infinity
@@ -349,8 +361,12 @@ public class PoseCameraView: ExpoView,
                 if corr > bestCorr { bestCorr = corr; bestLag = lag }
             }
         }
-        guard bestLag > 0, bestCorr > 0 else { return nil }
-        return 44100.0 / Double(bestLag)
+        guard bestLag > 0, bestCorr > 0 else { return (nil, 0) }
+        // Normalized autocorrelation peak as a tonality measure: ~1 for a clean,
+        // periodic tone; low when the sound is noisy/aperiodic (scratchy bowing).
+        // sumSq is the zero-lag energy, so bestCorr / sumSq lands in ~[0, 1].
+        let clarity = min(1.0, max(0.0, Double(bestCorr / max(sumSq, 1e-6))))
+        return (44100.0 / Double(bestLag), clarity)
     }
 
     private func appendToRing(_ samples: UnsafePointer<Float>, count: Int, sampleRate: Double) {
@@ -577,26 +593,38 @@ public class PoseCameraView: ExpoView,
         if !leftHand.isEmpty  { payload["leftHand"]  = leftHand  }
         if !rightHand.isEmpty { payload["rightHand"] = rightHand }
 
-        // ── Bow detection (~10 fps) ──────────────────────────────────────────
+        // ── Bow + violin detection (~10 fps) ─────────────────────────────────
         // Runs synchronously on frameQueue — inference takes ~100 ms, so frames
-        // that include bow detection naturally throttle to ~7–8 fps for those
-        // calls. Frames between bow inferences run at the full 15 fps pose rate.
+        // that include detection naturally throttle for those calls. Frames
+        // between inferences run at the full 15 fps pose rate.
+        //
+        // Coordinate note: the joints above come from Vision with orientation
+        // .down, so relative to the raw pixel buffer they are flipped in BOTH
+        // axes (x_joint = 1 − u, y_joint = 1 − v). The raw buffer is therefore
+        // 180° from upright — and the detector was trained on upright frames
+        // (the upload path rotates via appliesPreferredTrackTransform), so the
+        // frame is rotated upright here BEFORE inference to match the training
+        // domain. Rotating the image by 180° maps u → 1 − u, v → 1 − v, which
+        // means the resulting boxes land directly in joint space — no flip.
         let nowBow = CACurrentMediaTime()
         if nowBow - lastBowTime >= bowInterval,
            let detector = BowDetector.shared {
             lastBowTime = nowBow
-            let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+            let ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(.down)
             if let cgImage = bowCIContext.createCGImage(ciImage, from: ciImage.extent),
-               let bow = detector.detect(in: cgImage) {
-                payload["bowTip"]     = ["x": Double(bow.tipX),     "y": Double(bow.tipY),
-                                         "visible": bow.tipVisible]
-                payload["bowFrog"]    = ["x": Double(bow.frogX),    "y": Double(bow.frogY),
-                                         "visible": bow.frogVisible]
-                payload["bowContact"] = ["x": Double(bow.contactX), "y": Double(bow.contactY),
-                                         "visible": bow.contactVisible]
-                payload["bowBox"]     = ["x1": Double(bow.boxX1), "y1": Double(bow.boxY1),
-                                         "x2": Double(bow.boxX2), "y2": Double(bow.boxY2)]
-                payload["bowConfidence"] = Double(bow.confidence)
+               let detection = detector.detect(in: cgImage) {
+                func toBoxDict(_ b: DetectedBox) -> [String: Double] {
+                    return ["x1": Double(b.x1), "y1": Double(b.y1),
+                            "x2": Double(b.x2), "y2": Double(b.y2)]
+                }
+                if let bow = detection.bow {
+                    payload["bowBox"] = toBoxDict(bow)
+                    payload["bowConfidence"] = Double(bow.confidence)
+                }
+                if let violin = detection.violin {
+                    payload["violinBox"] = toBoxDict(violin)
+                    payload["violinConfidence"] = Double(violin.confidence)
+                }
             }
         }
 

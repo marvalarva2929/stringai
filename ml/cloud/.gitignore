@@ -1,0 +1,10 @@
+# orchestrate.py config + per-run transient artifacts — not meant to be committed
+.env
+_recv_staging/
+_send_bundle.tgz
+_pending_review.json
+pipeline.log
+label.log
+label_preview/
+pipeline_summary.json
+label_summary.json

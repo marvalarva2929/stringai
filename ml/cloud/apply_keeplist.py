@@ -57,6 +57,15 @@ def main():
         print(f"Indexing {ds.name} …")
         tar_backend = TarBackend(ds)
 
+    # --out persists across runs (e.g. on a pod between orchestrate.py
+    # invocations) and this only ever ADDS/overwrites files for frames in
+    # the current keep list — it never removes ones that dropped out of an
+    # earlier keep list (different thresholds, a filter change, etc.), so
+    # without this the dataset silently accumulates stale frames run over
+    # run. Always rebuild from scratch instead.
+    if out.exists():
+        shutil.rmtree(out)
+
     keeplist = json.loads(Path(args.keeplist).read_text())
     frames = keeplist["frames"]
     print(f"Keep list: {len(frames)} frame(s)  (generated {keeplist.get('generated_at')})")
@@ -126,6 +135,42 @@ def main():
             dst_img.symlink_to(os.path.relpath(src_img, dst_img.parent))
         stats["linked"] += 1
 
+    # The train/val split is decided once, back in autolabel.py (baked into
+    # which dir a frame's files land in), then just carried through here —
+    # so a small batch or aggressive filtering can easily leave val empty by
+    # chance, which crashes train_detect.py outright. Rescue a few frames
+    # from train rather than let that happen.
+    val_imgs = sorted((out / "images" / "val").glob("*.jpg"))
+    train_imgs = sorted((out / "images" / "train").glob("*.jpg"))
+    if not val_imgs and not train_imgs:
+        sys.exit(
+            f"[ERROR] 0 frame(s) linked into {out} from a keep list of {len(frames)} "
+            f"({stats['missing_image']} missing image, {stats['missing_label']} missing "
+            "label). Nothing to rescue — there's no train split to pull val frames from "
+            "either. auto_keeplist.py should have caught an empty keep list before this "
+            "point; if you're seeing this, the keeplist and dataset/ are probably out of "
+            "sync (e.g. --continue reusing a stale dataset_clean from before a filter "
+            "change) — rerun `python orchestrate.py` fresh, not --continue."
+        )
+    if not val_imgs and train_imgs:
+        n_move = max(1, len(train_imgs) // 10)
+        rescued = train_imgs[:n_move]
+        for img_path in rescued:
+            name = img_path.stem
+            for kind, ext in (("images", ".jpg"), ("labels", ".txt")):
+                src = out / kind / "train" / f"{name}{ext}"
+                dst = out / kind / "val" / f"{name}{ext}"
+                if src.is_symlink():
+                    target = os.readlink(src)
+                    src.unlink()
+                    dst.symlink_to(target)
+                elif src.exists():
+                    shutil.move(str(src), str(dst))
+        print(f"[WARN] val split was empty after filtering — moved {len(rescued)} "
+              "frame(s) from train to val so train_detect.py doesn't crash on an "
+              "empty validation set. Expected on small test batches; with more "
+              "footage val_fraction=0.1 won't land on zero.")
+
     yaml_path = out / "data.yaml"
     yaml_path.write_text(
         f"path: {out}\n"
@@ -138,8 +183,9 @@ def main():
     print(f"\n{'─' * 46}")
     for k, v in stats.items():
         print(f"{k:>16}: {v}")
-    n_train = sum(1 for f in frames.values() if f["split"] == "train")
-    print(f"{'train/val':>16}: {n_train}/{len(frames) - n_train}")
+    n_train = len(list((out / "images" / "train").glob("*.jpg")))
+    n_val = len(list((out / "images" / "val").glob("*.jpg")))
+    print(f"{'train/val':>16}: {n_train}/{n_val}")
     print(f"\nClean dataset: {out}")
     print(f"\nTrain with:\n  python train_detect.py --data {yaml_path} --device 0")
 

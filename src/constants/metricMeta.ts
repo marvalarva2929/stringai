@@ -1,4 +1,4 @@
-import { MetricKey, SeverityBand } from '../types/analysis';
+import type { MetricKey, SeverityBand } from '../types/analysis';
 
 interface MetricMeta {
   label: string;
