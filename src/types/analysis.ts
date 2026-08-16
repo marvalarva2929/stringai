@@ -122,6 +122,12 @@ export interface LLMPhraseFeedback {
   phraseId: number;
   observation: string;
   tip: string;
+  /**
+   * The phrase's start time in seconds, echoed back by the model. Lets the
+   * results UI seek to the moment even when the id doesn't resolve — a session
+   * re-opened from history has no phraseFeatures to look the id up in.
+   */
+  start_t?: number;
 }
 
 export interface LLMFeedback {
@@ -185,6 +191,12 @@ export interface VibratoNoteResult {
   depthCents: number;
   periodicityScore: number;
   consistencyOk: boolean;
+  /**
+   * Whether a real oscillation in the vibrato band was found on this note. Optional because
+   * analyses persisted before this field existed don't carry it; consumers fall back to the
+   * rate/depth check in hasVibrato().
+   */
+  detected?: boolean;
   feedbackNotes: string[];
   cents: number[];
 }
@@ -311,14 +323,31 @@ export interface AnalysisResult {
   /** L7 per-phrase musical descriptors. Plain data, so unlike sessionSignals it
    *  survives persistence — phrase-scoped practice blocks need these windows. */
   phraseFeatures?: import('../lib/phraseFeatures').PhraseFeatures[];
+  /**
+   * The ranked musical picture sent to the coach — see lib/musicalEvidence.ts.
+   * Held on the result so chat can discuss this session before the server-side
+   * write of musical_evidence has landed.
+   */
+  musicalEvidence?: import('../lib/musicalEvidence').MusicalEvidence;
+  /** L7.5 key, musical figures, and per-kind contrasts. Plain data; this is what
+   *  lets an exercise say "arpeggios in G" instead of "pitch accuracy". */
+  musicalContext?: import('../lib/musicalContext').MusicalContext;
   /** L9 per-session practice evidence ("issues"), computed once at analysis time.
    *  The single source of truth the results screen and the daily/session plans
    *  both read, instead of each re-deriving from raw analyses. */
   sessionEvidence?: import('../lib/practiceEvidence').PracticeEvidence[];
+  /** Which analysis version froze `sessionEvidence`. See EVIDENCE_VERSION. */
+  evidenceVersion?: number;
   /** L3 substrate. In-memory only — contains closures (TimeSeries.sample/window)
    *  that don't survive JSON serialization; stripped from persistence and from
    *  all but the newest sessionResultCache entry. */
   sessionSignals?: import('./signals').SessionSignals;
+  /** Sample data shown during activation to a user who doesn't have their
+   *  instrument to hand. Never saved to Supabase, never counted against the
+   *  analysis quota, never added to sessionHistory/metricHistory — and dropped
+   *  on rehydration (see useAnalysisStore) so it can't resurface as a real
+   *  session on the next launch. */
+  isDemo?: boolean;
   /** Runtime-only: true while the Pro Claude coaching upgrade is in flight for
    *  this session (set before the first render, cleared on success/failure by
    *  app/(tabs)/analyze.tsx). Powers the results screen's coaching-loading
@@ -349,6 +378,12 @@ export interface AudioAnalysisOutput {
   vibratoAnalysis: VibratoAnalysis;
   rhythmAnalysis?: RhythmAnalysis;
   rawSignals: RawAudioSignals;
+  /**
+   * True when the decoder rejected the file and these are the mock metrics, not
+   * a real analysis. The user is shown no difference, so this flag is the only
+   * way the app can tell — reported as `analysis_degraded`.
+   */
+  usedMockMetrics?: boolean;
 }
 
 export interface SessionSummary {

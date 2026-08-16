@@ -11,6 +11,13 @@ import { runPatternDetection, type StatisticalFinding } from './patternDetection
 import { buildSessionAssessment } from './sessionAssessment';
 import { groupNotes, type NoteGroup } from './noteGrouping';
 import { buildPhraseFeatures, type PhraseFeatures } from './phraseFeatures';
+import { buildMusicalContext, type MusicalContext } from './musicalContext';
+import {
+  computeDynamicsShape,
+  rankDynamicsIssues,
+  type DynamicsIssue,
+  type DynamicsShapeResult,
+} from './dynamicsShape';
 
 // ─────────────────────────────────────────────────────────────
 // Session pipeline (L1–L9 orchestrator)
@@ -33,6 +40,8 @@ export interface SessionPipelineInput {
   userCategory?: PlayerCategory;
   /** Optional bow calibration captured in the same camera position before recording. */
   calibration?: BowCalibration | null;
+  /** Piece.keySignature when the user supplied one — a prior for key estimation. */
+  keyHint?: string | null;
 }
 
 export interface SessionPipelineOutput {
@@ -46,12 +55,22 @@ export interface SessionPipelineOutput {
   phrases: Phrase[];
   /** L7 — per-phrase musical descriptors (evidence for L9/L10) */
   phraseFeatures: PhraseFeatures[];
+  /** L7.5 — key, musical figures, and per-kind contrasts */
+  musicalContext: MusicalContext;
   /** L8 — statistical findings that fired (confidence ≥ 0.4) */
   findings: StatisticalFinding[];
   /** Pose + bow metric scores (empty when < 5 usable pose frames) */
   videoMetrics: MetricScore[];
   /** L9 — categorical session assessment */
   sessionAssessment: SessionAssessment;
+  /** L6.5 — per-phrase dynamic shaping, keyed to the L6 phrase ids */
+  dynamics: DynamicsShapeResult;
+  /**
+   * audioOutput.metrics with dynamicControl completed — audioEngine can't
+   * detect phrase events because the phrases don't exist yet when it runs.
+   * Callers should prefer this over audioOutput.metrics.
+   */
+  audioMetrics: MetricScore[];
 }
 
 // Minimum shoulder width in raw screen coordinates (0-1) for reliable measurement.
@@ -106,10 +125,24 @@ export function runSessionPipeline(input: SessionPipelineInput): SessionPipeline
     onsets: audioOutput.rawSignals.onsetTimestamps,
   });
 
+  // ── L6.5: per-phrase dynamic shaping ──
+  // Runs here rather than in audioEngine because it needs the L6 phrases, and
+  // those need bow speed, which does not exist until the fusion above. This is
+  // the single phrase segmentation the whole app now agrees on.
+  const dynamics = computeDynamicsShape(
+    phrases,
+    audioOutput.rawSignals.rmsFrames,
+    audioOutput.rawSignals.pitchFrames,
+  );
+  const rankedDynamicsIssues = rankDynamicsIssues(dynamics.issues);
+
   // ── L7: phrase features ──
   const phraseFeatures = buildPhraseFeatures(
-    phrases, signals, noteEvents, noteGroups, audioOutput.vibratoAnalysis,
+    phrases, signals, noteEvents, noteGroups, audioOutput.vibratoAnalysis, dynamics.phraseRows,
   );
+
+  // ── L7.5: musical context (key, figures, per-kind contrasts) ──
+  const musicalContext = buildMusicalContext(noteEvents, phrases, { keyHint: input.keyHint });
 
   // ── L8: statistical pattern tests ──
   const findings = runPatternDetection(signals, noteEvents);
@@ -131,5 +164,40 @@ export function runSessionPipeline(input: SessionPipelineInput): SessionPipeline
     phraseFeatures,
   });
 
-  return { noteEvents, signals, noteGroups, phrases, phraseFeatures, findings, videoMetrics, sessionAssessment };
+  // audioEngine deliberately returns dynamicControl with no events — the phrase
+  // analysis that produces them lives here now, because it needs the L6 phrases.
+  // Patch it so callers get one complete metric rather than having to know
+  // about the split.
+  const audioMetrics = audioOutput.metrics.map((m) =>
+    m.key === 'dynamicControl' ? applyDynamicsIssues(m, rankedDynamicsIssues) : m,
+  );
+
+  return {
+    noteEvents, signals, noteGroups, phrases, phraseFeatures,
+    musicalContext, findings, videoMetrics, sessionAssessment,
+    dynamics, audioMetrics,
+  };
+}
+
+/**
+ * Folds the ranked phrase issues back onto the dynamicControl metric. The score
+ * is untouched — it is computed from jitter, range and a sliding-window R², all
+ * phrase-independent — so only the flagged moments and the summary change.
+ */
+function applyDynamicsIssues(metric: MetricScore, ranked: DynamicsIssue[]): MetricScore {
+  if (ranked.length === 0) return metric;
+  return {
+    ...metric,
+    flaggedTimestamps: ranked.map((e) => ({
+      startSeconds: e.startSec,
+      endSeconds: e.endSec,
+      note: e.note,
+    })),
+    events: ranked.map((e) => ({
+      type: e.type,
+      startSeconds: e.startSec,
+      endSeconds: e.endSec,
+    })),
+    observationSummary: ranked[0].note,
+  };
 }

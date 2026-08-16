@@ -32,6 +32,8 @@ export function PracticeNode({
   const requiresCamera = block.liveMode.requiresCamera;
   const needLabel = requiresCamera ? 'Camera' : block.liveMode.requiresMic ? 'Mic' : 'By ear';
   const needIcon = requiresCamera ? 'camera' : block.liveMode.requiresMic ? 'mic' : 'musical-note';
+  const evaluatorId = block.evaluator?.evaluatorId;
+  const gradedPerNote = evaluatorId === 'sequence' || evaluatorId === 'scale';
 
   return (
     <View style={s.row}>
@@ -51,7 +53,7 @@ export function PracticeNode({
         onPress={onPress}
       >
         <View style={[s.tile, { backgroundColor: accent }, done && s.tileDone]}>
-          <PracticeGraphic type={block.type} size={62} />
+          <PracticeGraphic type={block.type} size={TILE} />
           {done && (
             <View style={s.tileCheck}>
               <Ionicons name="checkmark" size={14} color={accent} />
@@ -62,6 +64,12 @@ export function PracticeNode({
         <View style={s.content}>
           {next && <Text style={s.nextLabel}>Up next</Text>}
           <Text style={s.title} numberOfLines={2}>{block.title}</Text>
+          {/* The reason the drill is here at all. Without it the path is a menu;
+              with it, every card is an argument the player can agree or
+              disagree with — which is the whole point of targeting them. */}
+          {block.reason ? (
+            <Text style={s.because} numberOfLines={2}>{block.reason}</Text>
+          ) : null}
           <View style={s.meta}>
             <View style={s.chip}>
               <Ionicons name="time-outline" size={13} color={colors.text.muted} />
@@ -71,6 +79,12 @@ export function PracticeNode({
               <Ionicons name={needIcon as any} size={13} color={colors.text.muted} />
               <Text style={s.chipText}>{needLabel}</Text>
             </View>
+            {gradedPerNote && (
+              <View style={s.chip}>
+                <Ionicons name="checkmark-circle-outline" size={13} color={colors.text.muted} />
+                <Text style={s.chipText}>Graded per note</Text>
+              </View>
+            )}
           </View>
         </View>
 
@@ -87,10 +101,10 @@ export function PracticeNode({
 
 const RAIL_W = 32;
 const MED = 26;
-const TILE = 62;
+const TILE = 78;
 
 const s = StyleSheet.create({
-  row: { flexDirection: 'row', gap: spacing.sm },
+  row: { flexDirection: 'row', gap: spacing.md },
   rail: { width: RAIL_W, alignItems: 'center' },
   medallion: {
     width: MED,
@@ -112,7 +126,7 @@ const s = StyleSheet.create({
     marginTop: 4,
     borderRadius: 2,
     backgroundColor: '#e5e7eb',
-    minHeight: spacing.md,
+    minHeight: spacing.lg,
   },
   connectorDone: { backgroundColor: colors.score.excellent },
   card: {
@@ -120,10 +134,10 @@ const s = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: spacing.md,
-    marginBottom: spacing.md,
+    marginBottom: spacing.lg,
     backgroundColor: '#fff',
     borderRadius: radius.xl,
-    padding: spacing.sm + 2,
+    padding: spacing.md - 2,
     borderWidth: 1.5,
     borderColor: '#eef2f7',
   },
@@ -158,7 +172,8 @@ const s = StyleSheet.create({
     letterSpacing: 0.5,
   },
   title: { fontSize: 16, fontWeight: '900', color: colors.text.primary, lineHeight: 20 },
-  meta: { flexDirection: 'row', gap: spacing.sm, marginTop: 2 },
+  because: { fontSize: 12, lineHeight: 16, color: colors.text.secondary, marginTop: 1 },
+  meta: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm, marginTop: 3 },
   chip: { flexDirection: 'row', alignItems: 'center', gap: 3 },
   chipText: { fontSize: 12, fontWeight: '700', color: colors.text.muted },
   chevron: { marginLeft: -4 },

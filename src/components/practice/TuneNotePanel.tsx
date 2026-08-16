@@ -1,9 +1,11 @@
 import React from 'react';
 import { TouchableWithoutFeedback, View, Text, Pressable, StyleSheet, Dimensions } from 'react-native';
 import { pitchClassInfo } from '../../lib/referenceNote';
+import { midiToNoteName, PITCH_CLASS_MIDI } from '../../lib/pitchNaming';
+import { fingeringFor } from '../../lib/fingering';
 import { colors, spacing, radius } from '../../constants/theme';
 
-const PANEL_H = Math.round(Dimensions.get('window').height * 0.42);
+const PANEL_H = Math.round(Dimensions.get('window').height * 0.46);
 
 /** Bottom-sheet reference-pitch player. Shared by the results screens and the practice runner. */
 export function TunePracticePanel({
@@ -15,14 +17,25 @@ export function TunePracticePanel({
   onToggle: () => void;
   onClose: () => void;
 }) {
-  const { freq, description } = pitchClassInfo(pitchClass, midiNote);
+  // The label, the description and the audio must all come from ONE note.
+  // Rendering the caller's `pitchClass` string directly is how this panel used
+  // to announce "D4" while playing B3: the label came from one field and the
+  // sound from another, and nothing forced them to agree.
+  const midi = midiNote ?? PITCH_CLASS_MIDI[pitchClass];
+  const { freq, description } = pitchClassInfo(pitchClass, midi);
+  const displayName = midi != null ? midiToNoteName(midi) : pitchClass;
+  const fingering = midi != null ? fingeringFor(midi) : null;
+
   return (
     <TouchableWithoutFeedback onPress={onClose}>
       <View style={s.backdrop}>
         <TouchableWithoutFeedback>
           <View style={s.sheet}>
             <View style={s.pill} />
-            <Text style={s.noteName}>{pitchClass}</Text>
+            <Text style={s.noteName}>{displayName}</Text>
+            {/* Where it is on the instrument, not just what it's called — a note
+                name alone leaves a beginner hunting for it. */}
+            {fingering && <Text style={s.fingering}>{fingering.label}</Text>}
             <Text style={s.noteDesc}>{description}</Text>
             <Text style={s.noteFreq}>{freq} Hz</Text>
             <Text style={s.instruction}>
@@ -70,6 +83,16 @@ const s = StyleSheet.create({
   },
   pill: { width: 36, height: 4, borderRadius: 2, backgroundColor: '#d1d5db', marginTop: 10, marginBottom: 4 },
   noteName: { fontSize: 52, fontWeight: '800', color: colors.brand[700], lineHeight: 60 },
+  fingering: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: colors.brand[600],
+    backgroundColor: colors.brand[50],
+    borderRadius: radius.full,
+    paddingHorizontal: 14,
+    paddingVertical: 5,
+    overflow: 'hidden',
+  },
   noteDesc: { fontSize: 14, color: colors.text.secondary, fontWeight: '500', textAlign: 'center' },
   noteFreq: { fontSize: 13, color: colors.text.muted, textAlign: 'center' },
   instruction: { fontSize: 13, color: colors.text.secondary, textAlign: 'center', lineHeight: 19, paddingHorizontal: spacing.md },

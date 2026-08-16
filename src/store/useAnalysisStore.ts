@@ -3,6 +3,11 @@ import { persist, createJSONStorage, StateStorage } from 'zustand/middleware';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { AnalysisResult, MetricScore, SessionSummary } from '../types/analysis';
 import { Piece } from '../types/piece';
+import { AnalyticsEvent, STREAK_MILESTONES } from '../constants/analyticsEvents';
+import { track } from '../services/analytics';
+import { computeStreak } from '../lib/streak';
+import { minutesPracticedThisWeek } from '../lib/weeklyGoal';
+import { useAuthStore } from './useAuthStore';
 
 // Wraps AsyncStorage so full-device errors are swallowed rather than crashing.
 const safeStorage: StateStorage = {
@@ -27,6 +32,37 @@ export type AnalysisPhase =
   | 'done'
   | 'error';
 
+/**
+ * Genuinely-measured figures for a session, captured at analysis time.
+ *
+ * MetricScore.occurrenceRate is only a real measurement for some metrics — for
+ * pitchAccuracy, vibrato and dynamicControl it is computed as `1 - score/100`,
+ * i.e. the internal score restated. The real note/beat counts live on
+ * intonationAnalysis / rhythmAnalysis, which are in-memory only. Picking them
+ * out here is what lets the Progress screen show "84% of notes in tune" without
+ * inventing a unit that was never measured.
+ */
+export interface SessionHeadline {
+  /** intonationAnalysis.inTuneRate — inTuneCount / noteEvents.length */
+  inTuneRate?: number;
+  /** intonationAnalysis.totalNoteEvents — sample size behind inTuneRate */
+  totalNotes?: number;
+  /** intonationAnalysis.tendencyCents — signed, negative = flat */
+  tendencyCents?: number;
+  /** intonationStabilityAnalysis.avgDriftCents */
+  avgDriftCents?: number;
+  /** Fraction of notes on the beat grid (rhythmAccuracy's occurrenceRate is real) */
+  onGridRate?: number;
+  /** rhythmAnalysis.bpmEst */
+  bpmEst?: number;
+  /** Fraction of session time free of tone faults (toneQuality's is real) */
+  cleanToneRate?: number;
+  /** vibratoAnalysis.eligibleCount — how many notes could be assessed at all */
+  vibratoEligible?: number;
+  /** vibratoAnalysis.avgNoteScore */
+  vibratoAvgScore?: number;
+}
+
 export interface MetricHistoryEntry {
   sessionId: string;
   recordedAt: string;
@@ -35,8 +71,13 @@ export interface MetricHistoryEntry {
    *  so the daily plan's window survives an app restart. Absent on entries saved
    *  before this existed — callers fall back to the score-level derivation. */
   evidence?: import('../lib/practiceEvidence').PracticeEvidence[];
+  /** Which analysis version produced `evidence`. See EVIDENCE_VERSION. */
+  evidenceVersion?: number;
   /** Piece this session practiced, for piece-scoped issue queries. */
   pieceId?: string;
+  /** Real-unit figures for trend display. Absent on entries saved before this
+   *  existed — callers fall back to the qualitative severity band. */
+  headline?: SessionHeadline;
 }
 
 interface AnalysisState {
@@ -71,7 +112,7 @@ const TRANSIENT_PHASES: AnalysisPhase[] = [
 
 export const useAnalysisStore = create<AnalysisState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       phase: 'piece_input',
       selectedPiece: null,
       currentResult: null,
@@ -85,8 +126,37 @@ export const useAnalysisStore = create<AnalysisState>()(
       setSelectedPiece: (piece) => set({ selectedPiece: piece }),
       setRecordingUri: (uri) => set({ recordingUri: uri }),
       setResult: (result) => set({ currentResult: result, phase: 'done' }),
-      addToHistory: (summary) =>
-        set((state) => ({ sessionHistory: [summary, ...state.sessionHistory] })),
+      // A session landing is the only thing that can move the streak or the
+      // weekly total, so the habit events are emitted here rather than
+      // recomputed on every render of the home screen. Reported after the write
+      // rather than inside the updater, keeping the updater side-effect free.
+      addToHistory: (summary) => {
+        const previous = get().sessionHistory;
+        const sessionHistory = [summary, ...previous];
+        set({ sessionHistory });
+
+        const before = computeStreak(previous);
+        const after = computeStreak(sessionHistory);
+        if (after > before) {
+          track(AnalyticsEvent.STREAK_EXTENDED, { streak_days: after });
+          if ((STREAK_MILESTONES as readonly number[]).includes(after)) {
+            track(AnalyticsEvent.STREAK_MILESTONE, { streak_days: after });
+          }
+        } else if (before > 1 && after <= 1) {
+          // They came back, but not in time — the gap ended the run.
+          track(AnalyticsEvent.STREAK_BROKEN, { previous_streak: before });
+        }
+
+        // Only on the session that crosses the line, so the event counts
+        // weeks-goal-hit rather than sessions-after-hitting-it.
+        const goal = useAuthStore.getState().weeklyGoalMinutes;
+        if (goal && minutesPracticedThisWeek(previous) < goal) {
+          const nowMinutes = minutesPracticedThisWeek(sessionHistory);
+          if (nowMinutes >= goal) {
+            track(AnalyticsEvent.WEEKLY_GOAL_MET, { minutes: goal, actual: nowMinutes });
+          }
+        }
+      },
       mergeHistory: (summaries) =>
         set((state) => {
           const byId = new Map<string, SessionSummary>();
@@ -133,8 +203,23 @@ export const useAnalysisStore = create<AnalysisState>()(
         metricHistory: state.metricHistory,
       }),
       onRehydrateStorage: () => (state) => {
+        // The activation sample analysis is not a session. It's persisted only
+        // because currentResult is, so drop it before anything else reads it —
+        // otherwise a user who took the "no violin" path would find a fake
+        // session waiting for them on next launch. Runs first so the phase
+        // reset below sees the cleared result.
+        if (state?.currentResult?.isDemo) {
+          state.currentResult = null;
+          state.phase = 'piece_input';
+        }
         // Reset any phase that can't be resumed (mid-recording, mid-upload, errors).
         if (state && TRANSIENT_PHASES.includes(state.phase)) {
+          // The reset is also the only evidence that a run was interrupted — an
+          // app kill mid-analysis otherwise leaves no trace anywhere. Reported
+          // before the phase is overwritten.
+          if (state.phase !== 'error') {
+            track(AnalyticsEvent.ANALYSIS_ABANDONED, { phase: state.phase });
+          }
           state.phase = state.currentResult ? 'done' : 'piece_input';
           state.error = null;
           state.recordingUri = null;

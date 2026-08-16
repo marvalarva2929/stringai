@@ -53,6 +53,8 @@
 	<string>StringAI needs microphone access to analyze your intonation, tone quality, and rhythm.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>StringAI needs photo library access to let you upload existing practice videos.</string>
+	<key>NSUserTrackingUsageDescription</key>
+	<string>StringAI uses this to measure which channels bring new violinists to the app. Your practice recordings and results are never shared or sold.</string>
 	<key>NSUserActivityTypes</key>
 	<array>
 		<string>$(PRODUCT_BUNDLE_IDENTIFIER).expo.index_route</string>

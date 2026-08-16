@@ -34,13 +34,25 @@ export async function ensureReminderPermission(): Promise<boolean> {
   return requested.granted;
 }
 
+/**
+ * Stable identifiers, so each scheduled notification can be replaced without
+ * touching the others.
+ *
+ * This used to be a `cancelAllScheduledNotificationsAsync()` before every
+ * schedule, on the reasoning that the daily reminder was the only thing the app
+ * ever scheduled. That stopped being true with the trial recap: rescheduling
+ * the reminder would silently delete the recap, and vice versa.
+ */
+export const DAILY_REMINDER_ID = 'daily-practice-reminder';
+export const TRIAL_RECAP_ID = 'trial-recap';
+
 /** Cancels any existing reminder, then schedules a new daily one at hour:minute
- *  local time. Reminders are the app's only scheduled notifications, so a full
- *  cancel-then-schedule can't clobber anything else. */
+ *  local time. Addressed by id so it can't disturb the trial recap. */
 export async function scheduleDailyReminder(hour: number, minute: number): Promise<void> {
   await ensureAndroidChannel();
-  await Notifications.cancelAllScheduledNotificationsAsync();
+  await Notifications.cancelScheduledNotificationAsync(DAILY_REMINDER_ID).catch(() => {});
   await Notifications.scheduleNotificationAsync({
+    identifier: DAILY_REMINDER_ID,
     content: {
       title: REMINDER_NOTIFICATION.title,
       body: REMINDER_NOTIFICATION.body,
@@ -54,5 +66,36 @@ export async function scheduleDailyReminder(hour: number, minute: number): Promi
 }
 
 export async function cancelReminders(): Promise<void> {
-  await Notifications.cancelAllScheduledNotificationsAsync();
+  await Notifications.cancelScheduledNotificationAsync(DAILY_REMINDER_ID).catch(() => {});
+}
+
+/**
+ * Schedules the one-off trial recap for an absolute date, replacing any
+ * previous one.
+ *
+ * Re-scheduled rather than written once, because a local notification's body is
+ * fixed at schedule time and the whole point of this message is to carry the
+ * user's *actual* progress. Every app open rewrites it with current numbers —
+ * see syncTrialRecap in src/lib/trialRecap.ts.
+ */
+export async function scheduleTrialRecap(
+  fireAt: Date,
+  content: { title: string; body: string },
+): Promise<void> {
+  await ensureAndroidChannel();
+  await Notifications.cancelScheduledNotificationAsync(TRIAL_RECAP_ID).catch(() => {});
+  // A date in the past fires immediately on some platforms — never schedule one.
+  if (fireAt.getTime() <= Date.now()) return;
+  await Notifications.scheduleNotificationAsync({
+    identifier: TRIAL_RECAP_ID,
+    content,
+    trigger: {
+      type: Notifications.SchedulableTriggerInputTypes.DATE,
+      date: fireAt,
+    },
+  });
+}
+
+export async function cancelTrialRecap(): Promise<void> {
+  await Notifications.cancelScheduledNotificationAsync(TRIAL_RECAP_ID).catch(() => {});
 }

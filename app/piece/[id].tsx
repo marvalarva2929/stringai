@@ -6,79 +6,89 @@ import {
   SafeAreaView,
   ScrollView,
   Pressable,
+  useWindowDimensions,
 } from 'react-native';
 import { router, useLocalSearchParams } from 'expo-router';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useAnalysisStore } from '../../src/store/useAnalysisStore';
 import { useUserStore } from '../../src/store/useUserStore';
 import { haptic } from '../../src/lib/haptics';
-import { Card } from '../../src/components/ui/Card';
-import { ScoreGauge } from '../../src/components/ui/ScoreGauge';
+import { DepthCard } from '../../src/components/ui/DepthCard';
+import { TrendLine } from '../../src/components/charts/TrendLine';
+import { DivergingBars } from '../../src/components/charts/DivergingBars';
+import { DIRECTION_STYLE } from '../../src/components/charts/chartTheme';
 import { colors, spacing, radius } from '../../src/constants/theme';
-import { severityFromScore, SessionSummary } from '../../src/types/analysis';
+import { METRIC_META } from '../../src/constants/metricMeta';
+import type { SessionSummary } from '../../src/types/analysis';
+import { collectIssueSources } from '../../src/lib/practiceIssues';
+import { buildIssueTimeline } from '../../src/lib/issueTimeline';
+import { usePracticeAttemptStore } from '../../src/store/usePracticeAttemptStore';
+import { IssueTimelineCard } from '../../src/components/progress/IssueTimelineCard';
+import {
+  categoryDeltas, compareHalves, pieceVsGlobalIssues, type TrendPoint,
+} from '../../src/lib/progressAnalytics';
 
-function ScoreBar({ score, maxScore }: { score: number; maxScore: number }) {
-  const height = Math.max(4, Math.round((score / 100) * 80));
-  const isLatest = score === maxScore;
-  return (
-    <View style={bar.wrap}>
-      <Text style={bar.label}>{score}</Text>
-      <View
-        style={[
-          bar.fill,
-          {
-            height,
-            backgroundColor: isLatest
-              ? colors.brand[500]
-              : score >= 70
-              ? colors.score.excellent
-              : score >= 50
-              ? '#f59e0b'
-              : colors.score.critical,
-          },
-        ]}
-      />
-    </View>
-  );
-}
-
-const bar = StyleSheet.create({
-  wrap: { alignItems: 'center', gap: 3 },
-  label: { fontSize: 10, color: colors.text.muted, fontWeight: '600' },
-  fill: { width: 28, borderRadius: 4 },
-});
+const SCREEN_PADDING = spacing.lg;
+const CARD_PADDING = spacing.md;
 
 export default function PieceDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
-  const { sessionHistory } = useAnalysisStore();
+  const { width } = useWindowDimensions();
+
+  const sessionHistory = useAnalysisStore((s) => s.sessionHistory);
+  const metricHistory = useAnalysisStore((s) => s.metricHistory);
+  const sessionResultCache = useAnalysisStore((s) => s.sessionResultCache);
   const currentPiece = useUserStore((st) => st.profile?.currentPiece);
   const pinPiece = useUserStore((st) => st.pinPiece);
   const unpinPiece = useUserStore((st) => st.unpinPiece);
 
   const isGeneral = id === 'general';
   const isPinned = currentPiece?.pieceId === id;
+  const chartWidth = width - SCREEN_PADDING * 2 - CARD_PADDING * 2 - 3;
 
   const sessions = useMemo<SessionSummary[]>(
     () =>
       sessionHistory
-        .filter((s) => isGeneral ? !s.piece?.id : s.piece?.id === id)
+        .filter((s) => (isGeneral ? !s.piece?.id : s.piece?.id === id))
         .sort((a, b) => a.recordedAt.localeCompare(b.recordedAt)),
     [sessionHistory, id, isGeneral],
   );
 
-  // Non-general: the filter above guarantees every session carries this piece,
-  // so sessions[0].piece is present whenever sessions is non-empty. The fallback
-  // only covers the empty case, which renders the empty state below anyway.
+  const points = useMemo<TrendPoint[]>(
+    () => sessions.map((s) => ({ t: new Date(s.recordedAt).getTime(), value: s.overallScore })),
+    [sessions],
+  );
+  const comparison = useMemo(() => compareHalves(points), [points]);
+
+  // Per-metric history for just this piece's attempts.
+  const pieceEntries = useMemo(
+    () => metricHistory.filter((e) => (isGeneral ? !e.pieceId : e.pieceId === id)),
+    [metricHistory, id, isGeneral],
+  );
+  const deltas = useMemo(() => categoryDeltas(pieceEntries), [pieceEntries]);
+
+  const issueSources = useMemo(
+    () => collectIssueSources({
+      recentSessions: Object.values(sessionResultCache),
+      metricHistory,
+    }),
+    [sessionResultCache, metricHistory],
+  );
+  const issueSplit = useMemo(
+    () => (isGeneral ? null : pieceVsGlobalIssues(issueSources, id)),
+    [issueSources, id, isGeneral],
+  );
+
+  // Act three: for each issue this piece produced, what happened next.
+  const attempts = usePracticeAttemptStore((st) => st.attempts);
+  const timeline = useMemo(
+    () => (isGeneral ? [] : buildIssueTimeline({ sources: issueSources, attempts, pieceId: id })),
+    [issueSources, attempts, id, isGeneral],
+  );
+
   const piece: { title: string; composer?: string } = isGeneral
     ? { title: 'General Practice' }
     : sessions[0]?.piece ?? { title: 'This piece' };
-  const scores = sessions.map((s) => s.overallScore);
-  const avgScore = scores.length
-    ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length)
-    : 0;
-  const bestScore = scores.length ? Math.max(...scores) : 0;
-  const latestScore = scores[scores.length - 1] ?? 0;
-  const improvement = scores.length >= 2 ? latestScore - scores[0] : null;
 
   if (sessions.length === 0) {
     return (
@@ -92,6 +102,8 @@ export default function PieceDetailScreen() {
       </SafeAreaView>
     );
   }
+
+  const direction = DIRECTION_STYLE[comparison.direction];
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -109,7 +121,7 @@ export default function PieceDetailScreen() {
             onPress={() => {
               haptic.medium();
               if (isPinned) unpinPiece();
-              else pinPiece({ pieceId: id, title: piece?.title ?? 'This piece', composer: piece?.composer });
+              else pinPiece({ pieceId: id, title: piece.title, composer: piece.composer });
             }}
           >
             <Text style={styles.pinBtnText}>
@@ -121,108 +133,147 @@ export default function PieceDetailScreen() {
 
       <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
 
-        {/* Stats row */}
-        <View style={styles.statsRow}>
-          <StatBox label="Sessions" value={String(sessions.length)} />
-          <StatBox label="Average" value={String(avgScore)} />
-          <StatBox label="Best" value={String(bestScore)} />
-          {improvement !== null && (
-            <StatBox
-              label="Overall"
-              value={`${improvement >= 0 ? '+' : ''}${improvement}`}
-              valueColor={improvement >= 0 ? colors.score.excellent : colors.score.critical}
-            />
-          )}
-        </View>
-
-        {/* Score trend chart */}
-        <Card style={styles.chartCard}>
-          <Text style={styles.sectionLabel}>Score Over Sessions</Text>
-          <View style={styles.chartWrapper}>
-            {/* Reference line at score 70 ("good" threshold) */}
-            <View style={styles.chartRefLine} />
-            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-              <View style={styles.chartArea}>
-                {sessions.map((s, i) => (
-                  <View key={s.id} style={styles.chartCol}>
-                    <ScoreBar score={s.overallScore} maxScore={bestScore} />
-                    <Text style={styles.chartDateLabel}>
-                      {new Date(s.recordedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
-                    </Text>
-                  </View>
-                ))}
+        {/* ── Attempts over time ─────────────────────────── */}
+        <DepthCard>
+          <View style={styles.attemptHeader}>
+            <View>
+              <Text style={styles.attemptCount}>
+                {sessions.length} attempt{sessions.length === 1 ? '' : 's'}
+              </Text>
+              <Text style={styles.attemptLabel}>on this piece</Text>
+            </View>
+            {comparison.direction !== 'unknown' && comparison.delta != null && (
+              <View style={styles.deltaBlock}>
+                <Text style={[styles.delta, { color: direction.color }]}>
+                  {direction.glyph} {Math.round(comparison.delta) > 0 ? '+' : ''}{Math.round(comparison.delta)}
+                </Text>
+                <Text style={styles.deltaLabel}>latest tries vs. first</Text>
               </View>
-            </ScrollView>
+            )}
           </View>
-          {improvement !== null && (
-            <Text style={[
-              styles.chartCaption,
-              { color: improvement >= 0 ? colors.score.excellent : colors.score.critical },
-            ]}>
-              {improvement >= 0 ? '▲' : '▼'} {Math.abs(improvement)} pts from first to latest session
-            </Text>
-          )}
-        </Card>
 
-        {/* Session list */}
-        <Text style={styles.sectionHeading}>All Sessions</Text>
+          {points.length >= 2 ? (
+            <TrendLine
+              points={points}
+              width={chartWidth}
+              onPointPress={(point) => {
+                const match = sessions.find((s) => new Date(s.recordedAt).getTime() === point.t);
+                if (match) { haptic.light(); router.push(`/session/${match.id}`); }
+              }}
+            />
+          ) : (
+            <Text style={styles.hint}>Record this piece again to see it as a trend.</Text>
+          )}
+        </DepthCard>
+
+        {/* ── What changed ───────────────────────────────── */}
+        {deltas.length > 0 && (
+          <>
+            <SectionHeader label="What changed on this piece" />
+            <DepthCard>
+              <DivergingBars deltas={deltas} width={chartWidth} />
+              <Text style={styles.footnote}>
+                First attempts compared with your most recent ones.
+              </Text>
+            </DepthCard>
+          </>
+        )}
+
+        {/* ── Did the practice help? ────────────────────── */}
+        {timeline.length > 0 && (
+          <>
+            <SectionHeader label="What you've been working on" />
+            <Text style={styles.groupHint}>
+              Each problem this piece has thrown up, what you did about it, and
+              what the measurement has done since.
+            </Text>
+            <View style={styles.timeline}>
+              {timeline.map((entry) => (
+                <IssueTimelineCard key={entry.issueId} entry={entry} />
+              ))}
+            </View>
+          </>
+        )}
+
+        {/* ── Issues, split by whether they follow you ───── */}
+        {issueSplit && issueSplit.pieceSpecific.length > 0 && (
+          <>
+            <SectionHeader label="Specific to this piece" />
+            <DepthCard>
+              <Text style={styles.groupHint}>
+                These show up here but not in your other playing — a hard passage
+                rather than a technique gap.
+              </Text>
+              {issueSplit.pieceSpecific.slice(0, 4).map((evidence) => (
+                <IssueRow key={evidence.id} title={evidence.title} metricKey={evidence.metricKey} />
+              ))}
+            </DepthCard>
+          </>
+        )}
+
+        {issueSplit && issueSplit.universal.length > 0 && (
+          <>
+            <SectionHeader label="Follows you everywhere" />
+            <DepthCard>
+              <Text style={styles.groupHint}>
+                These turn up whatever you play, so they're worth drilling on their
+                own rather than inside this piece.
+              </Text>
+              {issueSplit.universal.slice(0, 4).map((evidence) => (
+                <IssueRow key={evidence.id} title={evidence.title} metricKey={evidence.metricKey} />
+              ))}
+              <Pressable
+                style={({ pressed }) => [styles.cta, pressed && styles.ctaPressed]}
+                onPress={() => { haptic.medium(); router.push('/(tabs)/train'); }}
+              >
+                <Text style={styles.ctaText}>Practice these →</Text>
+              </Pressable>
+            </DepthCard>
+          </>
+        )}
+
+        {/* ── Attempt list ───────────────────────────────── */}
+        <SectionHeader label="All attempts" />
         {[...sessions].reverse().map((session) => (
-          <Pressable
+          <DepthCard
             key={session.id}
             onPress={() => router.push(`/session/${session.id}`)}
-            style={({ pressed }) => [{ opacity: pressed ? 0.75 : 1 }]}
+            style={styles.sessionCard}
           >
-            <Card style={styles.sessionCard}>
-              <View style={styles.sessionRow}>
-                <ScoreGauge
-                  score={session.overallScore}
-                  severity={severityFromScore(session.overallScore)}
-                  size="sm"
-                  showLabel={false}
-                />
-                <View style={styles.sessionInfo}>
-                  <Text style={styles.sessionDate}>
-                    {new Date(session.recordedAt).toLocaleDateString('en-US', {
-                      weekday: 'short', month: 'short', day: 'numeric',
-                    })}
-                  </Text>
-                  <Text style={styles.sessionMeta}>
-                    {Math.round(session.durationSeconds)}s session
-                    {session.topIssue ? ` · Focus: ${session.topIssue}` : ''}
-                  </Text>
-                </View>
-                {session.overallDelta != null && (
-                  <Text style={[
-                    styles.sessionDelta,
-                    { color: session.overallDelta >= 0 ? colors.score.excellent : colors.score.critical },
-                  ]}>
-                    {session.overallDelta >= 0 ? '+' : ''}{session.overallDelta}
-                  </Text>
-                )}
-                <Text style={styles.sessionArrow}>›</Text>
+            <View style={styles.sessionRow}>
+              <View style={styles.sessionInfo}>
+                <Text style={styles.sessionDate}>
+                  {new Date(session.recordedAt).toLocaleDateString('en-US', {
+                    weekday: 'short', month: 'short', day: 'numeric',
+                  })}
+                </Text>
+                <Text style={styles.sessionMeta}>
+                  {Math.round(session.durationSeconds)}s
+                  {session.topIssue ? ` · Focus: ${METRIC_META[session.topIssue]?.label ?? session.topIssue}` : ''}
+                </Text>
               </View>
-            </Card>
-          </Pressable>
+              <Text style={styles.chevron}>›</Text>
+            </View>
+          </DepthCard>
         ))}
 
+        <View style={styles.bottomPad} />
       </ScrollView>
     </SafeAreaView>
   );
 }
 
-function StatBox({
-  label,
-  value,
-  valueColor,
-}: {
-  label: string;
-  value: string;
-  valueColor?: string;
-}) {
+// ── Sub-components ───────────────────────────────────────────
+
+function SectionHeader({ label }: { label: string }) {
+  return <Text style={styles.sectionHeader}>{label}</Text>;
+}
+
+function IssueRow({ title, metricKey }: { title: string; metricKey: keyof typeof METRIC_META }) {
   return (
-    <View style={styles.statBox}>
-      <Text style={[styles.statValue, valueColor ? { color: valueColor } : {}]}>{value}</Text>
-      <Text style={styles.statLabel}>{label}</Text>
+    <View style={styles.issueRow}>
+      <Text style={styles.issueIcon}>{METRIC_META[metricKey]?.icon ?? '🎻'}</Text>
+      <Text style={styles.issueTitle}>{title}</Text>
     </View>
   );
 }
@@ -231,7 +282,10 @@ const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.background },
 
   header: { paddingBottom: spacing.xl, paddingHorizontal: spacing.xl },
-  backRow: { flexDirection: 'row', alignItems: 'center', gap: 4, paddingTop: spacing.md, marginBottom: spacing.md },
+  backRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 4,
+    paddingTop: spacing.md, marginBottom: spacing.md,
+  },
   backArrow: { fontSize: 24, color: 'rgba(255,255,255,0.8)', lineHeight: 28 },
   backLabel: { fontSize: 14, color: 'rgba(255,255,255,0.8)', fontWeight: '500' },
   pieceTitle: { fontSize: 22, fontWeight: '700', color: '#fff', lineHeight: 28 },
@@ -246,77 +300,50 @@ const styles = StyleSheet.create({
   },
   pinBtnText: { color: '#fff', fontSize: 13, fontWeight: '800' },
 
-  content: { padding: spacing.lg, gap: spacing.md },
+  content: { paddingHorizontal: spacing.lg, paddingTop: spacing.lg, gap: spacing.md },
 
-  // Stats
-  statsRow: {
-    flexDirection: 'row',
-    backgroundColor: '#fff',
-    borderRadius: radius.lg,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.07,
-    shadowRadius: 8,
-    elevation: 3,
-  },
-  statBox: {
-    flex: 1,
-    alignItems: 'center',
-    paddingVertical: spacing.md,
-    borderRightWidth: 1,
-    borderRightColor: '#f0f0f0',
-  },
-  statValue: { fontSize: 22, fontWeight: '700', color: colors.brand[700] },
-  statLabel: { fontSize: 11, color: colors.text.muted, fontWeight: '600', textTransform: 'uppercase', marginTop: 2 },
-
-  // Chart
-  chartCard: {},
-  sectionLabel: {
+  sectionHeader: {
     fontSize: 12, fontWeight: '700', color: colors.text.muted,
-    textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: spacing.md,
+    textTransform: 'uppercase', letterSpacing: 0.5, marginTop: spacing.sm,
   },
-  chartWrapper: {
-    position: 'relative',
-    minHeight: 110,
-    paddingTop: spacing.sm,
-  },
-  chartRefLine: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    top: Math.round(spacing.sm + (1 - 0.70) * 80),
-    height: 1,
-    backgroundColor: 'rgba(22,163,74,0.25)',
-    zIndex: 1,
-  },
-  chartArea: {
-    flexDirection: 'row',
-    alignItems: 'flex-end',
-    gap: spacing.sm,
-    minHeight: 100,
-    paddingTop: spacing.sm,
-    paddingBottom: 4,
-  },
-  chartCol: { alignItems: 'center', gap: 4 },
-  chartDateLabel: { fontSize: 9, color: colors.text.muted, textAlign: 'center' },
-  chartCaption: { fontSize: 12, fontWeight: '600', marginTop: spacing.sm, textAlign: 'center' },
 
-  // Session list
-  sectionHeading: {
-    fontSize: 13, fontWeight: '700', color: colors.text.muted,
-    textTransform: 'uppercase', letterSpacing: 0.5,
+  attemptHeader: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between' },
+  attemptCount: { fontSize: 24, fontWeight: '800', color: colors.text.primary },
+  attemptLabel: { fontSize: 12, color: colors.text.muted, fontWeight: '600' },
+  deltaBlock: { alignItems: 'flex-end' },
+  delta: { fontSize: 17, fontWeight: '800' },
+  deltaLabel: { fontSize: 11, color: colors.text.muted, marginTop: 2 },
+  hint: { fontSize: 13, color: colors.text.secondary, paddingVertical: spacing.sm },
+  footnote: { fontSize: 11, color: colors.text.muted, marginTop: spacing.xs },
+
+  groupHint: { fontSize: 12, color: colors.text.secondary, lineHeight: 17 },
+  timeline: { gap: spacing.sm },
+  issueRow: { flexDirection: 'row', alignItems: 'flex-start', gap: spacing.sm, paddingTop: 2 },
+  issueIcon: { fontSize: 14, lineHeight: 19 },
+  issueTitle: { flex: 1, fontSize: 13, color: colors.text.primary, fontWeight: '600', lineHeight: 19 },
+
+  cta: {
+    alignSelf: 'flex-start',
+    backgroundColor: colors.brand[50],
+    borderRadius: radius.full,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 7,
+    marginTop: spacing.xs,
   },
-  sessionCard: { marginBottom: 0 },
+  ctaPressed: { backgroundColor: colors.brand[100] },
+  ctaText: { fontSize: 13, fontWeight: '700', color: colors.brand[700] },
+
+  sessionCard: { paddingVertical: spacing.sm },
   sessionRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.md },
   sessionInfo: { flex: 1 },
   sessionDate: { fontSize: 14, fontWeight: '600', color: colors.text.primary },
   sessionMeta: { fontSize: 12, color: colors.text.muted, marginTop: 2 },
-  sessionDelta: { fontSize: 14, fontWeight: '700' },
-  sessionArrow: { fontSize: 18, color: colors.text.muted, marginLeft: spacing.xs },
+  chevron: { fontSize: 20, color: colors.text.muted, fontWeight: '300' },
 
-  // Empty / error
   emptyWrap: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: spacing.md },
   emptyText: { fontSize: 15, color: colors.text.secondary },
   backBtn: { paddingVertical: spacing.sm, paddingHorizontal: spacing.lg },
   backBtnText: { fontSize: 15, color: colors.brand[600], fontWeight: '600' },
+
+  bottomPad: { height: spacing.xl },
 });

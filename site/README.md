@@ -22,7 +22,7 @@ The live URLs are wired into the app in `src/constants/links.ts` and recorded fo
 | File | Purpose | App Store use |
 |---|---|---|
 | `index.html` | Landing page | Marketing / Support URL fallback |
-| `privacy.html` | Privacy Policy (AI clause, data label, DMCA, arbitration) | **Privacy Policy URL** (required) |
+| `privacy.html` | Privacy Policy (AI clause, data label, DMCA, warranty disclaimer, liability cap, indemnity, termination, arbitration) | **Privacy Policy URL** (required) |
 | `terms.html` | Terms of Service / EULA (warranty disclaimer, liability cap, indemnity, arbitration) | **EULA / License Agreement URL** |
 | `support.html` | Support + FAQ | **Support URL** (required) |
 | `styles.css` | Shared styles (light + dark) | — |
@@ -55,5 +55,6 @@ To use e.g. `stringai.app`: add a file named `CNAME` (no extension) containing j
 ## Maintenance notes
 
 - Governing law / arbitration venue is set to **Texas**.
+- `privacy.html` and `terms.html` both carry warranty, liability, indemnity, termination, and arbitration clauses. They are written to agree: the **US $100 / 12-months-paid liability cap is shared, not per-document**, the Terms control on conflict, and both use the same blow-up rule (class-waiver unenforceable ⇒ whole arbitration section void). **Change one, change the other** — divergent caps or divergent arbitration terms weaken both.
 - Keep the **effective/last-updated dates** current whenever you change a document.
 - Make sure your in-app **privacy label** in App Store Connect matches `privacy.html` (raw video/audio processed on device and not collected; email, purchases, identifiers, and derived data linked to the user; no tracking).

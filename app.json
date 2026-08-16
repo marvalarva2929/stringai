@@ -13,10 +13,13 @@
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.stringai.app",
+      "usesAppleSignIn": true,
+      "googleServicesFile": "./GoogleService-Info.plist",
       "infoPlist": {
         "NSCameraUsageDescription": "StringAI needs camera access to analyze your playing posture and bow technique.",
         "NSMicrophoneUsageDescription": "StringAI needs microphone access to analyze your intonation, tone quality, and rhythm.",
         "NSPhotoLibraryUsageDescription": "StringAI needs photo library access to let you upload existing practice videos.",
+        "NSUserTrackingUsageDescription": "StringAI uses this to measure which channels bring new violinists to the app. Your practice recordings and results are never shared or sold.",
         "ITSAppUsesNonExemptEncryption": false
       }
     },
@@ -26,7 +29,11 @@
         "CAMERA",
         "RECORD_AUDIO",
         "READ_EXTERNAL_STORAGE",
-        "POST_NOTIFICATIONS"
+        "POST_NOTIFICATIONS",
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "com.google.android.gms.permission.AD_ID"
       ]
     },
     "web": {
@@ -48,11 +55,41 @@
         }
       ],
       "expo-notifications",
-      "expo-web-browser"
+      "expo-web-browser",
+      "@react-native-firebase/app",
+      "@react-native-firebase/crashlytics",
+      "@react-native-firebase/perf",
+      [
+        "expo-tracking-transparency",
+        {
+          "userTrackingPermission": "StringAI uses this to measure which channels bring new violinists to the app. Your practice recordings and results are never shared or sold."
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "useFrameworks": "static",
+            "forceStaticLinking": [
+              "RNFBApp",
+              "RNFBAnalytics",
+              "RNFBCrashlytics",
+              "RNFBPerf"
+            ]
+          }
+        }
+      ]
     ],
     "scheme": "stringai",
     "experiments": {
       "typedRoutes": true
-    }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "6caed017-48ef-41aa-952b-23b62f7231de"
+      }
+    },
+    "owner": "marvalarva2929"
   }
 }

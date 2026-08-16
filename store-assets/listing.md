@@ -81,19 +81,27 @@ Practice video and audio are analyzed on your phone. Raw recordings are never
 uploaded to our servers. What syncs is your scores and progress — not the
 footage.
 
-FREE AND PRO
+SUBSCRIPTION
 
-Free includes three analyzed sessions a day with full metric scoring. Pro adds:
+StringAI requires a subscription. Start with a free trial — 7 days on the
+monthly plan, 14 days on the annual plan — and cancel any time before it ends
+without being charged. Every subscription includes:
 
 • Live camera recording with real-time feedback while you play
 • Personal AI coaching after every session
-• Unlimited analyses — no daily limit
+• Unlimited analyses of every piece you play
+• Full metric scoring, session history and progress tracking
 
-Pro is an auto-renewing subscription. Payment is charged to your Apple ID at
-confirmation of purchase. It renews automatically unless canceled at least 24
-hours before the end of the current period; your account is charged for renewal
-within 24 hours before the period ends. Manage or cancel in your Apple ID
-settings after purchase.
+StringAI Pro is an auto-renewing subscription, available monthly (TODO: $X.XX)
+or annually (TODO: $XX.XX). Free trial length depends on the plan chosen: 7 days
+monthly, 14 days annually. A free trial is available once per subscription
+group; if you have used one before, you will be charged at purchase. Payment is
+charged to your Apple ID at confirmation of purchase, or at the end of the free
+trial period. It renews automatically unless canceled at least 24 hours before
+the end of the current period; your account is charged for renewal within 24
+hours before the period ends. Any unused portion of a free trial is forfeited
+when you purchase a subscription. Manage or cancel in your Apple ID settings
+after purchase.
 
 FOR WHO
 

@@ -8,6 +8,8 @@ import { GOAL_TIERS, GoalTier } from '../src/lib/weeklyGoal';
 import { BigButton } from '../src/components/ui/BigButton';
 import { MaestroAvatar } from '../src/components/ui/MaestroAvatar';
 import { updateProfileFields } from '../src/services/auth';
+import { track } from '../src/services/analytics';
+import { AnalyticsEvent } from '../src/constants/analyticsEvents';
 import { colors, spacing } from '../src/constants/theme';
 
 export default function GoalModal() {
@@ -18,6 +20,10 @@ export default function GoalModal() {
 
   const save = async () => {
     if (!selectedTier) return;
+    track(AnalyticsEvent.WEEKLY_GOAL_SET, {
+      minutes: selectedTier.minutes,
+      changed: selectedTier.minutes !== weeklyGoalMinutes,
+    });
     await setWeeklyGoal(selectedTier.minutes);
     if (isAuthenticated && userId) {
       updateProfileFields(userId, { weekly_goal_minutes: selectedTier.minutes }).catch(() => {});

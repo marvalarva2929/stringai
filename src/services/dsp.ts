@@ -61,22 +61,38 @@ export function yinWindow(
   // Periodicity: 1 → perfectly periodic, 0 → noise. cmndfMin near 0 = strong pitch.
   const periodicity = clamp(1 - cmndfMin, 0, 1);
 
-  // Find first valley below threshold, refined with parabolic interpolation
+  // Search only where a violin can actually sound. Open G is 196Hz, so the
+  // floor leaves room for a badly flat G while refusing lags that could only be
+  // a subharmonic; the ceiling covers high playing on the E string. Scanning
+  // from tau=2 (22kHz) let a spurious short lag win the "first dip" race.
+  const tauMin = Math.max(2, Math.floor(sampleRate / MAX_VIOLIN_HZ));
+  const tauMax = Math.min(half - 2, Math.ceil(sampleRate / MIN_VIOLIN_HZ));
+
   const threshold = 0.15;
-  for (let tau = 2; tau < half - 1; tau++) {
+  let bestTau = -1;
+  for (let tau = tauMin; tau <= tauMax; tau++) {
     if (cmndf[tau] < threshold) {
-      while (tau + 1 < half - 1 && cmndf[tau + 1] < cmndf[tau]) tau++;
-      const prev = cmndf[tau - 1];
-      const curr = cmndf[tau];
-      const next = cmndf[tau + 1];
-      const denom = 2 * (2 * curr - prev - next);
-      const refined = denom !== 0 ? tau + (prev - next) / denom : tau;
-      const freq = sampleRate / refined;
-      if (freq >= 80 && freq <= 5000) return { frequency: freq, periodicity };
+      while (tau + 1 <= tauMax && cmndf[tau + 1] < cmndf[tau]) tau++;
+      bestTau = tau;
+      break;
     }
   }
-  return { frequency: null, periodicity };
+  if (bestTau < 0) return { frequency: null, periodicity };
+
+  const prev = cmndf[bestTau - 1];
+  const curr = cmndf[bestTau];
+  const next = cmndf[bestTau + 1];
+  const denom = 2 * (2 * curr - prev - next);
+  const refined = denom !== 0 ? bestTau + (prev - next) / denom : bestTau;
+  const freq = sampleRate / refined;
+  if (freq < MIN_VIOLIN_HZ || freq > MAX_VIOLIN_HZ) return { frequency: null, periodicity };
+  return { frequency: freq, periodicity };
 }
+
+/** Below open G (196Hz) nothing on a violin can sound; the margin allows a flat G. */
+const MIN_VIOLIN_HZ = 180;
+/** Comfortably above the top of the E string in high positions. */
+const MAX_VIOLIN_HZ = 2100;
 
 export function detectPitches(samples: Float32Array, sampleRate: number): PitchFrame[] {
   const windowSize = 1024; // ~23ms at 44100 Hz — keeps O(N²) cost manageable

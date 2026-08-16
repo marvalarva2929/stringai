@@ -5,7 +5,7 @@
  */
 
 import { computePracticePlan } from '../src/lib/practicePlan';
-import { buildSessionEvidence } from '../src/lib/practiceEvidence';
+import { EVIDENCE_VERSION, buildSessionEvidence } from '../src/lib/practiceEvidence';
 import { nextIncompleteBlock, completedBlockIdsFor, markComplete } from '../src/lib/practiceProgress';
 import { evaluatePitchLanding } from '../src/lib/practiceEvaluator';
 import type { AnalysisResult, MetricKey, MetricScore, PitchClassIssue } from '../src/types/analysis';
@@ -88,7 +88,11 @@ console.log('practice plan generation');
   });
 
   check('specific note becomes primary focus', /A4/.test(plan.primaryFocus), plan.primaryFocus);
-  check('first block is pitch landing', plan.blocks[0]?.type === 'pitch_landing', plan.blocks[0]?.type);
+  // The plan opens with a general warm-up (which cites no evidence), so the
+  // repair work is the first block that answers a finding.
+  const firstRepair = plan.blocks.find((b) => b.evidenceRefs.length > 0);
+  check('first evidence-driven block is pitch landing',
+    firstRepair?.type === 'pitch_landing', plan.blocks.map((b) => b.type).join(','));
   check('scale lock is added after note target', plan.blocks.some((b) => b.type === 'scale_lock'));
   check('foundation category uses guided coaching', plan.coachIntensity === 'guided', plan.coachIntensity);
 }
@@ -184,13 +188,13 @@ console.log('\nscoped plans: session and piece produce distinct, filtered plans'
     target: { metricKey: 'pitchAccuracy' } });
   const bachA = result({ sessionId: 'a', recordedAt: '2026-07-10T00:00:00Z',
     piece: { id: 'bach', title: 'Minuet' } as any, metrics: [metric('pitchAccuracy', 60)],
-    sessionEvidence: [pitchEv('pitch_note:G4')] as any });
+    sessionEvidence: [pitchEv('pitch_note:G4')] as any, evidenceVersion: EVIDENCE_VERSION });
   const bachB = result({ sessionId: 'b', recordedAt: '2026-07-09T00:00:00Z',
     piece: { id: 'bach', title: 'Minuet' } as any, metrics: [metric('pitchAccuracy', 60)],
-    sessionEvidence: [pitchEv('pitch_note:G4')] as any });
+    sessionEvidence: [pitchEv('pitch_note:G4')] as any, evidenceVersion: EVIDENCE_VERSION });
   const kreutzer = result({ sessionId: 'c', recordedAt: '2026-07-08T00:00:00Z',
     piece: { id: 'kreutzer', title: 'Etude' } as any, metrics: [metric('pitchAccuracy', 60)],
-    sessionEvidence: [pitchEv('pitch_note:B4')] as any });
+    sessionEvidence: [pitchEv('pitch_note:B4')] as any, evidenceVersion: EVIDENCE_VERSION });
   const all = [bachA, bachB, kreutzer];
   const base = { metricHistory: [], playerCategory: 'refinement' as const, weeklyGoalMinutes: 45 };
 
@@ -271,12 +275,15 @@ console.log('\nrecurring issue outranks a one-off through the whole plan');
     title: 'Tone quality', reason: 'thin', evidenceSummary: '', priority: 92, confidence: 0.7,
     supportsLive: true, requiresMic: true, requiresCamera: false, measurementAvailable: true,
     sessionCount: 1, target: { metricKey: 'toneQuality' } };
+  // Stamped current, so the frozen evidence is trusted rather than recomputed
+  // — an unstamped session predates versioning and gets rebuilt from its raw
+  // analyses, which is what keeps corrected findings from going stale.
   const newest = result({ sessionId: 'n', recordedAt: '2026-07-10T00:00:00Z',
     metrics: [metric('bowDistribution', 55), metric('toneQuality', 64)],
-    sessionEvidence: [{ ...bowEv }, { ...toneEv }] as any });
+    sessionEvidence: [{ ...bowEv }, { ...toneEv }] as any, evidenceVersion: EVIDENCE_VERSION });
   const older = result({ sessionId: 'o', recordedAt: '2026-07-08T00:00:00Z',
     metrics: [metric('bowDistribution', 55)],
-    sessionEvidence: [{ ...bowEv }] as any });
+    sessionEvidence: [{ ...bowEv }] as any, evidenceVersion: EVIDENCE_VERSION });
 
   const plan = computePracticePlan({ recentSessions: [newest, older], metricHistory: [],
     playerCategory: 'refinement', weeklyGoalMinutes: 45 });
@@ -369,9 +376,15 @@ console.log('\ncorroborating findings fold into one block');
     playerCategory: 'refinement',
     weeklyGoalMinutes: 45,
   });
-  const bow = plan.blocks.find((b) => b.type === 'bow_control');
+  // Which bow drill gets generated depends on what the findings say; what must
+  // hold regardless is that three agreeing findings produce ONE drill citing
+  // all of them, rather than three drills each citing a third of the story.
+  const BOW_DRILLS = ['bow_control', 'bow_distribution', 'articulation', 'crossing_wave'];
+  const bow = plan.blocks.find((b) => BOW_DRILLS.includes(b.type));
   const cited = new Set(plan.blocks.flatMap((b) => b.evidenceRefs.map((r) => r.evidenceId)));
-  check('one bow block, not three', plan.blocks.filter((b) => b.type === 'bow_control').length === 1);
+  check('one bow block, not three',
+    plan.blocks.filter((b) => BOW_DRILLS.includes(b.type)).length === 1,
+    plan.blocks.map((b) => b.type).join(','));
   check('all three bow findings survive into the plan',
     ['bow_zone_camping', 'upper_bow_tone_degradation', 'tip_dynamic_ceiling'].every((t) => cited.has(`pattern:${t}`)),
     bow ? bow.evidenceRefs.map((r) => r.evidenceId).join(',') : 'no bow block');

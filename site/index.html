@@ -26,7 +26,7 @@
         <h1>Practice like a teacher is<br />listening.</h1>
         <p>StringAI records your playing, measures intonation, tone, bowing, rhythm, and posture on your device, and turns it into clear, specific coaching — one thing to work on at a time.</p>
         <div class="cta-row">
-          <a class="btn" href="#coming-soon">Coming to the App Store</a>
+          <a class="btn" href="#waitlist">Join the waitlist</a>
           <a class="btn secondary" href="support.html">Get Support</a>
         </div>
       </section>
@@ -50,12 +50,32 @@
         </div>
       </section>
 
+      <section id="waitlist" class="waitlist">
+        <p>Enter your email and we'll reach out when the app is ready.</p>
+        <form id="waitlist-form" novalidate>
+          <label class="sr-only" for="waitlist-email">Email address</label>
+          <input
+            id="waitlist-email"
+            name="email"
+            type="email"
+            inputmode="email"
+            autocomplete="email"
+            placeholder="you@example.com"
+            required
+          />
+          <button id="waitlist-submit" class="btn" type="submit">Notify me</button>
+        </form>
+        <p id="waitlist-status" class="waitlist-status" role="status" aria-live="polite"></p>
+      </section>
+
       <section id="coming-soon" class="callout">
-        <p style="margin:0"><strong>StringAI is launching soon.</strong> For questions before launch, reach us at
+        <p style="margin:0"><strong>Questions before launch?</strong> Reach us at
         <a href="mailto:joshvigel@gmail.com">joshvigel@gmail.com</a>.</p>
       </section>
     </div>
   </main>
+
+  <script src="waitlist.js"></script>
 
   <footer class="site">
     <div class="wrap">

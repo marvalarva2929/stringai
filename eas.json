@@ -16,9 +16,6 @@
     },
     "production": {
       "autoIncrement": true,
-      "ios": {
-        "buildType": "release"
-      },
       "android": {
         "buildType": "app-bundle"
       },
@@ -28,9 +25,9 @@
   "submit": {
     "production": {
       "ios": {
-        "appleId": "REPLACE_WITH_APPLE_ID_EMAIL",
-        "ascAppId": "REPLACE_WITH_APP_STORE_CONNECT_APP_ID",
-        "appleTeamId": "REPLACE_WITH_APPLE_TEAM_ID"
+        "appleId": "joshvigel@gmail.com",
+        "ascAppId": "6801934738",
+        "appleTeamId": "TTKYKL258N"
       },
       "android": {
         "serviceAccountKeyPath": "./play-store-service-account.json",

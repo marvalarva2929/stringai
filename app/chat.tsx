@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import {
   View,
   Text,
@@ -14,17 +14,23 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { useAnalysisStore } from '../src/store/useAnalysisStore';
-import { useEntitlementStore } from '../src/store/useEntitlementStore';
-import { canUseLlmCoaching } from '../src/lib/entitlements';
-import { fetchChatReply, ChatMessage } from '../src/services/sessionChat';
+import { fetchChatReply, fetchChatHistory, ChatMessage } from '../src/services/sessionChat';
+import { useCoachContext } from '../src/hooks/useCoachContext';
 import { EntitlementRequiredError } from '../src/services/llmFeedback';
-import { Button } from '../src/components/ui/Button';
+import { track } from '../src/services/analytics';
+import { AnalyticsEvent } from '../src/constants/analyticsEvents';
+import { errorReason } from '../src/lib/analyticsUserProps';
+import { MarkdownText } from '../src/components/ui/MarkdownText';
 import { colors, spacing, radius } from '../src/constants/theme';
 
-type Bubble = ChatMessage & { id: string; upsell?: boolean };
+type Bubble = ChatMessage & { id: string };
 
-const UPSELL_MESSAGE =
-  'Chat coaching is a Pro feature — upgrade to get tailored feedback from Claude based on your session history.';
+// Everyone in the app is a subscriber, so a 402 here means the server has not
+// caught up with the client yet — the RevenueCat webhook mirrors onto
+// profiles.entitlement asynchronously, and a just-purchased user can beat it.
+// Genuine lapses are handled by the subscribe gate, not by this screen.
+const ENTITLEMENT_LAG_MESSAGE =
+  "Your subscription is still syncing on our end. Give it a moment and try again.";
 
 function greeting(sessionCount: number): string {
   if (sessionCount === 0) {
@@ -35,16 +41,18 @@ function greeting(sessionCount: number): string {
 
 export default function ChatScreen() {
   const sessionHistory = useAnalysisStore((s) => s.sessionHistory);
-  const entitlement = useEntitlementStore((s) => s.entitlement);
-  const isPro = canUseLlmCoaching(entitlement);
+  const coachContext = useCoachContext();
 
   const [messages, setMessages] = useState<Bubble[]>(() => [
     { id: 'greeting', role: 'assistant', content: greeting(sessionHistory.length) },
-    ...(isPro ? [] : [{ id: 'upsell', role: 'assistant' as const, content: UPSELL_MESSAGE, upsell: true }]),
   ]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const scrollRef = useRef<ScrollView>(null);
+
+  useEffect(() => {
+    track(AnalyticsEvent.CHAT_OPENED, { session_count: sessionHistory.length });
+  }, []);
 
   const send = async () => {
     const text = input.trim();
@@ -55,20 +63,24 @@ export default function ChatScreen() {
     setMessages(nextMessages);
     setInput('');
     setSending(true);
+    track(AnalyticsEvent.CHAT_MESSAGE_SENT, {
+      turn_index: nextMessages.filter((m) => m.role === 'user').length,
+    });
 
     try {
       const reply = await fetchChatReply(
         nextMessages.map(({ role, content }) => ({ role, content })),
-        sessionHistory,
+        coachContext,
       );
       setMessages((prev) => [...prev, { id: `a-${Date.now()}`, role: 'assistant', content: reply }]);
     } catch (err) {
       if (err instanceof EntitlementRequiredError) {
         setMessages((prev) => [
           ...prev,
-          { id: `upsell-${Date.now()}`, role: 'assistant', content: UPSELL_MESSAGE, upsell: true },
+          { id: `lag-${Date.now()}`, role: 'assistant', content: ENTITLEMENT_LAG_MESSAGE },
         ]);
       } else {
+        track(AnalyticsEvent.APP_ERROR, { domain: 'chat', reason: errorReason(err) });
         setMessages((prev) => [
           ...prev,
           { id: `err-${Date.now()}`, role: 'assistant', content: "Something went wrong reaching your coach. Give it another try." },
@@ -105,14 +117,12 @@ export default function ChatScreen() {
               style={[s.bubbleRow, m.role === 'user' ? s.bubbleRowUser : s.bubbleRowAssistant]}
             >
               <View style={[s.bubble, m.role === 'user' ? s.bubbleUser : s.bubbleAssistant]}>
-                <Text style={[s.bubbleText, m.role === 'user' && s.bubbleTextUser]}>{m.content}</Text>
-                {m.upsell && (
-                  <Button
-                    label="Upgrade to Pro"
-                    size="sm"
-                    onPress={() => router.push('/paywall')}
-                    fullWidth
-                  />
+                {/* Only the coach writes Markdown; the user's own text is
+                    rendered verbatim so typed asterisks stay as typed. */}
+                {m.role === 'user' ? (
+                  <Text style={[s.bubbleText, s.bubbleTextUser]}>{m.content}</Text>
+                ) : (
+                  <MarkdownText style={s.bubbleText}>{m.content}</MarkdownText>
                 )}
               </View>
             </View>
@@ -127,28 +137,22 @@ export default function ChatScreen() {
         </ScrollView>
 
         <View style={s.inputRow}>
-          {isPro ? (
-            <>
-              <TextInput
-                style={s.input}
-                value={input}
-                onChangeText={setInput}
-                placeholder="Ask about your practice…"
-                placeholderTextColor={colors.text.muted}
-                multiline
-                editable={!sending}
-              />
-              <Pressable
-                style={[s.sendBtn, (!input.trim() || sending) && s.sendBtnDisabled]}
-                onPress={send}
-                disabled={!input.trim() || sending}
-              >
-                <Ionicons name="arrow-up" size={20} color="#fff" />
-              </Pressable>
-            </>
-          ) : (
-            <Button label="Upgrade to Pro" fullWidth onPress={() => router.push('/paywall')} />
-          )}
+          <TextInput
+            style={s.input}
+            value={input}
+            onChangeText={setInput}
+            placeholder="Ask about your practice…"
+            placeholderTextColor={colors.text.muted}
+            multiline
+            editable={!sending}
+          />
+          <Pressable
+            style={[s.sendBtn, (!input.trim() || sending) && s.sendBtnDisabled]}
+            onPress={send}
+            disabled={!input.trim() || sending}
+          >
+            <Ionicons name="arrow-up" size={20} color="#fff" />
+          </Pressable>
         </View>
       </KeyboardAvoidingView>
     </SafeAreaView>

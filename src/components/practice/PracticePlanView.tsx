@@ -1,5 +1,5 @@
-import React, { useMemo } from 'react';
-import { View, Text, StyleSheet, ScrollView, SafeAreaView } from 'react-native';
+import React, { useEffect, useMemo, useRef } from 'react';
+import { View, Text, StyleSheet, ScrollView, SafeAreaView, Pressable } from 'react-native';
 import { router } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -13,6 +13,14 @@ import {
 import { PracticeNode, type NodeState } from './PracticeNode';
 import { CoachBubble } from './CoachBubble';
 import { DepthButton } from './DepthButton';
+import { useActivationStore } from '../../store/useActivationStore';
+import { useSpotlightTarget } from '../activation/useSpotlightTarget';
+import { useCoachmarks } from '../activation/useCoachmarks';
+import { SpotlightOverlay } from '../activation/SpotlightOverlay';
+import { PRACTICE_COACHMARKS } from '../../constants/activationScript';
+import { AnalyticsEvent } from '../../constants/analyticsEvents';
+import { track } from '../../services/analytics';
+import { qaCheckpoint } from '../../services/crashReporting';
 import { colors, spacing, radius } from '../../constants/theme';
 
 /**
@@ -50,6 +58,34 @@ export function PracticePlanView({
   const allDone = doneCount >= total && total > 0;
   const progressPct = total > 0 ? doneCount / total : 0;
 
+  useEffect(() => {
+    track(AnalyticsEvent.PRACTICE_PLAN_VIEW, {
+      scope: scope.kind,
+      block_count: total,
+      duration_min: plan.durationMinutes,
+      blocks_done: doneCount,
+    });
+    // Deliberately keyed on the plan, not on progress: re-rendering after each
+    // completed block would inflate this into a per-block counter.
+  }, [plan.id]);
+
+  // Leaving a partly-finished plan. Opening a block pushes on top of this screen
+  // rather than replacing it, so an unmount here means they actually left the
+  // practice area — the counterpart to practice_plan_complete.
+  const progressRef = useRef({ done: doneCount, total, allDone });
+  progressRef.current = { done: doneCount, total, allDone };
+  useEffect(() => {
+    return () => {
+      const { done, total: t, allDone: finished } = progressRef.current;
+      if (finished || done === 0) return;
+      track(AnalyticsEvent.PRACTICE_PLAN_ABANDONED, {
+        scope: scope.kind,
+        blocks_done: done,
+        blocks_total: t,
+      });
+    };
+  }, [plan.id]);
+
   const openBlock = (id: string) =>
     router.push({ pathname: '/practice/[id]', params: { id, ...scopeParams } });
 
@@ -59,8 +95,33 @@ export function PracticePlanView({
       return;
     }
     const target = next ?? plan.blocks[0];
-    if (target) openBlock(target.id);
+    if (target) {
+      track(AnalyticsEvent.PRACTICE_BLOCK_START, {
+        scope: scope.kind,
+        block_id: target.id,
+        block_type: target.type,
+        index: plan.blocks.findIndex((b) => b.id === target.id),
+      });
+      qaCheckpoint('practice_block_start'); // TEMPORARY — QA walkthrough checkpoint
+      openBlock(target.id);
+    }
   };
+
+  // Activation stage 5, and where the flow ends. The coachmarks run once, on
+  // whichever plan the walkthrough lands on — the session plan after a real
+  // recording, or the daily warm-up after the sample analysis.
+  const activationStep = useActivationStore((st) => st.step);
+  const inActivation = activationStep === 'practice';
+  const pathSpotlight = useSpotlightTarget('practice.path');
+  const startSpotlight = useSpotlightTarget('practice.start');
+
+  const coach = useCoachmarks(PRACTICE_COACHMARKS, inActivation, () => {
+    // They have now seen the entire loop, so activation is over and
+    // SubscribeGate takes it from here. The review prompt used to fire in
+    // between; it now waits until the trial has actually started, so a user
+    // who never subscribes is never asked to endorse the app.
+    useActivationStore.getState().complete();
+  });
 
   return (
     <View style={s.root}>
@@ -97,7 +158,7 @@ export function PracticePlanView({
               </View>
             )}
 
-            <View style={s.path}>
+            <View style={s.path} {...pathSpotlight}>
               {plan.blocks.map((block, i) => {
                 const state: NodeState = completedIds.includes(block.id)
                   ? 'done'
@@ -127,12 +188,33 @@ export function PracticePlanView({
         </ScrollView>
 
         <View style={[s.bottomBar, { paddingBottom: Math.max(insets.bottom, spacing.sm) }]}>
-          <DepthButton
-            label={allDone ? 'See summary' : doneCount > 0 ? 'Continue' : 'Start'}
-            icon={allDone ? 'trophy' : 'arrow-forward'}
-            onPress={startNext}
-          />
+          <View style={s.bottomBarRow}>
+            {scope.kind !== 'daily' && (
+              <Pressable
+                style={s.backBtn}
+                onPress={() => (router.canGoBack() ? router.back() : router.replace('/(tabs)/home'))}
+                hitSlop={8}
+              >
+                <Ionicons name="chevron-back" size={22} color={colors.text.secondary} />
+              </Pressable>
+            )}
+            <View style={{ flex: 1 }} {...startSpotlight}>
+              <DepthButton
+                label={allDone ? 'See summary' : doneCount > 0 ? 'Continue' : 'Start'}
+                icon={allDone ? 'trophy' : 'arrow-forward'}
+                onPress={startNext}
+              />
+            </View>
+          </View>
         </View>
+
+        <SpotlightOverlay
+          steps={PRACTICE_COACHMARKS}
+          index={coach.index}
+          onNext={coach.next}
+          onSkip={coach.skip}
+          blocking={inActivation}
+        />
       </SafeAreaView>
     </View>
   );
@@ -201,5 +283,14 @@ const s = StyleSheet.create({
     backgroundColor: colors.background,
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: '#e5e7eb',
+  },
+  bottomBarRow: { flexDirection: 'row', gap: spacing.sm },
+  backBtn: {
+    width: 58,
+    height: 58,
+    borderRadius: radius.lg,
+    backgroundColor: '#eef2f7',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
 });

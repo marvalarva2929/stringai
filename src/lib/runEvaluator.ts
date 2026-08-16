@@ -13,7 +13,9 @@ import { evaluateDynamicsShape } from './dynamicsEvaluator';
 import { evaluateHold, type HoldAttempt } from './holdEvaluator';
 import { evaluateScale, type ScaleAttempt } from './scaleEvaluator';
 import { evaluateRhythm, type RhythmAttempt } from './rhythmEvaluator';
-import { scaleNoteSequence } from './scaleSequence';
+import { evaluateTrill, type TrillAttempt } from './trillEvaluator';
+import { evaluateAttack, type NoteEnvelope } from './attackEvaluator';
+import { expectedNotesFor } from './sequenceSteps';
 import { useCalibrationStore } from '../store/useCalibrationStore';
 import type { EvaluatorParams } from './practiceBlocks';
 import type { RawBowFrame } from '../types/signals';
@@ -35,18 +37,6 @@ const ATTEMPT_GAP_S = 0.15;
 // ~100ms of voiced audio minimum before a segment counts as a real attempt,
 // filtering out brief noise blips that briefly cross the YIN pitch threshold.
 const MIN_ATTEMPT_FRAMES = 4;
-
-// The metronome's click is a synthesized pure tone (see useMetronome.ts's
-// buildClickWav) played right at each beat — exactly where a well-timed note
-// is also expected to land. If it bleeds acoustically into the mic (room
-// reverb, a phone speaker close to the mic), YIN can lock onto it as a
-// "voiced" pitch and it gets misread as the player's attack. Both click-paced
-// evaluators (scale, rhythm) filter it out by its known frequency.
-const CLICK_HZ = 1000;
-const CLICK_EXCLUDE_CENTS = 35;
-function isClickPitch(freqHz: number): boolean {
-  return Math.abs(1200 * Math.log2(freqHz / CLICK_HZ)) <= CLICK_EXCLUDE_CENTS;
-}
 
 // Splits detected pitch frames into voiced runs, one per note attempt/hold —
 // separated by a >150ms silence gap (the player stopping the bow).
@@ -108,16 +98,119 @@ function holdAttemptsFromSamples(samples: Float32Array, sampleRate: number, cent
     });
 }
 
-// Nulls out any frame pitched at the metronome click's own frequency, so it
-// can't be picked up as a voiced note by callers that segment on frequency !== null.
-function withoutClickFrames(frames: PitchFrame[]): PitchFrame[] {
-  return frames.map((f) => (f.frequency !== null && isClickPitch(f.frequency) ? { ...f, frequency: null } : f));
+/**
+ * A trill moves too fast for the 150ms silence-gap segmentation used elsewhere
+ * — the notes never stop. Instead, each change of detected pitch is one
+ * alternation, which is what the trill evaluator actually measures.
+ */
+function trillAttemptFromSamples(samples: Float32Array, sampleRate: number): TrillAttempt | null {
+  const frames = detectPitches(samples, sampleRate)
+    .filter((f) => f.frequency !== null);
+  if (frames.length < MIN_ATTEMPT_FRAMES) return null;
+
+  // Group consecutive frames that sit on the same semitone. A trill's two notes
+  // are a semitone or a tone apart, so rounding to the nearest semitone is
+  // exactly the resolution needed and it ignores the pitch smear at speed.
+  const semitoneOf = (hz: number) => Math.round(69 + 12 * Math.log2(hz / 440));
+  const onsetTimes: number[] = [];
+  const medianFreqs: (number | null)[] = [];
+  let currentSemitone: number | null = null;
+  let group: number[] = [];
+
+  const flush = (startTime: number) => {
+    if (group.length === 0) return;
+    const sorted = [...group].sort((a, b) => a - b);
+    medianFreqs.push(sorted[Math.floor(sorted.length / 2)]);
+    onsetTimes.push(startTime);
+    group = [];
+  };
+
+  let groupStart = frames[0].timestamp;
+  for (const frame of frames) {
+    const semitone = semitoneOf(frame.frequency!);
+    if (currentSemitone !== null && semitone !== currentSemitone) {
+      flush(groupStart);
+      groupStart = frame.timestamp;
+    }
+    currentSemitone = semitone;
+    group.push(frame.frequency!);
+  }
+  flush(groupStart);
+
+  if (onsetTimes.length < 2) return null;
+  return {
+    onsetTimes,
+    medianFreqs,
+    startTimeSeconds: frames[0].timestamp,
+    endTimeSeconds: frames[frames.length - 1].timestamp,
+  };
+}
+
+/**
+ * Per-note amplitude envelopes for the stroke evaluator. Segmentation is by
+ * RMS, not pitch — spiccato notes are short and airy enough that pitch tracking
+ * drops them, and their silence is precisely the thing being measured.
+ */
+function envelopesFromSamples(samples: Float32Array, sampleRate: number): NoteEnvelope[] {
+  const hopSize = Math.max(1, Math.floor(sampleRate * 0.005)); // 5ms resolution
+  const rms: { t: number; v: number }[] = [];
+  for (let i = 0; i + hopSize <= samples.length; i += hopSize) {
+    let sum = 0;
+    for (let k = i; k < i + hopSize; k++) sum += samples[k] * samples[k];
+    rms.push({ t: i / sampleRate, v: Math.sqrt(sum / hopSize) });
+  }
+  if (rms.length === 0) return [];
+
+  const peak = Math.max(...rms.map((r) => r.v));
+  if (peak <= 0) return [];
+  // Relative gate: a note is sounding while it is above a fraction of the
+  // loudest thing in the take, so recording level doesn't change the verdict.
+  const gate = peak * 0.12;
+
+  const spans: { start: number; end: number; frames: { t: number; v: number }[] }[] = [];
+  let current: { t: number; v: number }[] = [];
+  for (const frame of rms) {
+    if (frame.v >= gate) {
+      current.push(frame);
+    } else if (current.length > 0) {
+      spans.push({ start: current[0].t, end: current[current.length - 1].t, frames: current });
+      current = [];
+    }
+  }
+  if (current.length > 0) {
+    spans.push({ start: current[0].t, end: current[current.length - 1].t, frames: current });
+  }
+
+  // Anything this short is a click or a scrape, not a note.
+  const notes = spans.filter((s) => s.end - s.start >= 0.03);
+
+  return notes.map((span, i) => {
+    let peakIndex = 0;
+    for (let k = 1; k < span.frames.length; k++) {
+      if (span.frames[k].v > span.frames[peakIndex].v) peakIndex = k;
+    }
+    const peakValue = span.frames[peakIndex].v;
+    // "Sustain" is the body after the attack; for a very short note the whole
+    // note is the body, which is the honest reading for spiccato.
+    const body = span.frames.slice(peakIndex + 1);
+    const sustain = body.length > 0
+      ? body.reduce((s, f) => s + f.v, 0) / body.length
+      : peakValue;
+    const next = notes[i + 1];
+    return {
+      startSeconds: span.start,
+      endSeconds: span.end,
+      attackSeconds: span.frames[peakIndex].t - span.start,
+      peakToSustain: sustain > 0 ? peakValue / sustain : 1,
+      gapAfterSeconds: next ? next.start - span.end : 0,
+    };
+  });
 }
 
 // Fallback when beat timestamps aren't available: one entry per silence-gap
 // segment, in order — median detected frequency per segment.
 function scaleAttemptsFromSamples(samples: Float32Array, sampleRate: number): ScaleAttempt[] {
-  const frames = withoutClickFrames(detectPitches(samples, sampleRate));
+  const frames = detectPitches(samples, sampleRate);
   return segmentVoicedRuns(frames)
     .filter((seg) => seg.length >= MIN_ATTEMPT_FRAMES)
     .map((seg) => {
@@ -136,7 +229,7 @@ function scaleAttemptsFromSamples(samples: Float32Array, sampleRate: number): Sc
 // read each beat's own window directly instead of inferring note boundaries
 // from silence gaps — robust to a player who doesn't fully stop between notes.
 function scaleAttemptsFromBeats(samples: Float32Array, sampleRate: number, beatTimestamps: number[]): ScaleAttempt[] {
-  const frames = withoutClickFrames(detectPitches(samples, sampleRate));
+  const frames = detectPitches(samples, sampleRate);
   const avgInterval = beatTimestamps.length > 1
     ? (beatTimestamps[beatTimestamps.length - 1] - beatTimestamps[0]) / (beatTimestamps.length - 1)
     : 1;
@@ -148,15 +241,20 @@ function scaleAttemptsFromBeats(samples: Float32Array, sampleRate: number, beatT
     const windowStart = beatT + interval * 0.15;
     const windowEnd = beatT + interval * 0.9;
     const windowFrames = frames.filter((f) => f.frequency !== null && f.timestamp >= windowStart && f.timestamp < windowEnd);
+    // Where the note actually started relative to its click, so the score can
+    // weigh timing. Taken from the first voiced frame in the wider beat window,
+    // since the trimmed analysis window above deliberately skips the attack.
+    const onsetFrame = frames.find((f) => f.frequency !== null && f.timestamp >= beatT && f.timestamp < nextT);
+    const offsetMs = onsetFrame ? (onsetFrame.timestamp - beatT) * 1000 : null;
     // Playback uses the full beat window (not the trimmed analysis window
     // above), so replaying a degree includes its attack instead of just the
     // steady-state slice that gets judged.
     const playback = { startTimeSeconds: beatT, endTimeSeconds: nextT };
 
-    if (windowFrames.length === 0) return { medianFreqHz: 0, confidence: 0, ...playback };
+    if (windowFrames.length === 0) return { medianFreqHz: 0, confidence: 0, offsetMs, ...playback };
     const freqs = windowFrames.map((f) => f.frequency!).sort((a, b) => a - b);
     const avgPeriodicity = windowFrames.reduce((sum, f) => sum + (f.periodicity ?? 0), 0) / windowFrames.length;
-    return { medianFreqHz: freqs[Math.floor(freqs.length / 2)], confidence: avgPeriodicity, ...playback };
+    return { medianFreqHz: freqs[Math.floor(freqs.length / 2)], confidence: avgPeriodicity, offsetMs, ...playback };
   });
 }
 
@@ -164,9 +262,11 @@ function scaleAttemptsFromBeats(samples: Float32Array, sampleRate: number, beatT
 // half a beat interval of that click, so a slightly early or late attack still
 // counts as an answer to that click rather than its neighbor's.
 function rhythmAttemptsFromBeats(samples: Float32Array, sampleRate: number, beatTimestamps: number[]): RhythmAttempt[] {
-  // Unlike scaleAttemptsFromBeats, this can't just skip the frames right at
-  // the beat (that's exactly where a well-timed note is supposed to land) —
-  // so the click is filtered by its known frequency instead, per-onset.
+  // Unlike scaleAttemptsFromBeats, this can't skip the frames right at the beat —
+  // that is exactly where a well-timed note is supposed to land. It doesn't need to:
+  // onsets here come from voiced pitch runs, and the click is an aperiodic noise tick
+  // that never produces a voiced frame (see lib/clickTone.ts), so it is absent from
+  // this segmentation by construction rather than filtered out afterwards.
   const frames = detectPitches(samples, sampleRate);
   const onsets = segmentVoicedRuns(frames)
     .filter((seg) => seg.length >= MIN_ATTEMPT_FRAMES)
@@ -177,10 +277,7 @@ function rhythmAttemptsFromBeats(samples: Float32Array, sampleRate: number, beat
         confidence: seg.reduce((sum, f) => sum + (f.periodicity ?? 0), 0) / seg.length,
         freqHz: freqs[Math.floor(freqs.length / 2)],
       };
-    })
-    // Drop the metronome's own click bleeding into the mic — left in, it
-    // would register as a perfectly-on-time "note" on every single beat.
-    .filter((onset) => !isClickPitch(onset.freqHz));
+    });
 
   const avgInterval = beatTimestamps.length > 1
     ? (beatTimestamps[beatTimestamps.length - 1] - beatTimestamps[0]) / (beatTimestamps.length - 1)
@@ -217,6 +314,7 @@ function vibratoAttemptsFromSamples(samples: Float32Array, sampleRate: number): 
     depthCents: note.depthCents,
     confidence: note.periodicityScore,
     durationSeconds: note.durationS,
+    detected: note.detected,
   }));
 }
 
@@ -263,16 +361,24 @@ export function runEvaluator(
       return evaluateDynamicsShape(take.samples, take.sampleRate, params.target);
     case 'hold':
       return evaluateHold(holdAttemptsFromSamples(take.samples, take.sampleRate, params.centsThreshold), params);
-    case 'scale': {
+    // Both paced drills grade the same way — attempt i against expected note i.
+    // The only difference is where the expected list came from, which is why
+    // sequenceSteps.ts owns that and neither case derives it itself.
+    case 'scale':
+    case 'sequence': {
       const attempts = take.beatTimestamps && take.beatTimestamps.length > 0
         ? scaleAttemptsFromBeats(take.samples, take.sampleRate, take.beatTimestamps)
         : scaleAttemptsFromSamples(take.samples, take.sampleRate);
-      return evaluateScale(attempts, scaleNoteSequence(params.scaleName, params.rootMidiNote), params);
+      return evaluateScale(attempts, expectedNotesFor(params), params);
     }
     case 'rhythm': {
       if (!take.beatTimestamps || take.beatTimestamps.length === 0) return NO_TAKE_EVALUATION;
       return evaluateRhythm(rhythmAttemptsFromBeats(take.samples, take.sampleRate, take.beatTimestamps), params);
     }
+    case 'trill':
+      return evaluateTrill(trillAttemptFromSamples(take.samples, take.sampleRate), params);
+    case 'attack':
+      return evaluateAttack(envelopesFromSamples(take.samples, take.sampleRate), params);
     default:
       return UNSUPPORTED_EVALUATION;
   }

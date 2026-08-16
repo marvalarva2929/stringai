@@ -23,7 +23,10 @@ export interface PostureThresholds {
   violinAngleMax: number;
 }
 
-export interface SkillWeights {
+// A type alias rather than an interface on purpose: only aliases get an
+// implicit index signature, which is what lets these be passed to the
+// Record<string, number> weight helpers in src/lib/scoring.ts without a cast.
+export type SkillWeights = {
   pitchAccuracy: number;
   toneQuality: number;
   bowSmoothness: number;
@@ -31,7 +34,7 @@ export interface SkillWeights {
   rhythmAccuracy: number;
   posture: number;
   vibrato: number;
-}
+};
 
 export interface InstrumentConfig {
   id: InstrumentId;

@@ -35,15 +35,42 @@ const NOTE_COMMIT_FRAMES = 3;
 const SILENCE_TIMEOUT_MS = 350;
 /** The needle runs at full rate on the UI thread; the numeric readout only needs ~12Hz to be legible. */
 const READOUT_INTERVAL_MS = 80;
+/** Fine tuners only give a few millimeters of screw travel — enough to nudge a string but not
+ * to recover from being way off. Past a quarter-tone, the peg is the only tool that can get there. */
+const FINE_TUNER_RANGE_CENTS = 50;
+/** Within this many cents of the target we call it in tune — matches the existing gauge threshold. */
+const IN_TUNE_CENTS = 5;
 
 const NOTE_NAMES = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
 
-const VIOLIN_STRINGS: { label: string; freq: number }[] = [
-  { label: 'G3', freq: 196.0 },
-  { label: 'D4', freq: 293.66 },
-  { label: 'A4', freq: 440.0 },
-  { label: 'E5', freq: 659.25 },
+interface ViolinString {
+  label: string;
+  freq: number;
+}
+
+const VIOLIN_STRINGS: ViolinString[] = [
+  { label: 'G', freq: 196.0 },
+  { label: 'D', freq: 293.66 },
+  { label: 'A', freq: 440.0 },
+  { label: 'E', freq: 659.25 },
 ];
+
+type TuningTool = 'in-tune' | 'fine' | 'peg';
+
+interface TuningGuidance {
+  tool: TuningTool;
+  direction: 'tighten' | 'loosen' | null;
+}
+
+/** Cents measured directly against the selected string's target frequency (not the nearest
+ * chromatic semitone) — this is what should drive peg-vs-fine-tuner advice, since a string that's
+ * badly out of tune can sit closer to a different note letter entirely. */
+function tuningGuidance(targetCents: number): TuningGuidance {
+  if (Math.abs(targetCents) <= IN_TUNE_CENTS) return { tool: 'in-tune', direction: null };
+  const direction = targetCents < 0 ? 'tighten' : 'loosen';
+  const tool = Math.abs(targetCents) <= FINE_TUNER_RANGE_CENTS ? 'fine' : 'peg';
+  return { tool, direction };
+}
 
 // ─────────────────────────────────────────────────────────────
 // Helpers
@@ -77,6 +104,8 @@ interface Display {
   note: NoteInfo;
   cents: number;
   hz: number;
+  /** Cents relative to the selected string's target frequency, if one is selected. */
+  targetCents: number | null;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -91,6 +120,14 @@ interface TunerModalProps {
 export function TunerModal({ visible, onClose }: TunerModalProps) {
   const [display, setDisplay] = useState<Display | null>(null);
   const [permissionDenied, setPermissionDenied] = useState(false);
+  const [selectedString, setSelectedString] = useState<ViolinString | null>(null);
+
+  /** Read from the hot path without forcing onReading to be redefined (and the mic listener
+   * resubscribed) every time the user taps a different string. */
+  const selectedStringRef = useRef<ViolinString | null>(null);
+  useEffect(() => {
+    selectedStringRef.current = selectedString;
+  }, [selectedString]);
 
   /** Live cents, consumed by CentsGauge on the UI thread. Never triggers a React render. */
   const centsSv = useSharedValue(0);
@@ -172,10 +209,12 @@ export function TunerModal({ visible, onClose }: TunerModalProps) {
     // Push to React on a note change immediately; otherwise throttle the readout.
     if (noteChanged || now - lastReadoutAt.current >= READOUT_INTERVAL_MS) {
       lastReadoutAt.current = now;
+      const target = selectedStringRef.current;
       setDisplay({
         note: midiToNote(committedMidi.current!),
         cents: Math.round(emaCents.current),
         hz,
+        targetCents: target ? 1200 * Math.log2(hz / target.freq) : null,
       });
     }
   }, [centsSv, resetSmoothing]);
@@ -290,6 +329,10 @@ export function TunerModal({ visible, onClose }: TunerModalProps) {
 
   const active = display !== null;
   const statusColor = active ? noteColor(display.cents) : colors.text.muted;
+  const guidance =
+    active && selectedString && display.targetCents !== null
+      ? tuningGuidance(display.targetCents)
+      : null;
 
   return (
     <Modal
@@ -321,6 +364,25 @@ export function TunerModal({ visible, onClose }: TunerModalProps) {
             </View>
           ) : (
             <>
+              {/* String selector — pick which string you're tuning first */}
+              <Text style={styles.sectionLabel}>Which string?</Text>
+              <View style={styles.stringsRow}>
+                {VIOLIN_STRINGS.map((s) => {
+                  const isSelected = selectedString?.label === s.label;
+                  return (
+                    <Pressable
+                      key={s.label}
+                      onPress={() => setSelectedString(s)}
+                      style={[styles.stringChip, isSelected && styles.stringChipActive]}
+                    >
+                      <Text style={[styles.stringLabel, isSelected && styles.stringLabelActive]}>
+                        {s.label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+
               {/* Note name */}
               <View style={styles.noteDisplay}>
                 {active ? (
@@ -331,7 +393,9 @@ export function TunerModal({ visible, onClose }: TunerModalProps) {
                     <Text style={styles.noteOctave}>{display.note.octave}</Text>
                   </>
                 ) : (
-                  <Text style={styles.noteListening}>Play a note…</Text>
+                  <Text style={styles.noteListening}>
+                    {selectedString ? `Play the ${selectedString.label} string…` : 'Play a note…'}
+                  </Text>
                 )}
               </View>
 
@@ -346,28 +410,39 @@ export function TunerModal({ visible, onClose }: TunerModalProps) {
                     : `${display.cents > 0 ? '+' : ''}${display.cents}¢`
                   : 'Listening…'}
               </Text>
+
+              {/* Peg vs. fine-tuner guidance, once a string is selected and a pitch is heard */}
+              {selectedString && (
+                <View
+                  style={[
+                    styles.guidanceBanner,
+                    guidance?.tool === 'in-tune' && styles.guidanceBannerInTune,
+                    guidance?.tool === 'peg' && styles.guidanceBannerPeg,
+                  ]}
+                >
+                  {!guidance ? (
+                    <Text style={styles.guidanceText}>
+                      Play the {selectedString.label} string to get advice.
+                    </Text>
+                  ) : guidance.tool === 'in-tune' ? (
+                    <Text style={styles.guidanceText}>✓ {selectedString.label} string is in tune</Text>
+                  ) : (
+                    <>
+                      <Text style={styles.guidanceText}>
+                        {guidance.tool === 'fine' ? 'Use the fine tuner' : 'Use the peg'} —{' '}
+                        {guidance.direction}
+                      </Text>
+                      {guidance.tool === 'peg' && (
+                        <Text style={styles.guidanceSubtext}>
+                          Get close with the peg, then finish with the fine tuner.
+                        </Text>
+                      )}
+                    </>
+                  )}
+                </View>
+              )}
             </>
           )}
-
-          {/* Violin strings reference */}
-          <View style={styles.stringsRow}>
-            {VIOLIN_STRINGS.map((s) => {
-              const isNearest =
-                display !== null &&
-                Math.abs(display.cents) <= 30 &&
-                Math.abs(display.hz - s.freq) < 40;
-              return (
-                <View
-                  key={s.label}
-                  style={[styles.stringChip, isNearest && styles.stringChipActive]}
-                >
-                  <Text style={[styles.stringLabel, isNearest && styles.stringLabelActive]}>
-                    {s.label}
-                  </Text>
-                </View>
-              );
-            })}
-          </View>
         </View>
       </View>
     </Modal>
@@ -433,12 +508,19 @@ const styles = StyleSheet.create({
   },
   permissionText: { fontSize: 14, color: '#92400e', textAlign: 'center', lineHeight: 20 },
 
+  sectionLabel: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: colors.text.muted,
+    textAlign: 'center',
+    marginBottom: spacing.sm,
+  },
   stringsRow: {
     flexDirection: 'row',
     justifyContent: 'center',
     gap: spacing.md,
     paddingHorizontal: spacing.lg,
-    marginTop: spacing.sm,
+    marginBottom: spacing.sm,
   },
   stringChip: {
     flex: 1,
@@ -450,4 +532,27 @@ const styles = StyleSheet.create({
   stringChipActive: { backgroundColor: colors.brand[100] },
   stringLabel: { fontSize: 15, fontWeight: '700', color: colors.text.secondary },
   stringLabelActive: { color: colors.brand[700] },
+
+  guidanceBanner: {
+    marginHorizontal: spacing.lg,
+    marginTop: spacing.xs,
+    padding: spacing.md,
+    borderRadius: radius.md,
+    backgroundColor: '#fef9c3',
+    alignItems: 'center',
+  },
+  guidanceBannerInTune: { backgroundColor: '#dcfce7' },
+  guidanceBannerPeg: { backgroundColor: '#fee2e2' },
+  guidanceText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: colors.text.primary,
+    textAlign: 'center',
+  },
+  guidanceSubtext: {
+    fontSize: 13,
+    color: colors.text.secondary,
+    textAlign: 'center',
+    marginTop: 4,
+  },
 });

@@ -27,16 +27,19 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { useAnalysisStore } from '../../src/store/useAnalysisStore';
 import { useAuthStore } from '../../src/store/useAuthStore';
 import { useUserStore } from '../../src/store/useUserStore';
+import { useActivationStore } from '../../src/store/useActivationStore';
+import { useSpotlightTarget } from '../../src/components/activation/useSpotlightTarget';
+import { useCoachmarks } from '../../src/components/activation/useCoachmarks';
+import { SpotlightOverlay } from '../../src/components/activation/SpotlightOverlay';
+import { PIECE_COACHMARKS, CAPTURE_COACHMARKS } from '../../src/constants/activationScript';
+import { loadDemoAnalysis } from '../../src/lib/activationDemo';
+import { DiagnosticTake } from '../../src/components/onboarding/DiagnosticTake';
+import { syncTrialRecap } from '../../src/services/trialRecapScheduler';
 import { TunerModal } from '../../src/components/tuner/TunerModal';
-import { runAudioAnalysis, mockVideoMetrics, computeOverallScore, saveSession, sessionToSummary, buildSessionFeedback, updateSessionLlmFeedback } from '../../src/services/analysis';
+import { runAudioAnalysis, mockVideoMetrics, computeOverallScore, activeScoreWeights, saveSession, sessionToSummary, sessionToMetricHistoryEntry, buildSessionFeedback, updateSessionLlmFeedback } from '../../src/services/analysis';
 import { runSessionPipeline } from '../../src/lib/sessionPipeline';
 import { useEntitlementStore } from '../../src/store/useEntitlementStore';
-import {
-  FREE_DAILY_ANALYSES,
-  analysesRemaining,
-  canRecordLive,
-  canUseLlmCoaching,
-} from '../../src/lib/entitlements';
+import { isPro } from '../../src/lib/entitlements';
 import { isSupabaseConfigured } from '../../src/services/supabase';
 import { buildCoachingInput, fetchCoachingFeedback } from '../../src/services/llmFeedback';
 import { computePracticePlan } from '../../src/lib/practicePlan';
@@ -59,8 +62,9 @@ import { haptic } from '../../src/lib/haptics';
 import { colors, spacing, radius } from '../../src/constants/theme';
 import { AnalysisResult, MetricScore } from '../../src/types/analysis';
 import { buildSessionAssessment } from '../../src/lib/sessionAssessment';
-import { buildSessionEvidence } from '../../src/lib/practiceEvidence';
+import { buildSessionEvidence, EVIDENCE_VERSION } from '../../src/lib/practiceEvidence';
 import { Piece } from '../../src/types/piece';
+import { TECHNIQUE_PIECE } from '../../src/constants/pieces';
 import { INSTRUMENTS } from '../../src/constants/instruments';
 import { PoseSkeleton, PoseJoint, PoseJoints, HandLandmarks, LEFT_HAND_COLOR, RIGHT_HAND_COLOR } from '../../src/components/analysis/PoseSkeleton';
 import { startRecording as poseStartRecording, stopRecording as poseStopRecording, getPoseCameraView, setHomeIndicatorHidden } from 'pose-camera';
@@ -74,6 +78,18 @@ import Svg, { Circle, Line, G, Rect, Path, Polygon, Text as SvgText } from 'reac
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useCalibrationStore } from '../../src/store/useCalibrationStore';
 import { CALIBRATION_ENABLED } from '../../src/constants/featureFlags';
+import { track } from '../../src/services/analytics';
+import { breadcrumb, reportError, qaCheckpoint } from '../../src/services/crashReporting';
+import { AnalyticsEvent } from '../../src/constants/analyticsEvents';
+import type {
+  AnalysisDegradedReason,
+  AnalysisFailureStage,
+  AnalysisSource,
+} from '../../src/constants/analyticsEvents';
+import { errorReason } from '../../src/lib/analyticsUserProps';
+import { createStopwatch } from '../../src/lib/analyticsTiming';
+import { buildMusicalEvidence } from '../../src/lib/musicalEvidence';
+import { startTrace } from '../../src/services/performance';
 
 // Confidence floor for the debug metrics panel. The live coaching thresholds
 // moved to src/lib/liveCoach.ts, which reads poseScoring's THRESHOLDS so the
@@ -539,7 +555,6 @@ function MethodButton({
   iconColor,
   title,
   subtitle,
-  locked = false,
 }: {
   onPress: () => void;
   iconName: React.ComponentProps<typeof Ionicons>['name'];
@@ -547,8 +562,6 @@ function MethodButton({
   iconColor: string;
   title: string;
   subtitle: string;
-  /** Shows a Pro pill instead of the chevron. Still pressable — it opens the paywall. */
-  locked?: boolean;
 }) {
   const offset = useSharedValue(0);
   const surfaceStyle = useAnimatedStyle(() => ({
@@ -570,14 +583,7 @@ function MethodButton({
           <Text style={styles.methodBtnTitle}>{title}</Text>
           <Text style={styles.methodBtnSub}>{subtitle}</Text>
         </View>
-        {locked ? (
-          <View style={styles.methodProPill}>
-            <Ionicons name="lock-closed" size={11} color="#fff" />
-            <Text style={styles.methodProPillText}>PRO</Text>
-          </View>
-        ) : (
-          <Ionicons name="chevron-forward" size={18} color={colors.text.muted} />
-        )}
+        <Ionicons name="chevron-forward" size={18} color={colors.text.muted} />
       </RAnimated.View>
     </Pressable>
   );
@@ -592,11 +598,80 @@ export default function AnalyzeScreen() {
   } = useAnalysisStore();
   const { profile } = useUserStore();
   const { isAuthenticated, playerCategory, weeklyGoalMinutes } = useAuthStore();
-  const { entitlement, tryConsumeAnalysis } = useEntitlementStore();
+  const { entitlement } = useEntitlementStore();
   const setCalibration = useCalibrationStore((s) => s.setCalibration);
 
-  const liveRecordingUnlocked = canRecordLive(entitlement);
-  const remainingToday = analysesRemaining(entitlement);
+  // Top of the capture funnel — every later step (piece, method, recording,
+  // analysis) is measured against this denominator.
+  useEffect(() => {
+    track(AnalyticsEvent.ANALYSIS_FLOW_START, {
+      in_activation: inCaptureStage,
+      session_count: sessionHistory.length,
+    });
+    // Mount only: re-firing on activation changes would double-count.
+  }, []);
+
+  // ── Activation (first run) ───────────────────────────────────
+  const activationStep = useActivationStore((st) => st.step);
+  const inCaptureStage = activationStep === 'capture';
+
+  const pieceSpotlight = useSpotlightTarget('piece.search');
+  // One target per option — highlighting both buttons at once explained neither.
+  const recordMethodSpotlight = useSpotlightTarget('capture.record');
+  const uploadMethodSpotlight = useSpotlightTarget('capture.upload');
+
+  // The walkthrough drives this screen rather than waiting on the user. Asking a
+  // brand-new player to name a piece and record a take before they have seen a
+  // single result is where the flow used to strand them — so each run of
+  // coachmarks moves the screen on by itself.
+  const pieceCoach = useCoachmarks(
+    PIECE_COACHMARKS,
+    inCaptureStage && phase === 'piece_input',
+    () => setPhase('method_select'),
+  );
+
+  const captureCoach = useCoachmarks(
+    CAPTURE_COACHMARKS,
+    inCaptureStage && phase === 'method_select',
+    () => {
+      // Both capture buttons have been explained; now they actually play. This
+      // used to jump straight to the hand-authored sample instead, which meant
+      // nobody ever heard their own playing analysed before being asked to pay
+      // — the one thing a screenshot of the app can't reproduce.
+      //
+      // The piece is set here rather than at hand-off because processMedia
+      // closes over `selectedPiece`; setting it in the same tick as the call
+      // would leave the closure reading the previous value. A scale isn't a
+      // piece, but it still needs a home in history — the same bucket the
+      // "not a piece" path uses.
+      setSelectedPiece(TECHNIQUE_PIECE);
+      setDiagnosticOpen(true);
+    },
+  );
+
+  /** The first-run scale take. Owns the capture stage until it produces a result. */
+  const [diagnosticOpen, setDiagnosticOpen] = useState(false);
+
+  const useSampleInstead = () => {
+    setDiagnosticOpen(false);
+    const activation = useActivationStore.getState();
+    activation.markDemo();
+    activation.advanceTo('carousel');
+    loadDemoAnalysis();
+  };
+
+  /** True wherever activation owns this screen — keeps the scrim up between steps. */
+  const captureBlocking =
+    inCaptureStage && (phase === 'piece_input' || phase === 'method_select');
+
+  // A real analysis landing during activation (rather than the sample) also
+  // hands over to the carousel walkthrough — covers the live-record and upload
+  // paths if a user reaches them mid-flow.
+  useEffect(() => {
+    if (inCaptureStage && phase === 'done' && currentResult) {
+      useActivationStore.getState().advanceTo('carousel');
+    }
+  }, [inCaptureStage, phase, currentResult]);
 
   // Video seek state (for inline player in results)
   const [seekVersion, setSeekVersion] = useState(0);
@@ -643,6 +718,11 @@ export default function AnalyzeScreen() {
 
   // Step 1 form state
   const [songName, setSongName] = useState('');
+  // Optional, and deliberately secondary to the title: they are what let the
+  // coach draw on real knowledge of the repertoire rather than guessing from a
+  // bare string. Empty is fine — the coach falls back to the title alone.
+  const [composerName, setComposerName] = useState('');
+  const [movementName, setMovementName] = useState('');
   const [sheetMusicUri, setSheetMusicUri] = useState<string | null>(null);
   const [sheetMusicName, setSheetMusicName] = useState<string | null>(null);
 
@@ -746,7 +826,13 @@ export default function AnalyzeScreen() {
 
   // Hide the tab bar during recording, calibration, and results so it doesn't overlap the camera/results UI.
   useEffect(() => {
-    const hide = phase === 'calibrating' || phase === 'recording' || phase === 'done';
+    const hide =
+      phase === 'calibrating' ||
+      phase === 'recording' ||
+      phase === 'processing_audio' ||
+      phase === 'processing_video' ||
+      phase === 'uploading' ||
+      phase === 'done';
     navigation.setOptions({
       tabBarStyle: hide
         ? { display: 'none' }
@@ -880,19 +966,35 @@ export default function AnalyzeScreen() {
     return {
       id: `manual-${slug}`,
       title: songName.trim(),
+      // Composer and movement are what let the coach bring real repertoire
+      // knowledge — "in the Bach A minor first movement this phrase is a
+      // sequence" — instead of guessing from a bare title.
+      composer: composerName.trim() || undefined,
+      movement: movementName.trim() || undefined,
       source: 'manual',
       pdfUri: sheetMusicUri ?? undefined,
     };
   };
 
   const handleNext = () => {
-    setSelectedPiece(buildPiece());
+    const piece = buildPiece();
+    // Guarded by the disabled Next button, but a stray call must not slip an
+    // unnamed session through — per-piece progress depends on every take
+    // belonging to something.
+    if (!piece) return;
+    track(AnalyticsEvent.PIECE_SELECTED, {
+      has_piece: true,
+      has_sheet_music: !!sheetMusicUri,
+    });
+    setSelectedPiece(piece);
     setPhase('method_select');
   };
 
-  const handleSkip = () => {
-    setSelectedPiece(null);
-    setPhase('method_select');
+  /** Scales and open-string work aren't a piece, but they still need a home. */
+  const handleTechniqueSession = () => {
+    haptic.light();
+    track(AnalyticsEvent.PIECE_SELECTED, { has_piece: true, has_sheet_music: false });
+    continueWithPiece(TECHNIQUE_PIECE);
   };
 
   // ── Step 2: Method select ──────────────────────────────────
@@ -954,10 +1056,12 @@ export default function AnalyzeScreen() {
   const startRecording = async () => {
     if (!cameraPermission?.granted) {
       const { granted } = await requestCameraPermission();
+      track(AnalyticsEvent.PERMISSION_RESULT, { permission: 'camera', granted, context: 'record' });
       if (!granted) { Alert.alert('Camera Permission', 'Camera access is needed to record video.'); return; }
     }
     if (!micPermission?.granted) {
       const { granted } = await requestMicPermission();
+      track(AnalyticsEvent.PERMISSION_RESULT, { permission: 'microphone', granted, context: 'record' });
       if (!granted) { Alert.alert('Microphone Permission', 'Microphone access is needed to record audio.'); return; }
     }
     recordingStartedRef.current  = false;
@@ -975,6 +1079,10 @@ export default function AnalyzeScreen() {
     setLiveBoxes(null);
     recordingStartTimeRef.current = 0;
     haptic.medium();
+    track(AnalyticsEvent.RECORDING_STARTED, {
+      engine: usingPoseCamera ? 'pose_camera' : 'expo_camera',
+      has_metronome: metronomeSettings.enabled,
+    });
     setPhase('recording');
     if (cameraReadyRef.current) {
       await beginRecording();
@@ -983,9 +1091,14 @@ export default function AnalyzeScreen() {
     }
   };
 
+  // Whether the camera-tip CTA leads into calibration rather than straight to
+  // recording. The button label and the note under it both depend on it, so the
+  // player is never told "start recording" by a button that starts bow holds.
+  const willCalibrate = usingPoseCamera && CALIBRATION_ENABLED;
+
   const startCalibrationOrRecording = async () => {
     // Calibration is stubbed out (see CALIBRATION_ENABLED) — go straight to recording.
-    if (!usingPoseCamera || !CALIBRATION_ENABLED) {
+    if (!willCalibrate) {
       await startRecording();
       return;
     }
@@ -1015,11 +1128,21 @@ export default function AnalyzeScreen() {
     if (timerRef.current) clearInterval(timerRef.current);
     const { uri, error } = e.nativeEvent ?? e;
     if (error || !uri) {
+      track(AnalyticsEvent.RECORDING_FAILED, {
+        engine: 'pose_camera',
+        reason: errorReason(error ?? 'no_uri'),
+      });
       setError(error ?? 'Recording failed');
       return;
     }
+    track(AnalyticsEvent.RECORDING_STOPPED, {
+      engine: 'pose_camera',
+      duration_sec: elapsedRef.current,
+      pose_frames: poseFramesRef.current.length,
+      bow_frames: bowFramesRef.current.length,
+    });
     setRecordingUri(uri);
-    await processMedia(uri, elapsedRef.current, true, poseFramesRef.current);
+    await processMedia(uri, elapsedRef.current, true, 'record', poseFramesRef.current);
   }, []);
 
   const handleStopPoseRecording = useCallback(async () => {
@@ -1074,12 +1197,19 @@ export default function AnalyzeScreen() {
     try {
       const recorded = await cameraRef.current!.recordAsync({ maxDuration: 120 });
       if (timerRef.current) clearInterval(timerRef.current);
+      track(AnalyticsEvent.RECORDING_STOPPED, {
+        engine: 'expo_camera',
+        duration_sec: elapsedRef.current,
+        pose_frames: 0,
+        bow_frames: 0,
+      });
       setRecordingUri(recorded!.uri);
-      await processMedia(recorded!.uri, elapsedRef.current, true);
+      await processMedia(recorded!.uri, elapsedRef.current, true, 'record');
     } catch (err: any) {
       if (timerRef.current) clearInterval(timerRef.current);
       const msg: string = err?.message ?? '';
       if (!msg.toLowerCase().includes('stop') && !msg.toLowerCase().includes('abort') && !msg.toLowerCase().includes('cancel')) {
+        track(AnalyticsEvent.RECORDING_FAILED, { engine: 'expo_camera', reason: errorReason(msg) });
         setError(msg || 'Recording failed');
       }
     }
@@ -1091,28 +1221,62 @@ export default function AnalyzeScreen() {
 
   const uploadVideoFromLibrary = async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (status !== 'granted') { Alert.alert('Photos Permission', 'Photo library access is needed to upload a video.'); return; }
+    if (status !== 'granted') {
+      track(AnalyticsEvent.PERMISSION_RESULT, {
+        permission: 'photo_library',
+        granted: false,
+        context: 'upload',
+      });
+      Alert.alert('Photos Permission', 'Photo library access is needed to upload a video.');
+      return;
+    }
 
+    track(AnalyticsEvent.UPLOAD_PICKER_OPENED);
     const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: 'videos', allowsEditing: false, quality: 1 });
-    if (result.canceled || !result.assets?.[0]) return;
+    if (result.canceled || !result.assets?.[0]) {
+      // Backing out of the picker is a silent exit from the core funnel — it
+      // looks identical to never having tapped upload without this.
+      track(AnalyticsEvent.UPLOAD_PICKER_CANCELLED);
+      return;
+    }
 
     const asset = result.assets[0];
     const durationSec = asset.duration ? Math.round(asset.duration / 1000) : 60;
     setRecordingUri(asset.uri);
-    await processMedia(asset.uri, durationSec, true);
+    await processMedia(asset.uri, durationSec, true, 'upload');
   };
 
   // ── Core analysis pipeline ─────────────────────────────────
 
-  const processMedia = async (uri: string, durationSec: number, isVideo: boolean, poseFrames?: FrameKeypoints[]) => {
-    // The commit point for both capture paths. consume_analysis is the server's
-    // only writer and its answer is final — the method picker's earlier check is
-    // just UX, since another device may have spent the day's quota since then.
-    if (!(await tryConsumeAnalysis(isAuthenticated))) {
-      reset();
-      router.push('/paywall');
-      return;
-    }
+  const processMedia = async (
+    uri: string,
+    durationSec: number,
+    isVideo: boolean,
+    source: AnalysisSource,
+    poseFrames?: FrameKeypoints[],
+  ) => {
+    const watch = createStopwatch();
+    // Set when a run produces a result from mock data instead of real analysis.
+    // These paths are deliberately silent to the user, so without this the app
+    // cannot tell a good analysis from a fabricated one.
+    let degraded: AnalysisDegradedReason | undefined;
+
+    track(AnalyticsEvent.ANALYSIS_STARTED, {
+      source,
+      duration_sec: Math.round(durationSec),
+      instrument,
+      has_piece: !!selectedPiece,
+      is_pro: isPro(entitlement),
+    });
+    breadcrumb(`analysis started (${source}, ${Math.round(durationSec)}s)`);
+
+    // The processing screen promises "about 30 seconds" while its progress bar
+    // is a fixed timer animation, so the real distribution of pipeline durations
+    // is unknown. Performance Monitoring gives it a percentile breakdown that
+    // the ms_* event params can't, segmented by capture path and device.
+    const perfTrace = startTrace('analysis_pipeline');
+    perfTrace.attribute('source', source);
+    perfTrace.metric('duration_sec', Math.round(durationSec));
 
     let videoUri: string | undefined;
     if (isVideo) {
@@ -1121,6 +1285,8 @@ export default function AnalyzeScreen() {
       } catch {
         // Copy failed — fall back to original URI (valid for this session)
         videoUri = uri;
+        degraded = 'persist_failed';
+        track(AnalyticsEvent.ANALYSIS_DEGRADED, { reason: degraded, source });
       }
     }
     setPhase('processing_audio');
@@ -1132,6 +1298,16 @@ export default function AnalyzeScreen() {
         audioMetrics = audioOutput.metrics;
       } catch (err: any) {
         if (err?.message === 'VIDEO_UPLOADED') {
+          // A funnel exit with no error screen — the user just lands back at the
+          // start, so this is the only record that the run ever happened.
+          track(AnalyticsEvent.ANALYSIS_FAILED, {
+            stage: 'audio',
+            reason: 'no_audio_track',
+            source,
+            ms_elapsed: watch.elapsed(),
+          });
+          perfTrace.attribute('outcome', 'no_audio_track');
+          perfTrace.stop();
           Alert.alert(
             'No audio found',
             'Could not extract audio from this video. Make sure the video has a recorded audio track, or use the Record button to capture directly.',
@@ -1141,6 +1317,13 @@ export default function AnalyzeScreen() {
         }
         throw err;
       }
+      // runAudioAnalysis swallows NOT_WAV internally and returns mock metrics,
+      // so the flag on the output is the only way to know this run is fiction.
+      if (audioOutput?.usedMockMetrics) {
+        degraded = 'not_wav';
+        track(AnalyticsEvent.ANALYSIS_DEGRADED, { reason: degraded, source });
+      }
+      watch.split('audio');
 
       setPhase('processing_video');
       // Acquire pose + bow frames: the live path uses frames captured during
@@ -1173,6 +1356,7 @@ export default function AnalyzeScreen() {
             instrument,
             userCategory,
             calibration: useCalibrationStore.getState().calibration,
+            keyHint: selectedPiece?.keySignature,
           })
         : null;
 
@@ -1186,7 +1370,11 @@ export default function AnalyzeScreen() {
         // Android or Vision produced too few frames — placeholder scores.
         videoMetrics = await mockVideoMetrics();
         sessionAssessment = buildSessionAssessment(videoMetrics, userCategory);
+        // Same silent-substitution problem as the audio path above.
+        degraded = degraded ?? 'no_video_frames';
+        track(AnalyticsEvent.ANALYSIS_DEGRADED, { reason: 'no_video_frames', source });
       }
+      watch.split('video');
 
       // Derive intonation analysis from the same note events — single source of truth.
       // If fuseSignals produces no events, intonation is undefined so feedback never
@@ -1214,7 +1402,11 @@ export default function AnalyzeScreen() {
         return { startSeconds: best.startSeconds, endSeconds: best.endSeconds, note: best.noteName };
       };
 
-      const audioMetricsFinal = audioMetrics.map(m => {
+      // The pipeline completes dynamicControl — audioEngine can't detect phrase
+      // events because the L6 phrases don't exist when it runs.
+      const audioMetricsWithDynamics = pipeline?.audioMetrics ?? audioMetrics;
+
+      const audioMetricsFinal = audioMetricsWithDynamics.map(m => {
         if (noteEvents.length === 0) return m;
         if (m.key === 'pitchAccuracy') {
           const outOfTune = noteEvents
@@ -1230,10 +1422,8 @@ export default function AnalyzeScreen() {
 
       const skillLevel = profile?.skillLevel ?? 'beginner';
       const weights = instrumentConfig.skillWeights[skillLevel];
-      // Bow and posture scoring is hidden until reliable — exclude their keys from the overall score.
-      const HIDDEN_SCORE_KEYS = new Set(['bowSmoothness', 'bowPlacement', 'bowAngle', 'bowDistribution', 'posture', 'leftHandWrist', 'bowArmLevel']);
-      const activeWeights = Object.fromEntries(Object.entries(weights).filter(([k]) => !HIDDEN_SCORE_KEYS.has(k)));
-      const overallScore = computeOverallScore(audioMetricsFinal, videoMetrics, activeWeights as any);
+      const activeWeights = activeScoreWeights(weights);
+      const overallScore = computeOverallScore(audioMetricsFinal, videoMetrics, activeWeights);
 
       // Rolling delta: new score vs. average of the 3 most recent sessions
       const recentScores = sessionHistory.slice(0, 3).map((s) => s.overallScore);
@@ -1280,6 +1470,7 @@ export default function AnalyzeScreen() {
         noteEvents,
         patternFindings: pipeline?.findings,
         phraseFeatures: pipeline?.phraseFeatures,
+        musicalContext: pipeline?.musicalContext,
         sessionSignals: pipeline?.signals,
       };
 
@@ -1287,6 +1478,24 @@ export default function AnalyzeScreen() {
       // analyses, so every downstream surface reads the same issues instead of
       // re-deriving them independently.
       result.sessionEvidence = buildSessionEvidence(result);
+      // Stamped so a later analysis improvement knows this copy is stale rather
+      // than serving it forever. See EVIDENCE_VERSION.
+      result.evidenceVersion = EVIDENCE_VERSION;
+
+      // The timestamped musical picture — phrases and their shapes, tempo
+      // movement against the intended tempo, notable notes. Attached to the
+      // result so chat can discuss this session immediately, before the
+      // server-side musical_evidence write lands with the coaching upgrade.
+      const musicalEvidence = pipeline
+        ? buildMusicalEvidence({
+            phraseFeatures: pipeline.phraseFeatures,
+            noteEvents: pipeline.noteEvents,
+            musicalContext: pipeline.musicalContext,
+            rhythm: audioOutput?.rhythmAnalysis ?? null,
+            metronomeBpm: metronomeSettings.enabled ? metronomeSettings.bpm : undefined,
+          })
+        : undefined;
+      result.musicalEvidence = musicalEvidence;
 
       // Write wrist debug data to a file so it can be pulled via xcrun devicectl.
       // Dev-only — release builds shouldn't spend I/O on a debugging artifact.
@@ -1300,20 +1509,56 @@ export default function AnalyzeScreen() {
       }
 
       // Quota was already consumed at the top of processMedia.
+      let savedRemote = false;
       if (isAuthenticated && profile?.id && isSupabaseConfigured) {
-        await saveSession(result).catch(() => {});
+        // Previously a bare .catch(() => {}) — a failure here leaves the session
+        // on-device only, and nothing anywhere recorded that it happened.
+        savedRemote = await saveSession(result)
+          .then(() => true)
+          .catch((err) => {
+            track(AnalyticsEvent.SESSION_SAVE_FAILED, { reason: errorReason(err) });
+            reportError(err, 'analysis', { stage: 'save_session' });
+            return false;
+          });
       }
+      watch.split('save');
       addToHistory(sessionToSummary(result));
-      addToMetricHistory({ sessionId, recordedAt, scores: allMetrics, evidence: result.sessionEvidence, pieceId: result.piece?.id });
+      addToMetricHistory(sessionToMetricHistoryEntry(result));
+      // The pre-conversion recap quotes session count and score movement, so it
+      // is stale the moment a new session lands. Cheap to rewrite; no-op unless
+      // a trial is running.
+      void syncTrialRecap();
 
       // Set before the first render so the results screen shows a coaching
       // loading state immediately rather than flashing static→loading→real.
       const willFetchCoaching =
-        canUseLlmCoaching(entitlement) && isAuthenticated && !!profile?.id && isSupabaseConfigured && !!pipeline;
+        isAuthenticated && !!profile?.id && isSupabaseConfigured && !!pipeline;
       result.coachingPending = willFetchCoaching;
       cacheSessionResult(result);
 
       setResult(result);
+
+      const splits = watch.splits();
+      track(AnalyticsEvent.ANALYSIS_COMPLETED, {
+        source,
+        ms_total: watch.elapsed(),
+        ms_audio: splits.audio,
+        ms_video: splits.video,
+        ms_save: splits.save,
+        duration_sec: Math.round(durationSec),
+        overall_score: overallScore,
+        overall_delta: overallDelta,
+        note_count: noteEvents.length,
+        degraded: degraded ?? 'none',
+        will_fetch_coaching: willFetchCoaching,
+        saved_remote: savedRemote,
+      });
+      qaCheckpoint('analysis_completed'); // TEMPORARY — QA walkthrough checkpoint
+
+      perfTrace.attribute('outcome', 'completed');
+      perfTrace.attribute('degraded', degraded ?? 'none');
+      perfTrace.metric('note_count', noteEvents.length);
+      perfTrace.stop();
 
       // L10: upgrade the static feedback with Claude coaching. Non-blocking —
       // the UI shows a coaching-loading state (coachingPending, set above) until
@@ -1330,6 +1575,7 @@ export default function AnalyzeScreen() {
           pipeline.findings,
           pipeline.phraseFeatures,
           result.sessionEvidence,
+          musicalEvidence,
         );
         // The deterministic session-scoped plan doubles as the fallback for
         // grounding Claude's blocks (Phase 3.6) and its `id` is the planId the
@@ -1345,8 +1591,14 @@ export default function AnalyzeScreen() {
           scope: { kind: 'session', sessionId },
         });
         const fallbackBlocks = candidatesFromBlocks(sessionPlan.blocks);
+        const coachingWatch = createStopwatch();
+        track(AnalyticsEvent.COACHING_REQUESTED);
         fetchCoachingFeedback(coachingInput, result.sessionEvidence ?? [], fallbackBlocks)
           .then((claudeFeedback) => {
+            track(AnalyticsEvent.COACHING_SUCCEEDED, {
+              ms: coachingWatch.elapsed(),
+              block_count: claudeFeedback.curatedBlocks?.length ?? 0,
+            });
             if (claudeFeedback.curatedBlocks) {
               useCuratedPlanStore.getState().setCuratedBlocks(sessionPlan.id, claudeFeedback.curatedBlocks);
             }
@@ -1359,11 +1611,33 @@ export default function AnalyzeScreen() {
             // Only swap the visible result if the user is still on this session
             const { currentResult } = useAnalysisStore.getState();
             if (currentResult?.sessionId === result.sessionId) setResult(upgraded);
-            updateSessionLlmFeedback(result.sessionId, persistedFeedback).catch(() => {});
+            // The plan the student actually sees: deterministic titles from
+            // practiceBlocks.ts, with the LLM's rationale where curation
+            // survived grounding. Storing the LLM's own titles (as this used
+            // to) meant chat described drills that were never on screen.
+            const curatedById = new Map((curatedBlocks ?? []).flatMap((c) =>
+              c.issueIds.map((id) => [id, c.whyThisDrill] as const)));
+            const renderedPlan = sessionPlan.blocks.map((b) => ({
+              title: b.title,
+              minutes: b.estimatedMinutes,
+              whyThisDrill:
+                b.evidenceRefs.map((r) => curatedById.get(r.evidenceId)).find(Boolean) ?? b.reason,
+            }));
+            updateSessionLlmFeedback(
+              result.sessionId,
+              persistedFeedback,
+              renderedPlan,
+              musicalEvidence,
+            ).catch(() => {});
           })
-          .catch(() => {
+          .catch((err) => {
             // Network/timeout/malformed — keep the static template, just stop
             // showing the coaching-loading state so it doesn't spin forever.
+            // Silent to the user, so the reason only exists here.
+            track(AnalyticsEvent.COACHING_FAILED, {
+              ms: coachingWatch.elapsed(),
+              reason: errorReason(err),
+            });
             const cleared: AnalysisResult = { ...result, coachingPending: false };
             cacheSessionResult(cleared);
             const { currentResult } = useAnalysisStore.getState();
@@ -1371,11 +1645,51 @@ export default function AnalyzeScreen() {
           });
       }
     } catch (err: any) {
+      // The stage is inferred from which splits were recorded — the phase the
+      // run died in is what makes this actionable.
+      const done = watch.splits();
+      const stage: AnalysisFailureStage = !done.audio
+        ? 'audio'
+        : !done.video
+          ? 'video'
+          : !done.save
+            ? 'pipeline'
+            : 'assemble';
+      track(AnalyticsEvent.ANALYSIS_FAILED, {
+        stage,
+        reason: errorReason(err),
+        source,
+        ms_elapsed: watch.elapsed(),
+      });
+      reportError(err, 'analysis', { stage, source });
+      perfTrace.attribute('outcome', `failed_${stage}`);
+      perfTrace.stop();
       setError(err.message ?? 'Analysis failed');
     }
   };
 
   const formatElapsed = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`;
+
+  // ── First-run diagnostic ───────────────────────────────────
+  //
+  // Owns the screen outright while it runs. Checked ahead of every phase branch
+  // because it starts from method_select and hands over to processMedia, which
+  // drives the phase machine from processing_audio onward — once that begins,
+  // this is unmounted and the normal processing screen takes over.
+  if (diagnosticOpen) {
+    return (
+      <DiagnosticTake
+        onUseDemo={useSampleInstead}
+        onAnalyze={(uri, durationSeconds) => {
+          setDiagnosticOpen(false);
+          // Audio-only: no video to persist, no pose frames to score. The
+          // effect at the top of this file moves activation on to the carousel
+          // when the result lands, exactly as it does for a real recording.
+          void processMedia(uri, durationSeconds, false, 'diagnostic');
+        }}
+      />
+    );
+  }
 
   // ── Step 1: Piece input ────────────────────────────────────
   if (phase === 'piece_input') {
@@ -1391,8 +1705,8 @@ export default function AnalyzeScreen() {
     const sessionGroups: { title: string; composer?: string; sessions: typeof filteredSessions }[] = [];
     const titleMap = new Map<string, number>();
     for (const s of filteredSessions) {
-      const key = s.piece?.title ?? '';
-      const displayTitle = s.piece?.title ?? 'Untitled Session';
+      const key = s.piece?.title ?? TECHNIQUE_PIECE.title;
+      const displayTitle = key;
       if (titleMap.has(key)) {
         sessionGroups[titleMap.get(key)!].sessions.push(s);
       } else {
@@ -1419,7 +1733,7 @@ export default function AnalyzeScreen() {
                 <Text style={styles.setupTitle}>Start Practice{'\n'}Session</Text>
 
                 {/* Search box */}
-                <View style={styles.searchBox}>
+                <View style={styles.searchBox} {...pieceSpotlight}>
                   <Ionicons name="search" size={20} color={colors.text.muted} style={styles.searchIcon} />
                   <TextInput
                     style={styles.searchInput}
@@ -1437,6 +1751,33 @@ export default function AnalyzeScreen() {
                     </Pressable>
                   )}
                 </View>
+
+                {/* Shown once a title exists, so the empty state stays a single
+                    field and this never looks like a form to fill in. */}
+                {songName.trim().length > 0 && (
+                  <View style={styles.pieceDetailRow}>
+                    <TextInput
+                      style={styles.pieceDetailInput}
+                      placeholder="Composer (optional)"
+                      placeholderTextColor={colors.text.muted}
+                      value={composerName}
+                      onChangeText={setComposerName}
+                      autoCorrect={false}
+                      autoCapitalize="words"
+                      returnKeyType="next"
+                    />
+                    <TextInput
+                      style={styles.pieceDetailInput}
+                      placeholder="Movement (optional)"
+                      placeholderTextColor={colors.text.muted}
+                      value={movementName}
+                      onChangeText={setMovementName}
+                      autoCorrect={false}
+                      autoCapitalize="words"
+                      returnKeyType="done"
+                    />
+                  </View>
+                )}
 
                 {/* Sheet music */}
                 {sheetMusicUri ? (
@@ -1476,7 +1817,12 @@ export default function AnalyzeScreen() {
                               style={({ pressed }) => [styles.prevCard, pressed && { opacity: 0.85 }]}
                               onPress={() => {
                                 haptic.light();
-                                continueWithPiece(s.piece ? { ...s.piece, source: 'manual' as const } : null);
+                                // Sessions recorded before naming was required
+                                // have no piece; adopt the technique bucket so
+                                // continuing one still lands somewhere.
+                                continueWithPiece(
+                                  s.piece ? { ...s.piece, source: 'manual' as const } : TECHNIQUE_PIECE,
+                                );
                               }}
                             >
                               <View style={styles.prevCardText}>
@@ -1496,15 +1842,24 @@ export default function AnalyzeScreen() {
                 )}
               </ScrollView>
 
-              {/* Bottom: Next + Skip */}
+              {/* Bottom: Next (needs a name) + the one non-piece bucket */}
               <View style={styles.setupBottom}>
-                <BigButton label="Next →" onPress={handleNext} />
-                <Pressable style={styles.skipBtn} onPress={handleSkip}>
-                  <Text style={styles.skipLabel}>Skip — practice without naming</Text>
+                <BigButton label="Next →" onPress={handleNext} disabled={!songName.trim()} />
+                <Pressable style={styles.techniqueBtn} onPress={handleTechniqueSession}>
+                  <Ionicons name="barbell-outline" size={16} color={colors.text.secondary} />
+                  <Text style={styles.techniqueLabel}>Not a piece — scales and technique</Text>
                 </Pressable>
               </View>
             </View>
           </KeyboardAvoidingView>
+
+          <SpotlightOverlay
+            steps={PIECE_COACHMARKS}
+            index={pieceCoach.index}
+            onNext={pieceCoach.next}
+            onSkip={pieceCoach.skip}
+            blocking={captureBlocking}
+          />
         </SafeAreaView>
       </RAnimated.View>
     );
@@ -1558,25 +1913,20 @@ export default function AnalyzeScreen() {
 
             {/* Popout method buttons */}
             <View style={styles.methodCards}>
-              <MethodButton
-                onPress={() => {
-                  haptic.medium();
-                  // Shown locked rather than hidden — a visible Pro feature is
-                  // what the paywall is selling.
-                  if (!liveRecordingUnlocked) { router.push('/paywall'); return; }
-                  setPhase('camera_tip');
-                }}
-                iconName="videocam"
-                iconBg={colors.brand[50]}
-                iconColor={colors.brand[600]}
-                title="Record In-App"
-                subtitle={
-                  liveRecordingUnlocked
-                    ? 'Live camera with real-time feedback'
-                    : 'Live camera with real-time feedback — Pro'
-                }
-                locked={!liveRecordingUnlocked}
-              />
+              <View {...recordMethodSpotlight}>
+                <MethodButton
+                  onPress={() => {
+                    haptic.medium();
+                    track(AnalyticsEvent.CAPTURE_METHOD_SELECTED, { method: 'record' });
+                    setPhase('camera_tip');
+                  }}
+                  iconName="videocam"
+                  iconBg={colors.brand[50]}
+                  iconColor={colors.brand[600]}
+                  title="Record In-App"
+                  subtitle="Live camera with real-time feedback"
+                />
+              </View>
 
               <View style={styles.dividerRow}>
                 <View style={styles.dividerLine} />
@@ -1584,29 +1934,21 @@ export default function AnalyzeScreen() {
                 <View style={styles.dividerLine} />
               </View>
 
-              <MethodButton
-                onPress={() => {
-                  haptic.medium();
-                  // Cheap pre-check so a free user isn't sent to pick a video
-                  // only to be turned away. processMedia still consumes.
-                  if (remainingToday <= 0) { router.push('/paywall'); return; }
-                  setShowUploadTips(true);
-                }}
-                iconName="film"
-                iconBg="#fef9c3"
-                iconColor="#a16207"
-                title="Upload a Video"
-                subtitle="Pick a recording from your camera roll"
-              />
+              <View {...uploadMethodSpotlight}>
+                <MethodButton
+                  onPress={() => {
+                    haptic.medium();
+                    track(AnalyticsEvent.CAPTURE_METHOD_SELECTED, { method: 'upload' });
+                    setShowUploadTips(true);
+                  }}
+                  iconName="film"
+                  iconBg="#fef9c3"
+                  iconColor="#a16207"
+                  title="Upload a Video"
+                  subtitle="Pick a recording from your camera roll"
+                />
+              </View>
             </View>
-
-            {Number.isFinite(remainingToday) && (
-              <Text style={styles.methodQuotaHint}>
-                {remainingToday > 0
-                  ? `${remainingToday} of ${FREE_DAILY_ANALYSES} free analyses left today`
-                  : 'Daily limit reached — resets at midnight'}
-              </Text>
-            )}
 
             {/* Bottom actions */}
             <View style={styles.methodBottom}>
@@ -1619,6 +1961,14 @@ export default function AnalyzeScreen() {
               </Pressable>
             </View>
           </View>
+
+          <SpotlightOverlay
+            steps={CAPTURE_COACHMARKS}
+            index={captureCoach.index}
+            onNext={captureCoach.next}
+            onSkip={captureCoach.skip}
+            blocking={captureBlocking}
+          />
         </SafeAreaView>
       </RAnimated.View>
     );
@@ -1840,11 +2190,14 @@ export default function AnalyzeScreen() {
           <MetronomeSetup />
 
           <Button
-            label="Ready — Start Recording"
+            label={willCalibrate ? 'Next — Calibrate your bow' : 'Ready — Start Recording'}
             onPress={startCalibrationOrRecording}
             size="lg"
             fullWidth
           />
+          {willCalibrate && (
+            <Text style={styles.ctaNote}>Two quick bow positions first, then recording starts.</Text>
+          )}
 
           <Pressable style={styles.backBtn} onPress={() => setPhase('method_select')}>
             <Text style={styles.backLabel}>← Back</Text>
@@ -2104,7 +2457,16 @@ export default function AnalyzeScreen() {
           // Post-session loop: hand the student straight into exercises scoped to
           // the take they just recorded (Phase 3.5 / the submit→drill→resubmit flow).
           const sessionId = currentResult.sessionId;
+          const wasDemo = !!currentResult.isDemo;
           reset();
+          if (wasDemo) {
+            // The sample session isn't in sessionHistory (deliberately — see
+            // activationDemo.ts), so a session-scoped plan would come back
+            // empty. Send them to the free daily warm-up instead, whose
+            // cold-start copy already says exactly the right thing.
+            router.push('/(tabs)/train');
+            return;
+          }
           router.push({ pathname: '/practice/plan', params: { sessionId } });
         }}
         onHome={() => {
@@ -2163,6 +2525,16 @@ const styles = StyleSheet.create({
     gap: spacing.sm,
   },
   searchIcon: { flexShrink: 0 },
+  pieceDetailRow: { flexDirection: 'row', gap: spacing.sm, marginTop: spacing.sm },
+  pieceDetailInput: {
+    flex: 1,
+    backgroundColor: '#f3f4f6',
+    borderRadius: radius.lg,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 10,
+    fontSize: 14,
+    color: colors.text.primary,
+  },
   searchInput: {
     flex: 1,
     fontSize: 18,
@@ -2238,8 +2610,14 @@ const styles = StyleSheet.create({
   },
   sheetMusicFilename: { flex: 1, fontSize: 13, fontWeight: '600', color: '#166534' },
   sheetMusicRemove: { padding: 4 },
-  skipBtn: { alignItems: 'center', paddingVertical: spacing.sm },
-  skipLabel: { fontSize: 14, color: colors.text.muted, textDecorationLine: 'underline' },
+  techniqueBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.xs + 2,
+    paddingVertical: spacing.sm,
+  },
+  techniqueLabel: { fontSize: 14, fontWeight: '600', color: colors.text.secondary },
 
   // Step 2 — method select
   methodOuter: { flex: 1, paddingHorizontal: spacing.lg, paddingTop: spacing.xl, gap: spacing.lg },
@@ -2397,6 +2775,15 @@ const styles = StyleSheet.create({
   cameraTipRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   cameraTipDot: { width: 10, height: 10, borderRadius: 5, flexShrink: 0 },
   cameraTipRowText: { fontSize: 14, color: colors.text.secondary, flex: 1, lineHeight: 20 },
+  // Sets expectations for the calibration step that sits between this screen
+  // and the take, so the bow holds aren't a surprise.
+  ctaNote: {
+    fontSize: 13,
+    lineHeight: 18,
+    color: colors.text.muted,
+    textAlign: 'center',
+    marginTop: spacing.sm,
+  },
 
   // Large wrist angle + palm normal display
   wristAngleRow: {

@@ -33,23 +33,44 @@ user could not have signed in at all.
   rhythm, bowing, and posture, so metric detail screens are populated.
 - **One saved piece** — Bach A minor concerto, four sessions attached; the other
   two are unattached so the "General Practice" bucket is populated too.
-- Daily analysis counter reset to zero.
+## Where the reviewer signs in
 
-## ⚠️ Pro is only half-granted — finish this after RevenueCat exists
+**Account creation no longer happens during onboarding.** It moved to
+`AccountGate`, which runs *after* a purchase. So there is no signup or sign-in
+screen anywhere in the first run — the reviewer completes onboarding, walks the
+activation flow, and arrives at the paywall.
+
+The paywall carries an **"Already subscribed? Sign in"** link beneath *Restore
+purchases*, which opens `SignInSheet` — a native Modal, so it draws above the
+gate overlay rather than being pushed underneath it. **That link is the
+reviewer's only way in.** Signing in there fires `onAuthStateChange` →
+`identifyPurchaser` → the granted entitlement lands and the gate clears.
+
+Verify that link works on the release build before submitting. Without it the
+credentials below are unusable, because the paywall is the only screen a
+signed-out user can reach.
+
+## 🚫 BLOCKER — the reviewer cannot enter the app without this
+
+The app is **subscription-only**. `SubscribeGate` renders a mandatory paywall
+over the whole navigator once the activation flow ends: no ✕, no "Maybe Later",
+no way past it except purchasing, restoring, or signing in as an account that
+already holds the entitlement. A reviewer without an entitlement sees the
+paywall and nothing else, so this is no longer a "some features are locked"
+problem — it is a hard stop, and a guaranteed rejection.
 
 The account has `entitlement = 'pro'` in Supabase, which is what the **server**
-checks: `consume_analysis()` returns unlimited analyses for it. But that is not
-what the **app** checks.
+checks (`analyze-feedback` and `session-chat` gate on it). But that is not what
+the **app** checks.
 
 `useEntitlementStore` derives the tier solely from RevenueCat's `CustomerInfo`
 (`entitlementFromCustomerInfo`). Nothing on the client ever reads
-`profiles.entitlement` — that column exists so the server can enforce quota and
-so the RevenueCat webhook has somewhere to mirror state. So as things stand, a
-reviewer signing in today would get unlimited analyses but **still hit the
-paywall** on live recording and AI coaching.
+`profiles.entitlement` — that column exists so the server can enforce its own
+gate and so the RevenueCat webhook has somewhere to mirror state. So the seed
+alone leaves a reviewer stuck at the paywall.
 
-To actually unlock the client gates, once RevenueCat is set up (stage 3 of the
-launch checklist), grant the entitlement there:
+To let the reviewer in, once RevenueCat is set up (stage 3 of the launch
+checklist), grant the entitlement there:
 
 > RevenueCat dashboard → Customers → search App User ID
 > `178d7a08-6c39-4012-8ad1-d3a1f2802a9b` → **Grant entitlement** → `pro`,
@@ -61,8 +82,14 @@ The customer record only appears in RevenueCat after the account has signed in
 once from a build with a live RevenueCat key — so: configure RevenueCat, sign in
 on a device as this account, then grant.
 
-**Do not skip this.** A reviewer who hits a paywall on the features the listing
-advertises is the most likely single cause of rejection.
+**Do not skip this.** Verify it by signing in as the review account on a release
+build and confirming you reach the home tab rather than the paywall.
+
+The alternative — leaving the reviewer to make a real sandbox purchase — also
+works, but only if sandbox purchases are confirmed working end-to-end on that
+build first. If you go that route, say so explicitly in App Review Notes along
+with the plans and trial lengths (monthly / 7 days, annual / 14 days), since the
+reviewer will otherwise expect the credentials alone to be enough.
 
 ## Re-running / resetting
 

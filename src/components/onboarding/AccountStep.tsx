@@ -1,9 +1,12 @@
 import React, { useState } from 'react';
-import { View, Text, TextInput, Pressable, StyleSheet, Alert, ScrollView } from 'react-native';
+import { View, Text, TextInput, StyleSheet, Alert, ScrollView } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors, spacing } from '../../constants/theme';
 import { STEP_COPY } from '../../constants/onboardingContent';
 import { signUp } from '../../services/auth';
+import { track, trackSignUp } from '../../services/analytics';
+import { AnalyticsEvent } from '../../constants/analyticsEvents';
+import { errorReason } from '../../lib/analyticsUserProps';
 import { Button } from '../ui/Button';
 import { OAuthButtons } from '../auth/OAuthButtons';
 import { haptic } from '../../lib/haptics';
@@ -11,12 +14,24 @@ import { haptic } from '../../lib/haptics';
 interface AccountStepProps {
   /** Called once an authenticated session exists right after signup. */
   onCreated: (userId: string) => void;
-  /** Called for "Skip for now", and also after signup when email confirmation
-   *  is required (no session yet) — onboarding still completes either way. */
-  onSkip: () => void;
+  /**
+   * Signup succeeded but email confirmation is required, so there is no session
+   * yet. The user has already paid at this point, so they are let into the app
+   * and sign in from Settings once the mail arrives — see `accountDeferred` in
+   * useAuthStore. Holding them here would wall a paying customer behind a
+   * message that may never be delivered.
+   */
+  onConfirmationSent: () => void;
 }
 
-export function AccountStep({ onCreated, onSkip }: AccountStepProps) {
+// An account is required: the app is subscription-only and the server gates
+// coaching on profiles.entitlement, so a user with no profile row would end up
+// paying for a degraded app. There is deliberately no skip.
+//
+// Rendered by AccountGate, immediately after the purchase. It used to be the
+// last step of onboarding, where it sat between the user and everything the
+// app does; see AccountGate for why it moved.
+export function AccountStep({ onCreated, onConfirmationSent }: AccountStepProps) {
   const insets = useSafeAreaInsets();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -33,6 +48,7 @@ export function AccountStep({ onCreated, onSkip }: AccountStepProps) {
     setLoading(true);
     try {
       const data = await signUp(email.trim(), password);
+      trackSignUp('email');
       if (data.session && data.user) {
         onCreated(data.user.id);
       } else {
@@ -40,6 +56,11 @@ export function AccountStep({ onCreated, onSkip }: AccountStepProps) {
         setConfirmNote(true);
       }
     } catch (err: any) {
+      track(AnalyticsEvent.AUTH_FAILED, {
+        stage: 'sign_up',
+        method: 'email',
+        reason: errorReason(err),
+      });
       Alert.alert('Registration Failed', err.message ?? 'Something went wrong.');
     } finally {
       setLoading(false);
@@ -61,7 +82,7 @@ export function AccountStep({ onCreated, onSkip }: AccountStepProps) {
           <Text style={styles.confirmText}>
             Check your email to activate your account — you can sign in later from Settings.
           </Text>
-          <Button label="Continue" onPress={onSkip} fullWidth size="lg" />
+          <Button label="Continue" onPress={onConfirmationSent} fullWidth size="lg" />
         </View>
       ) : (
         <View style={styles.form}>
@@ -97,9 +118,6 @@ export function AccountStep({ onCreated, onSkip }: AccountStepProps) {
             fullWidth
             size="lg"
           />
-          <Pressable onPress={onSkip} style={styles.skipBtn}>
-            <Text style={styles.skipText}>{STEP_COPY.account.skip}</Text>
-          </Pressable>
         </View>
       )}
     </ScrollView>
@@ -137,8 +155,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#e5e7eb',
   },
-  skipBtn: { alignItems: 'center', marginTop: spacing.sm, padding: spacing.sm },
-  skipText: { color: colors.text.muted, fontSize: 14, fontWeight: '600' },
   confirmCard: { gap: spacing.md },
   confirmText: {
     fontSize: 14,

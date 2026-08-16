@@ -51,19 +51,18 @@ begin
   end if;
 
   -- ── Pro entitlement ──────────────────────────────────────────
-  -- entitlement is the real gate (src/lib/entitlements.ts); subscription_tier is
-  -- the legacy column settings.tsx still reads, so set both or the account looks
-  -- Pro in the app but Free on the settings screen.
+  -- entitlement is what the Edge Functions gate on. Note this only covers the
+  -- server half: the client derives its tier from RevenueCat, so the reviewer
+  -- also needs a promotional entitlement granted in the RevenueCat dashboard —
+  -- without it they cannot get past the mandatory paywall. See
+  -- store-assets/app-review-account.md.
   update public.profiles
      set entitlement            = 'pro',
          entitlement_expires_at = now() + interval '10 years',
-         subscription_tier      = 'annual',
          trial_ends_at          = null,
          display_name           = 'App Review',
          skill_level            = 'intermediate',
-         instrument             = 'violin',
-         analyses_used_today    = 0,
-         analyses_count_date    = current_date
+         instrument             = 'violin'
    where id = v_uid;
 
   -- ── A piece to hang the history on ───────────────────────────
@@ -110,7 +109,6 @@ end $$;
 -- ── Verify ───────────────────────────────────────────────────
 select p.email,
        p.entitlement,
-       p.subscription_tier,
        p.entitlement_expires_at,
        (select count(*) from public.sessions s where s.user_id = p.id) as sessions
   from public.profiles p

@@ -6,6 +6,8 @@ import { ScoreGauge } from '../ui/ScoreGauge';
 import { colors, spacing } from '../../constants/theme';
 import { MetricScore } from '../../types/analysis';
 import { METRIC_META } from '../../constants/metricMeta';
+import { AnalyticsEvent } from '../../constants/analyticsEvents';
+import { track } from '../../services/analytics';
 
 interface MetricCardProps {
   metric: MetricScore;
@@ -89,10 +91,16 @@ export function MetricCard({ metric, sessionId }: MetricCardProps) {
             {!unavailable && (
             <Pressable
               style={styles.detailLink}
-              onPress={() => router.push({
-                pathname: '/metric/[key]',
-                params: { key: metric.key, ...(sessionId ? { sessionId } : {}) },
-              })}
+              onPress={() => {
+                track(AnalyticsEvent.METRIC_DETAIL_OPEN, {
+                  metric_key: metric.key,
+                  score: metric.score,
+                });
+                router.push({
+                  pathname: '/metric/[key]',
+                  params: { key: metric.key, ...(sessionId ? { sessionId } : {}) },
+                });
+              }}
             >
               <Text style={styles.detailLinkText}>Full breakdown →</Text>
             </Pressable>

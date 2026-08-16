@@ -10,195 +10,289 @@ import {
 import { router } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useAnalysisStore } from '../../src/store/useAnalysisStore';
+import { useAuthStore } from '../../src/store/useAuthStore';
 import { haptic } from '../../src/lib/haptics';
-import { Card } from '../../src/components/ui/Card';
-import { ScoreGauge } from '../../src/components/ui/ScoreGauge';
+import { DepthCard } from '../../src/components/ui/DepthCard';
+import { OverallTrendCard } from '../../src/components/progress/OverallTrendCard';
+import { CategoryTrendRow } from '../../src/components/progress/CategoryTrendRow';
+import { StuckIssueCard } from '../../src/components/progress/StuckIssueCard';
+import { ConsistencyCard } from '../../src/components/progress/ConsistencyCard';
+import { PieceSummaryCard, type PieceSummary } from '../../src/components/progress/PieceSummaryCard';
 import { colors, spacing, radius } from '../../src/constants/theme';
-import { severityFromScore, SessionSummary } from '../../src/types/analysis';
-import { scoreColor } from '../../src/lib/scoreColor';
+import { collectIssueSources } from '../../src/lib/practiceIssues';
+import { minutesPracticedThisWeek } from '../../src/lib/weeklyGoal';
+import { computeStreak } from '../../src/lib/streak';
+import { CATEGORY_BY_ID } from '../../src/constants/categories';
+import {
+  buildCategorySeries, overallSeries, comparePeriods, compareHalves,
+  stuckIssues, resolvedIssues, pieceVsGlobalIssues, practiceCalendar,
+  progressStage, rangeStart,
+  RANGE_LABELS, MIN_SESSIONS_FOR_STUCK,
+  type ProgressRange, type TrendPoint,
+} from '../../src/lib/progressAnalytics';
 
-type ProgressView = 'by_song' | 'all_sessions';
-
-interface PieceGroup {
-  pieceId: string | null;
-  piece: { id: string; title: string; composer?: string } | null;
-  sessions: SessionSummary[]; // ascending by recordedAt
-  sessionCount: number;
-  avgScore: number;
-  bestScore: number;
-  latestScore: number;
-  improvement: number | null; // last score − first score
-  scoreHistory: number[];
-  latestDate: string;
-}
-
-function ScoreDots({ scores }: { scores: number[] }) {
-  const recent = scores.slice(-6);
-  return (
-    <View style={dot.row}>
-      {recent.map((s, i) => (
-        <View key={i} style={[dot.circle, { backgroundColor: scoreColor(s) }]} />
-      ))}
-    </View>
-  );
-}
-
-const dot = StyleSheet.create({
-  row:    { flexDirection: 'row', alignItems: 'center', gap: 5 },
-  circle: { width: 8, height: 8, borderRadius: 4 },
-});
+const RANGES: ProgressRange[] = ['4w', '3m', 'all'];
+const CALENDAR_WEEKS: Record<ProgressRange, number> = { '4w': 5, '3m': 13, all: 13 };
 
 export default function ProgressScreen() {
-  const { sessionHistory } = useAnalysisStore();
-  const [view, setView] = useState<ProgressView>('by_song');
+  // Selector subscriptions — destructuring the whole store re-rendered this
+  // screen on every unrelated write.
+  const sessionHistory = useAnalysisStore((s) => s.sessionHistory);
+  const metricHistory = useAnalysisStore((s) => s.metricHistory);
+  const sessionResultCache = useAnalysisStore((s) => s.sessionResultCache);
+  const currentResult = useAnalysisStore((s) => s.currentResult);
+  const weeklyGoalMinutes = useAuthStore((s) => s.weeklyGoalMinutes);
 
-  const hasData = sessionHistory.length > 0;
+  const [range, setRange] = useState<ProgressRange>('4w');
+  const [showFixed, setShowFixed] = useState(false);
 
-  // Group sessions by piece
-  const pieceGroups = useMemo<PieceGroup[]>(() => {
-    const map = new Map<string | null, SessionSummary[]>();
-    for (const s of sessionHistory) {
-      const key = s.piece?.id ?? null;
-      if (!map.has(key)) map.set(key, []);
-      map.get(key)!.push(s);
+  const stage = progressStage(sessionHistory.length);
+
+  // ── Overall ──────────────────────────────────────────────
+  const allOverallPoints = useMemo(() => overallSeries(sessionHistory), [sessionHistory]);
+
+  const { overallPoints, overallComparison } = useMemo(() => {
+    const now = new Date();
+    const start = rangeStart(range, now);
+    const visible = start == null
+      ? allOverallPoints
+      : allOverallPoints.filter((p) => p.t >= start);
+    const comparison = start == null
+      ? compareHalves(allOverallPoints)
+      : comparePeriods(allOverallPoints, start, now.getTime());
+    return { overallPoints: visible, overallComparison: comparison };
+  }, [allOverallPoints, range]);
+
+  // ── Categories ───────────────────────────────────────────
+  const categorySeries = useMemo(
+    () => buildCategorySeries(metricHistory, range),
+    [metricHistory, range],
+  );
+
+  // ── Issues ───────────────────────────────────────────────
+  const issueSources = useMemo(
+    () => collectIssueSources({
+      recentSessions: Object.values(sessionResultCache),
+      metricHistory,
+    }),
+    [sessionResultCache, metricHistory],
+  );
+
+  const stuck = useMemo(() => stuckIssues(issueSources), [issueSources]);
+  const fixed = useMemo(() => resolvedIssues(issueSources), [issueSources]);
+
+  // ── Consistency ──────────────────────────────────────────
+  const weeks = useMemo(
+    () => practiceCalendar(sessionHistory, CALENDAR_WEEKS[range]),
+    [sessionHistory, range],
+  );
+  const streak = useMemo(() => computeStreak(sessionHistory), [sessionHistory]);
+  const minutesThisWeek = useMemo(() => minutesPracticedThisWeek(sessionHistory), [sessionHistory]);
+
+  // ── Pieces ───────────────────────────────────────────────
+  const pieceSummaries = useMemo<PieceSummary[]>(() => {
+    const grouped = new Map<string | null, typeof sessionHistory>();
+    for (const session of sessionHistory) {
+      const key = session.piece?.id ?? null;
+      const list = grouped.get(key) ?? [];
+      list.push(session);
+      grouped.set(key, list);
     }
 
-    const groups: PieceGroup[] = [];
-    for (const [pieceId, sessions] of map.entries()) {
+    const summaries: PieceSummary[] = [];
+    for (const [pieceId, sessions] of grouped.entries()) {
       const sorted = [...sessions].sort((a, b) => a.recordedAt.localeCompare(b.recordedAt));
-      const scores = sorted.map((s) => s.overallScore);
-      const avg = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
-      groups.push({
+      const points: TrendPoint[] = sorted.map((s) => ({
+        t: new Date(s.recordedAt).getTime(),
+        value: s.overallScore,
+      }));
+
+      let note: string | null = null;
+      if (pieceId) {
+        const split = pieceVsGlobalIssues(issueSources, pieceId);
+        if (split.pieceSpecific.length > 0) {
+          note = `${split.pieceSpecific.length} issue${split.pieceSpecific.length === 1 ? '' : 's'} only show${split.pieceSpecific.length === 1 ? 's' : ''} up here`;
+        } else if (split.universal.length > 0) {
+          note = 'Shares your general technique issues';
+        }
+      }
+
+      summaries.push({
         pieceId,
-        piece: sorted[0].piece ?? null,
-        sessions: sorted,
+        title: pieceId === null ? 'General Practice' : sorted[0].piece?.title ?? 'Unknown Piece',
+        composer: sorted[0].piece?.composer,
         sessionCount: sorted.length,
-        avgScore: avg,
-        bestScore: Math.max(...scores),
-        latestScore: scores[scores.length - 1],
-        improvement: scores.length >= 2 ? scores[scores.length - 1] - scores[0] : null,
-        scoreHistory: scores,
-        latestDate: sorted[sorted.length - 1].recordedAt,
+        points,
+        direction: compareHalves(points).direction,
+        note,
       });
     }
 
-    // Most recently played piece first; general practice last
-    return groups
-      .sort((a, b) => b.latestDate.localeCompare(a.latestDate))
+    // Most recently played first; unnamed practice always last.
+    return summaries
+      .sort((a, b) => (b.points.at(-1)?.t ?? 0) - (a.points.at(-1)?.t ?? 0))
       .sort((a, b) => (a.pieceId === null ? 1 : 0) - (b.pieceId === null ? 1 : 0));
-  }, [sessionHistory]);
+  }, [sessionHistory, issueSources]);
 
-  const namedGroups = pieceGroups.filter((g) => g.pieceId !== null);
-  const generalGroup = pieceGroups.find((g) => g.pieceId === null) ?? null;
+  if (stage === 'empty') {
+    return (
+      <SafeAreaView style={styles.safe}>
+        <Header sessionCount={0} pieceCount={0} />
+        <EmptyState />
+      </SafeAreaView>
+    );
+  }
 
-  const avgScore = hasData
-    ? Math.round(sessionHistory.reduce((a, s) => a + s.overallScore, 0) / sessionHistory.length)
-    : null;
+  const namedPieces = pieceSummaries.filter((p) => p.pieceId !== null).length;
+  const earlyData = stage !== 'full';
 
   return (
     <SafeAreaView style={styles.safe}>
-      <View style={styles.header}>
-        <Text style={styles.title}>Progress</Text>
-        <Text style={styles.subtitle}>
-          {hasData
-            ? `${sessionHistory.length} session${sessionHistory.length === 1 ? '' : 's'} · ${namedGroups.length} piece${namedGroups.length === 1 ? '' : 's'}`
-            : 'Record your first session to start tracking'}
-        </Text>
-      </View>
+      <Header sessionCount={sessionHistory.length} pieceCount={namedPieces} />
 
-      {/* View toggle — styled as iOS segmented control */}
       <View style={styles.toggleContainer}>
         <View style={styles.toggleTrack}>
-          <Pressable
-            style={[styles.toggleChip, view === 'by_song' && styles.toggleChipActive]}
-            onPress={() => setView('by_song')}
-          >
-            <Text style={[styles.toggleText, view === 'by_song' && styles.toggleTextActive]}>
-              By Song
-            </Text>
-          </Pressable>
-          <Pressable
-            style={[styles.toggleChip, view === 'all_sessions' && styles.toggleChipActive]}
-            onPress={() => setView('all_sessions')}
-          >
-            <Text style={[styles.toggleText, view === 'all_sessions' && styles.toggleTextActive]}>
-              All Sessions
-            </Text>
-          </Pressable>
+          {RANGES.map((r) => (
+            <Pressable
+              key={r}
+              style={[styles.toggleChip, range === r && styles.toggleChipActive]}
+              onPress={() => { haptic.light(); setRange(r); }}
+            >
+              <Text style={[styles.toggleText, range === r && styles.toggleTextActive]}>
+                {RANGE_LABELS[r]}
+              </Text>
+            </Pressable>
+          ))}
         </View>
       </View>
 
       <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
 
-        {/* Practice plan entry point */}
-        <Pressable style={styles.practiceCard} onPress={() => router.push('/(tabs)/train')}>
-          <Ionicons name="list" size={24} color={colors.brand[600]} />
-          <View style={styles.practiceCardText}>
-            <Text style={styles.practiceCardTitle}>Practice Plan</Text>
-            <Text style={styles.practiceCardSub}>Personalized exercises based on your sessions</Text>
-          </View>
-          <Text style={styles.practiceCardArrow}>›</Text>
-        </Pressable>
+        {stage === 'baseline' ? (
+          <DepthCard>
+            <Text style={styles.baselineTitle}>This is your baseline</Text>
+            <Text style={styles.baselineBody}>
+              One session in. Record again and everything below turns into a trend —
+              what's improving, what's stuck, and what to practice next.
+            </Text>
+          </DepthCard>
+        ) : (
+          <OverallTrendCard
+            points={overallPoints}
+            comparison={overallComparison}
+            range={range}
+            onPointPress={(point) => {
+              const match = sessionHistory.find(
+                (s) => new Date(s.recordedAt).getTime() === point.t,
+              );
+              if (match) { haptic.light(); router.push(`/session/${match.id}`); }
+            }}
+          />
+        )}
 
-        {/* ── By Song view ─────────────────────────────────── */}
-        {view === 'by_song' && (
+        {/* ── Categories ─────────────────────────────────── */}
+        <SectionHeader label="By skill" />
+        <DepthCard style={styles.categoryCard}>
+          {categorySeries.map((series) => (
+            <CategoryTrendRow
+              key={series.id}
+              series={series}
+              earlyData={earlyData}
+              // The metric screen renders a specific session's detail and its
+              // source (sessionResultCache / currentResult) is in-memory only.
+              // Without one loaded the tap would dead-end on an empty state, so
+              // the row simply isn't interactive then.
+              onPress={
+                currentResult
+                  ? () => router.push(`/metric/${CATEGORY_BY_ID[series.id].keys[0]}`)
+                  : undefined
+              }
+            />
+          ))}
+        </DepthCard>
+
+        {/* ── Still working on ───────────────────────────── */}
+        {stuck.length > 0 ? (
           <>
-            {namedGroups.length === 0 && !generalGroup && (
-              <EmptyState />
-            )}
-
-            {namedGroups.map((group) => (
-              <PieceGroupCard
-                key={group.pieceId!}
-                group={group}
-                onPress={() => router.push(`/piece/${group.pieceId}`)}
+            <SectionHeader label="Still working on" />
+            {stuck.slice(0, 3).map((recurrence) => (
+              <StuckIssueCard
+                key={recurrence.evidence.id}
+                recurrence={recurrence}
+                onPractice={() => router.push('/(tabs)/train')}
               />
             ))}
-
-            {generalGroup && (
-              <PieceGroupCard
-                key="general"
-                group={generalGroup}
-                onPress={() => router.push('/piece/general')}
-              />
-            )}
           </>
-        )}
-
-        {/* ── All Sessions view ─────────────────────────────── */}
-        {view === 'all_sessions' && (
+        ) : sessionHistory.length < MIN_SESSIONS_FOR_STUCK ? (
           <>
-            {avgScore != null && (
-              <Card style={styles.avgCard}>
-                <Text style={styles.sectionLabel}>Average Score</Text>
-                <View style={styles.avgRow}>
-                  <ScoreGauge score={avgScore} severity={severityFromScore(avgScore)} size="lg" />
-                  <View style={styles.avgInfo}>
-                    <Text style={styles.avgSubtitle}>across {sessionHistory.length} sessions</Text>
-                    <Text style={styles.avgHint}>Keep practicing daily for the fastest improvement.</Text>
-                  </View>
-                </View>
-              </Card>
-            )}
+            <SectionHeader label="Still working on" />
+            <DepthCard>
+              <Text style={styles.lockedBody}>
+                After {MIN_SESSIONS_FOR_STUCK} sessions this shows the faults that keep
+                coming back — the ones worth building practice around.
+                {' '}{MIN_SESSIONS_FOR_STUCK - sessionHistory.length} to go.
+              </Text>
+            </DepthCard>
+          </>
+        ) : null}
 
-            {hasData ? (
-              <>
-                <Text style={styles.historyHeading}>Session History</Text>
-                {[...sessionHistory]
-                  .sort((a, b) => b.recordedAt.localeCompare(a.recordedAt))
-                  .map((session) => (
-                    <SessionRow
-                      key={session.id}
-                      session={session}
-                      onPress={() => router.push(`/session/${session.id}`)}
-                    />
+        {/* ── Fixed ──────────────────────────────────────── */}
+        {fixed.length > 0 && (
+          <>
+            <SectionHeader label="You fixed these" />
+            <DepthCard onPress={() => setShowFixed((v) => !v)}>
+              <View style={styles.fixedHeader}>
+                <Ionicons name="checkmark-circle" size={18} color="#22c55e" />
+                <Text style={styles.fixedCount}>
+                  {fixed.length} issue{fixed.length === 1 ? '' : 's'} stopped showing up
+                </Text>
+                <Text style={styles.chevron}>{showFixed ? '⌃' : '⌄'}</Text>
+              </View>
+              {showFixed && (
+                <View style={styles.fixedList}>
+                  {fixed.map((evidence) => (
+                    <Text key={evidence.id} style={styles.fixedItem}>• {evidence.title}</Text>
                   ))}
-              </>
-            ) : (
-              <EmptyState />
-            )}
+                </View>
+              )}
+            </DepthCard>
           </>
         )}
+
+        {/* ── Consistency ────────────────────────────────── */}
+        <SectionHeader label="Consistency" />
+        <ConsistencyCard
+          weeks={weeks}
+          streak={streak}
+          minutesThisWeek={minutesThisWeek}
+          goalMinutes={weeklyGoalMinutes}
+        />
+
+        {/* ── By piece ───────────────────────────────────── */}
+        {pieceSummaries.length > 0 && (
+          <>
+            <SectionHeader label="By piece" />
+            {pieceSummaries.map((summary) => (
+              <PieceSummaryCard
+                key={summary.pieceId ?? 'general'}
+                summary={summary}
+                onPress={() => router.push(`/piece/${summary.pieceId ?? 'general'}`)}
+              />
+            ))}
+          </>
+        )}
+
+        {/* ── Practice plan ──────────────────────────────── */}
+        <DepthCard onPress={() => router.push('/(tabs)/train')} style={styles.planCard}>
+          <Ionicons name="list" size={22} color={colors.brand[600]} />
+          <View style={styles.planText}>
+            <Text style={styles.planTitle}>Practice Plan</Text>
+            <Text style={styles.planSub}>Exercises built from what's stuck</Text>
+          </View>
+          <Text style={styles.chevron}>›</Text>
+        </DepthCard>
+
+        <View style={styles.bottomPad} />
       </ScrollView>
     </SafeAreaView>
   );
@@ -206,91 +300,21 @@ export default function ProgressScreen() {
 
 // ── Sub-components ───────────────────────────────────────────
 
-function PieceGroupCard({
-  group,
-  onPress,
-}: {
-  group: PieceGroup;
-  onPress: () => void;
-}) {
-  const isGeneral = group.pieceId === null;
-  const title = isGeneral ? 'General Practice' : (group.piece?.title ?? 'Unknown Piece');
-  const sub = isGeneral
-    ? `${group.sessionCount} session${group.sessionCount === 1 ? '' : 's'} without a selected piece`
-    : `${group.piece?.composer ?? 'Unknown'} · ${group.sessionCount} session${group.sessionCount === 1 ? '' : 's'}`;
-
+function Header({ sessionCount, pieceCount }: { sessionCount: number; pieceCount: number }) {
   return (
-    <Pressable
-      style={({ pressed }) => [styles.groupCard, { opacity: pressed ? 0.85 : 1 }]}
-      onPress={onPress}
-    >
-      <View style={styles.groupTop}>
-        <View style={styles.groupTitleBlock}>
-          <Text style={styles.groupTitle} numberOfLines={1}>{title}</Text>
-          <Text style={styles.groupSub} numberOfLines={1}>{sub}</Text>
-        </View>
-        <View style={styles.groupScoreBlock}>
-          <Text style={styles.groupAvg}>{group.avgScore}</Text>
-          <Text style={styles.groupAvgLabel}>avg</Text>
-        </View>
-        <Text style={styles.groupArrow}>›</Text>
-      </View>
-
-      <View style={styles.groupBottom}>
-        <ScoreDots scores={group.scoreHistory} />
-        <View style={styles.groupStats}>
-          <Text style={styles.groupBest}>Best {group.bestScore}</Text>
-          {group.improvement !== null && (
-            <Text style={[
-              styles.groupDelta,
-              { color: group.improvement >= 0 ? colors.score.excellent : colors.score.critical },
-            ]}>
-              {group.improvement >= 0 ? '▲' : '▼'} {Math.abs(group.improvement)} pts overall
-            </Text>
-          )}
-        </View>
-      </View>
-    </Pressable>
+    <View style={styles.header}>
+      <Text style={styles.title}>Progress</Text>
+      <Text style={styles.subtitle}>
+        {sessionCount === 0
+          ? 'Record your first session to start tracking'
+          : `${sessionCount} session${sessionCount === 1 ? '' : 's'} · ${pieceCount} piece${pieceCount === 1 ? '' : 's'}`}
+      </Text>
+    </View>
   );
 }
 
-function SessionRow({ session, onPress }: { session: SessionSummary; onPress?: () => void }) {
-  return (
-    <Pressable onPress={() => { haptic.light(); onPress?.(); }} style={({ pressed }) => [{ opacity: pressed ? 0.75 : 1 }]}>
-      <Card style={styles.sessionCard}>
-        <View style={styles.sessionRow}>
-          <ScoreGauge
-            score={session.overallScore}
-            severity={severityFromScore(session.overallScore)}
-            size="sm"
-            showLabel={false}
-          />
-          <View style={styles.sessionInfo}>
-            <Text style={styles.sessionDate}>
-              {new Date(session.recordedAt).toLocaleDateString('en-US', {
-                weekday: 'short', month: 'short', day: 'numeric',
-              })}
-            </Text>
-            <Text style={styles.sessionMeta} numberOfLines={1}>
-              {session.piece?.title
-                ? session.piece.title
-                : session.instrument}{' '}
-              · {Math.round(session.durationSeconds)}s
-            </Text>
-          </View>
-          {session.overallDelta != null && (
-            <Text style={[
-              styles.sessionDelta,
-              { color: session.overallDelta >= 0 ? colors.score.excellent : colors.score.critical },
-            ]}>
-              {session.overallDelta >= 0 ? '+' : ''}{session.overallDelta}
-            </Text>
-          )}
-          {onPress && <Text style={styles.sessionArrow}>›</Text>}
-        </View>
-      </Card>
-    </Pressable>
-  );
+function SectionHeader({ label }: { label: string }) {
+  return <Text style={styles.sectionHeader}>{label}</Text>;
 }
 
 function EmptyState() {
@@ -299,7 +323,8 @@ function EmptyState() {
       <Ionicons name="musical-notes-outline" size={64} color={colors.brand[300]} />
       <Text style={styles.emptyTitle}>No sessions yet</Text>
       <Text style={styles.emptyBody}>
-        Head to the Analyze tab and record your first session.
+        Record a session and this becomes your practice history — which skills are
+        improving, which faults keep returning, and what to work on next.
       </Text>
     </View>
   );
@@ -309,6 +334,7 @@ function EmptyState() {
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.background },
+
   header: {
     paddingTop: 20, paddingBottom: spacing.xl, paddingHorizontal: spacing.xl,
     backgroundColor: colors.surface,
@@ -322,8 +348,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.lg,
     paddingVertical: spacing.md,
     backgroundColor: colors.background,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f0f0f0',
   },
   toggleTrack: {
     flexDirection: 'row',
@@ -332,12 +356,7 @@ const styles = StyleSheet.create({
     padding: 3,
     gap: 3,
   },
-  toggleChip: {
-    flex: 1,
-    alignItems: 'center',
-    paddingVertical: 7,
-    borderRadius: radius.md,
-  },
+  toggleChip: { flex: 1, alignItems: 'center', paddingVertical: 7, borderRadius: radius.md },
   toggleChipActive: {
     backgroundColor: '#fff',
     shadowColor: '#000',
@@ -346,84 +365,42 @@ const styles = StyleSheet.create({
     shadowRadius: 4,
     elevation: 2,
   },
-  toggleText: { fontSize: 14, fontWeight: '600', color: colors.text.secondary },
+  toggleText: { fontSize: 13, fontWeight: '600', color: colors.text.secondary },
   toggleTextActive: { color: colors.brand[600] },
 
-  content: { padding: spacing.lg, gap: spacing.md },
+  content: { paddingHorizontal: spacing.lg, paddingBottom: spacing.lg, gap: spacing.md },
 
-  // Piece group card
-  groupCard: {
-    backgroundColor: '#fff',
-    borderRadius: radius.lg,
-    padding: spacing.md,
-    gap: spacing.sm,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.07,
-    shadowRadius: 8,
-    elevation: 3,
-  },
-  groupTop: { flexDirection: 'row', alignItems: 'flex-start', gap: spacing.sm },
-  groupTitleBlock: { flex: 1 },
-  groupTitle: { fontSize: 15, fontWeight: '700', color: colors.text.primary },
-  groupSub: { fontSize: 12, color: colors.text.muted, marginTop: 2 },
-  groupScoreBlock: { alignItems: 'center', minWidth: 36 },
-  groupAvg: { fontSize: 22, fontWeight: '700', color: colors.text.primary, lineHeight: 26 },
-  groupAvgLabel: { fontSize: 10, color: colors.text.muted, fontWeight: '600', textTransform: 'uppercase' },
-  groupArrow: { fontSize: 22, color: colors.text.muted, fontWeight: '300', alignSelf: 'center' },
-  groupBottom: { flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-between' },
-  groupStats: { alignItems: 'flex-end', gap: 2 },
-  groupBest: { fontSize: 11, color: colors.text.muted },
-  groupDelta: { fontSize: 12, fontWeight: '700' },
-
-  // Average card
-  avgCard: {},
-  avgRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.md },
-  avgInfo: { flex: 1 },
-  avgSubtitle: { fontSize: 13, color: colors.text.secondary },
-  avgHint: { fontSize: 12, color: colors.text.muted, marginTop: 4, lineHeight: 17 },
-
-  sectionLabel: {
+  sectionHeader: {
     fontSize: 12, fontWeight: '700', color: colors.text.muted,
-    textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: spacing.sm,
-  },
-
-  // Session list
-  historyHeading: {
-    fontSize: 13, fontWeight: '700', color: colors.text.muted,
     textTransform: 'uppercase', letterSpacing: 0.5,
+    marginTop: spacing.sm,
   },
-  sessionCard: { marginBottom: 0 },
-  sessionRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.md },
-  sessionInfo: { flex: 1 },
-  sessionDate: { fontSize: 14, fontWeight: '600', color: colors.text.primary },
-  sessionMeta: { fontSize: 12, color: colors.text.muted, marginTop: 2 },
-  sessionDelta: { fontSize: 14, fontWeight: '700' },
-  sessionArrow: { fontSize: 18, color: colors.text.muted, marginLeft: spacing.xs },
 
-  // Empty state
-  emptyState: { alignItems: 'center', paddingTop: spacing.xxl },
-  emptyEmoji: { fontSize: 48, marginBottom: spacing.md },
-  emptyTitle: { fontSize: 18, fontWeight: '700', color: colors.text.primary },
-  emptyBody: { fontSize: 13, color: colors.text.muted, textAlign: 'center', marginTop: spacing.sm, lineHeight: 20 },
+  categoryCard: { paddingVertical: 2 },
 
-  // Practice plan card
-  practiceCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.sm,
-    backgroundColor: '#fff',
-    borderRadius: radius.lg,
-    padding: spacing.md,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.05,
-    shadowRadius: 4,
-    elevation: 2,
+  baselineTitle: { fontSize: 16, fontWeight: '700', color: colors.text.primary },
+  baselineBody: { fontSize: 13, color: colors.text.secondary, lineHeight: 19 },
+
+  lockedBody: { fontSize: 13, color: colors.text.secondary, lineHeight: 19 },
+
+  fixedHeader: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  fixedCount: { flex: 1, fontSize: 14, fontWeight: '700', color: colors.text.primary },
+  fixedList: { gap: 4, paddingTop: spacing.xs },
+  fixedItem: { fontSize: 13, color: colors.text.secondary, lineHeight: 19 },
+
+  planCard: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  planText: { flex: 1 },
+  planTitle: { fontSize: 15, fontWeight: '700', color: colors.text.primary },
+  planSub: { fontSize: 12, color: colors.text.muted, marginTop: 2 },
+
+  chevron: { fontSize: 20, color: colors.text.muted, fontWeight: '300' },
+
+  emptyState: { alignItems: 'center', paddingTop: spacing.xxl, paddingHorizontal: spacing.xl },
+  emptyTitle: { fontSize: 18, fontWeight: '700', color: colors.text.primary, marginTop: spacing.md },
+  emptyBody: {
+    fontSize: 13, color: colors.text.muted, textAlign: 'center',
+    marginTop: spacing.sm, lineHeight: 20,
   },
-  practiceCardIcon: { fontSize: 24 },
-  practiceCardText: { flex: 1 },
-  practiceCardTitle: { fontSize: 15, fontWeight: '700', color: colors.text.primary },
-  practiceCardSub: { fontSize: 12, color: colors.text.muted, marginTop: 2 },
-  practiceCardArrow: { fontSize: 22, color: colors.text.muted, fontWeight: '300' },
+
+  bottomPad: { height: spacing.xl },
 });

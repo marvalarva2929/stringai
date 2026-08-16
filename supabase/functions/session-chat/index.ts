@@ -1,81 +1,66 @@
 // L10 — chat-with-your-coach Edge Function.
 //
-// Input: the running conversation (messages) plus a condensed session-history
-// summary from the client. Output: { reply: string }. Unlike analyze-feedback
-// this is free-form conversational text, not structured output — a chat
-// doesn't have a fixed schema per turn.
+// Input: the running conversation (messages) plus the shared CoachContext.
+// Output: { reply: string }. Unlike analyze-feedback this is free-form
+// conversational text, not structured output — a chat doesn't have a fixed
+// schema per turn.
 //
 // Deploy:  supabase functions deploy session-chat
 // Secret:  supabase secrets set ANTHROPIC_API_KEY=sk-ant-...
 //
+// Runs on Claude Haiku while post-session coaching runs on DeepSeek. That split
+// is about latency, not capability: this call blocks the composer while the
+// student waits, so a few seconds matters; coaching fills in behind a spinner
+// where ~20s is invisible and its longer output makes token price dominate.
+// Both read the SAME context (see _shared/coachContext.ts) — different models,
+// one view of the student.
+//
 // JWT verification is on by default, so only authenticated app users reach this
-// handler. Gated behind Pro same as analyze-feedback — every turn is a Claude
-// call, so an unmetered free tier here is an open tab on our API key.
+// handler. Gated behind Pro same as analyze-feedback — every turn is an
+// inference call, so an unmetered free tier here is an open tab on our key.
 
 import Anthropic from 'npm:@anthropic-ai/sdk';
-import { createClient } from 'npm:@supabase/supabase-js@2';
+import {
+  CONTEXT_PROMPT_SECTION,
+  renderCoachContext,
+  type CoachContext,
+} from '../_shared/coachContext.ts';
+import { resolveProCaller } from '../_shared/caller.ts';
+import { loadCoachContext, saveChatTurns } from '../_shared/loadCoachContext.ts';
 
 interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
 }
 
-interface SessionHistoryEntry {
-  recordedAt: string;
-  overallScore: number;
-  topIssue?: string;
-  piece?: string;
-  durationSeconds: number;
-}
-
 interface ChatInput {
   messages: ChatMessage[];
-  sessionHistory: SessionHistoryEntry[];
+  /**
+   * Optional. The context is loaded server-side; this is merged in only for
+   * sessions that never reached the database (saveSession is fire-and-forget).
+   */
+  context?: CoachContext;
+  /** Set when chat was opened from a specific session's results. */
+  sessionId?: string;
 }
 
 const SYSTEM_PROMPT = `You are a friendly, expert violin teacher chatting with a student inside their practice app.
 
-You have access to a condensed list of the student's recent practice sessions (date, overall score, top issue, piece, duration). Use it to ground your answers in real trends — e.g. "your intonation score has climbed the last three sessions" — rather than generic advice.
+${CONTEXT_PROMPT_SECTION}
 
-- Be conversational and concise: 2-5 sentences per reply unless the student asks for a detailed breakdown.
+- Be conversational. Two or three sentences for a simple question; go longer — walk through the phrases one at a time — when they ask about musicality, interpretation, or what to do about a specific passage. A question about shaping deserves a real answer, not a summary.
 - Reference specific sessions or trends from the history when relevant; don't invent data that isn't there.
 - Give specific, actionable practice suggestions with durations when coaching technique — never vague advice like "practice slowly".
-- If the history is empty or too sparse to say anything specific, say so honestly and ask a clarifying question instead of guessing.`;
-
-/** Same pattern as analyze-feedback's callerIsPro — duplicated because each Edge Function is an isolated Deno module. */
-async function callerIsPro(req: Request): Promise<boolean> {
-  const jwt = req.headers.get('Authorization')?.replace(/^Bearer\s+/i, '');
-  if (!jwt) return false;
-
-  const url = Deno.env.get('SUPABASE_URL');
-  const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
-  if (!url || !serviceKey) return false;
-
-  const admin = createClient(url, serviceKey, { auth: { persistSession: false } });
-
-  const { data: userData, error: userErr } = await admin.auth.getUser(jwt);
-  if (userErr || !userData.user) return false;
-
-  const { data: profile, error: profileErr } = await admin
-    .from('profiles')
-    .select('entitlement, entitlement_expires_at')
-    .eq('id', userData.user.id)
-    .single();
-  if (profileErr || !profile) return false;
-
-  if (profile.entitlement !== 'pro') return false;
-  if (profile.entitlement_expires_at && new Date(profile.entitlement_expires_at) <= new Date()) {
-    return false;
-  }
-  return true;
-}
+- If the history is empty or too sparse to say anything specific, say so honestly and ask a clarifying question instead of guessing.
+- Formatting: the app renders **bold**, *italic*, \`code\`, and short bullet or numbered lists. Use them sparingly for emphasis and steps. Do NOT use headings, tables, links, images, blockquotes or code fences — they render as literal characters.`;
 
 Deno.serve(async (req: Request) => {
   if (req.method !== 'POST') {
     return new Response(JSON.stringify({ error: 'method not allowed' }), { status: 405 });
   }
 
-  if (!(await callerIsPro(req))) {
+  const caller = await resolveProCaller(req);
+  if (!caller) {
     return new Response(JSON.stringify({ error: 'entitlement_required' }), {
       status: 402,
       headers: { 'content-type': 'application/json' },
@@ -94,11 +79,13 @@ Deno.serve(async (req: Request) => {
 
   const client = new Anthropic({ apiKey: Deno.env.get('ANTHROPIC_API_KEY') });
 
-  // Session history goes in as a system-adjacent preamble on the first user
-  // turn so it's available for the whole conversation without repeating it
-  // on every message.
-  const historyBlock = `Recent session history (most recent first, JSON): ${JSON.stringify(
-    (input.sessionHistory ?? []).slice(0, 20),
+  // The student record — scores, trends, and the drill plans the coach
+  // produced — goes in as a preamble on the first user turn so it is available
+  // for the whole conversation without being repeated on every message.
+  const context = await loadCoachContext(caller.admin, caller.userId, input.context);
+  const contextBlock = `Student record (most recent session first, JSON): ${renderCoachContext(
+    context,
+    input.sessionId,
   )}`;
 
   const messages = input.messages
@@ -106,8 +93,11 @@ Deno.serve(async (req: Request) => {
     .slice(-20)
     .map((m) => ({ role: m.role, content: m.content }));
 
+  // Grabbed before the context preamble is spliced onto the first turn below.
+  const rawLastUserMessage = [...messages].reverse().find((m) => m.role === 'user')?.content;
+
   if (messages.length > 0 && messages[0].role === 'user') {
-    messages[0] = { role: 'user', content: `${historyBlock}\n\n${messages[0].content}` };
+    messages[0] = { role: 'user', content: `${contextBlock}\n\n${messages[0].content}` };
   }
 
   try {
@@ -126,6 +116,20 @@ Deno.serve(async (req: Request) => {
     if (!textBlock || textBlock.type !== 'text') {
       return new Response(JSON.stringify({ error: 'empty model response' }), { status: 502 });
     }
+
+    // Record the exchange. Written server-side so a client cannot forge
+    // assistant turns, which the post-session coach later reads as evidence.
+    // Fire-and-forget: losing a message costs a little context and is never
+    // worth failing the student's reply over.
+    const lastUserTurn = [...messages].reverse().find((m) => m.role === 'user');
+    saveChatTurns(caller.admin, caller.userId, input.sessionId ?? null, [
+      // The stored copy is the student's actual words, not the first turn with
+      // the context block prepended to it.
+      ...(lastUserTurn
+        ? [{ role: 'user' as const, content: rawLastUserMessage ?? lastUserTurn.content }]
+        : []),
+      { role: 'assistant' as const, content: textBlock.text },
+    ]).catch(() => {});
 
     return new Response(JSON.stringify({ reply: textBlock.text }), {
       headers: { 'content-type': 'application/json' },

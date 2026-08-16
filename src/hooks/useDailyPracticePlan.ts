@@ -3,6 +3,7 @@ import { useAnalysisStore } from '../store/useAnalysisStore';
 import { useAuthStore } from '../store/useAuthStore';
 import { useUserStore } from '../store/useUserStore';
 import { useCuratedPlanStore } from '../store/useCuratedPlanStore';
+import { useTechniqueSkillStore, mayShift } from '../store/useTechniqueSkillStore';
 import { useDailyPlanSnapshotStore } from '../store/useDailyPlanSnapshotStore';
 import { computePracticePlan, type PracticePlan, type PlanScope } from '../lib/practicePlan';
 import { applyCuratedCopy } from '../lib/practiceCuration';
@@ -33,6 +34,7 @@ export function usePracticePlan(scope: PlanScope): PracticePlan {
   const { playerCategory, weeklyGoalMinutes } = useAuthStore();
   const { profile } = useUserStore();
   const curatedBlocksByPlan = useCuratedPlanStore((s) => s.curatedBlocksByPlan);
+  const thirdPosition = useTechniqueSkillStore((s) => s.thirdPosition);
 
   const richSessions = useMemo(
     () => recentRichSessions(currentResult, sessionResultCache),
@@ -49,6 +51,9 @@ export function usePracticePlan(scope: PlanScope): PracticePlan {
     playerCategory: profile?.playerCategory ?? playerCategory,
     weeklyGoalMinutes: profile?.weeklyGoalMinutes ?? weeklyGoalMinutes,
     skillLevel: profile?.skillLevel ?? 'beginner',
+    // Until the player says they can shift, every generated drill stays in
+    // first position. See useTechniqueSkillStore for why "unknown" means no.
+    canShift: mayShift(thirdPosition),
     sessionWindow: 5,
     scope,
   }), [
@@ -57,6 +62,7 @@ export function usePracticePlan(scope: PlanScope): PracticePlan {
     profile?.playerCategory,
     profile?.weeklyGoalMinutes,
     profile?.skillLevel,
+    thirdPosition,
     playerCategory,
     weeklyGoalMinutes,
     scopeKey,

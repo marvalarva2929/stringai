@@ -12,6 +12,8 @@ export interface VibratoAttempt {
   depthCents: number;
   confidence: number;
   durationSeconds: number;
+  /** Whether any oscillation was found at all. Absent on older callers. */
+  detected?: boolean;
 }
 
 export interface BowControlSample {
@@ -22,10 +24,13 @@ export interface BowControlSample {
 export interface AttemptResult {
   passed: boolean;
   centsDeviation?: number;
-  /** Signed ms offset from the expected click (rhythm evaluator only). Negative = early/rushed, positive = late/dragged. */
+  /** Signed ms offset from the expected click. Negative = early/rushed, positive = late/dragged. */
   offsetMs?: number;
   /** Expected note name for this attempt, e.g. a scale degree. Blank for single-target exercises. */
   label?: string;
+  /** Note actually heard. Lets a wrong note be named rather than reported as a
+   *  huge cents figure, which is meaningless past about a semitone. */
+  heardNoteName?: string;
   /** Offsets into the take's recorded audio, so this attempt can be replayed on its own. */
   startTimeSeconds?: number;
   endTimeSeconds?: number;
@@ -38,6 +43,8 @@ export interface PracticeEvaluation {
   bestStreak: number;
   feedback: string;
   attemptResults?: AttemptResult[];
+  /** Holistic 0-100 breakdown for paced sequence drills. See sequenceScore.ts. */
+  score?: import('./sequenceScore').SequenceScore;
 }
 
 export function evaluatePitchLanding(
@@ -218,6 +225,11 @@ function vibratoFeedback(
   if (!last) return 'Need more sustained attempts before judging vibrato.';
   if (last.confidence < 0.45) return 'Vibrato confidence was low. Hold the note longer with a clearer pitch center.';
   if (last.durationSeconds < minDuration) return `Hold the note for at least ${minDuration}s before judging vibrato.`;
+  // No oscillation at all — reporting that as a rate or depth fault ("too slow at 0.0 Hz")
+  // would tell the player to adjust a motion they never made.
+  if (last.detected === false || last.rateHz === 0) {
+    return `No vibrato came through — start a slow, even wrist rock on the held note, about ${minRate} swings per second.`;
+  }
   if (last.rateHz < minRate) return `Vibrato is too slow at ${last.rateHz.toFixed(1)} Hz. Aim for ${minRate}-${maxRate} Hz.`;
   if (last.rateHz > maxRate) return `Vibrato is too fast at ${last.rateHz.toFixed(1)} Hz. Relax the motion.`;
   if (last.depthCents < minDepth) return `Vibrato is shallow at ${Math.round(last.depthCents)} cents. Let the pitch wave widen slightly.`;

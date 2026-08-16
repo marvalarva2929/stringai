@@ -55,7 +55,14 @@ export function useTakeLiveFeedback(active: boolean, targetMidi?: number): LiveT
 
     const onReading = (reading: PitchReading) => {
       const now = Date.now();
-      const voiced = reading.voiced && reading.clarity >= MIN_CLARITY && reading.hz > 0;
+      // The metronome click needs no special case here: it is an aperiodic noise
+      // tick (see lib/clickTone.ts), so it never clears the clarity gate. It used
+      // to be a 1 kHz sine, which did — on every beat, exactly when the gauge is
+      // read — and was excluded by frequency, which also blinded the gauge to a
+      // real B5 at that pitch.
+      const voiced = reading.voiced
+        && reading.clarity >= MIN_CLARITY
+        && reading.hz > 0;
 
       if (!voiced) {
         // A gap long enough to close out the note that was sounding.

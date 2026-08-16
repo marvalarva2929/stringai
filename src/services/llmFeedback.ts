@@ -24,12 +24,20 @@ import { issuesForCoaching, buildCoachingInput, type CoachingInput } from '../li
 export { issuesForCoaching, buildCoachingInput, type CoachingInput };
 
 // ─────────────────────────────────────────────────────────────
-// Edge Function path (L10 — Claude coaching)
+// Edge Function path (L10 — AI coaching)
 // ─────────────────────────────────────────────────────────────
 
-const EDGE_TIMEOUT_MS = 10_000;
+/**
+ * Generous because coaching is a background fill-in, not something the user
+ * waits on: results render immediately and this swaps in behind the
+ * `coachingPending` state. DeepSeek measures ~19-22s for a full structured plan,
+ * so the old 10s budget discarded every completed generation — the Edge Function
+ * finished, the client had already given up, and updateSessionLlmFeedback never
+ * ran. We paid for the tokens and threw the answer away.
+ */
+const EDGE_TIMEOUT_MS = 40_000;
 
-/** Thrown when the caller is not entitled to Claude coaching (Edge Function 402). */
+/** Thrown when the caller is not entitled to AI coaching (Edge Function 402). */
 export class EntitlementRequiredError extends Error {
   constructor() {
     super('Claude coaching requires an active Pro subscription.');

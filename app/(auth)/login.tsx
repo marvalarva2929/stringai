@@ -17,6 +17,10 @@ import { useAuthStore } from '../../src/store/useAuthStore';
 import { useUserStore } from '../../src/store/useUserStore';
 import { Button } from '../../src/components/ui/Button';
 import { OAuthButtons } from '../../src/components/auth/OAuthButtons';
+import { track, trackLogin } from '../../src/services/analytics';
+import { AnalyticsEvent } from '../../src/constants/analyticsEvents';
+import { errorReason } from '../../src/lib/analyticsUserProps';
+import { qaCheckpoint } from '../../src/services/crashReporting';
 import { colors, spacing } from '../../src/constants/theme';
 
 export default function Login() {
@@ -54,12 +58,19 @@ export default function Login() {
     try {
       const data = await signIn(email.trim(), password);
       if (data.user && data.session) {
+        trackLogin('email');
+        qaCheckpoint('login_success'); // TEMPORARY — QA walkthrough checkpoint
         setAuthenticated(data.user.id, data.session.access_token);
         const profile = await fetchProfile(data.user.id);
         setProfile(profile);
         router.replace('/(tabs)/home');
       }
     } catch (err: any) {
+      track(AnalyticsEvent.AUTH_FAILED, {
+        stage: 'sign_in',
+        method: 'email',
+        reason: errorReason(err),
+      });
       Alert.alert('Sign In Failed', err.message ?? 'Please check your credentials.');
     } finally {
       setLoading(false);

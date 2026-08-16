@@ -12,23 +12,35 @@
  *      is generic."
  *
  * NOT part of test:all / CI: costs real API calls and is nondeterministic,
- * same spirit as test:corpus. Requires ANTHROPIC_API_KEY.
+ * same spirit as test:corpus. Requires HF_TOKEN.
  *
- *   ANTHROPIC_API_KEY=sk-ant-... node --experimental-strip-types --loader ./test/ts-resolver.mjs test/llmEval.test.ts
+ *   HF_TOKEN=hf_... node --experimental-strip-types --loader ./test/ts-resolver.mjs test/llmEval.test.ts
  */
 
-import Anthropic from '@anthropic-ai/sdk';
-import { SYSTEM_PROMPT, OUTPUT_SCHEMA, buildUserContent, type CoachingInput } from '../supabase/functions/_shared/coachingPrompt';
+import OpenAI from 'openai';
+import {
+  BANNED_GENERIC_PHRASES,
+  SYSTEM_PROMPT,
+  COACHING_BASE_URL,
+  COACHING_MODEL,
+  COACHING_EXTRA_PARAMS,
+  RESPONSE_FORMAT,
+  buildUserContent,
+  type CoachingInput,
+} from '../supabase/functions/_shared/coachingPrompt';
 import { groundCuratedPlan, parseCuratedResponse } from '../src/lib/practiceCuration';
 import type { PracticeEvidence } from '../src/lib/practiceEvidence';
 
-if (!process.env.ANTHROPIC_API_KEY) {
-  console.log('ANTHROPIC_API_KEY not set — skipping live LLM eval.');
-  console.log('Run with: ANTHROPIC_API_KEY=sk-ant-... npm run test:llm-eval');
+if (!process.env.HF_TOKEN) {
+  console.log('HF_TOKEN not set — skipping live LLM eval.');
+  console.log('Run with: HF_TOKEN=hf_... npm run test:llm-eval');
   process.exit(0);
 }
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const client = new OpenAI({
+  baseURL: COACHING_BASE_URL,
+  apiKey: process.env.HF_TOKEN,
+});
 
 function issue(over: Partial<PracticeEvidence> & { id: string; title: string; reason: string; evidenceSummary: string }): PracticeEvidence {
   return {
@@ -51,6 +63,12 @@ interface Fixture {
   expectMergedCauseOver?: number;
   /** When true, grounded root causes must be empty (clean-session case). */
   expectNoRootCauses?: boolean;
+  /**
+   * When set, the response must engage with the musical evidence: at least this
+   * many phrase_feedback entries, each pointing at a real phrase. This is the
+   * check that fails a generic answer.
+   */
+  expectPhraseFeedback?: number;
 }
 
 const toneIssue = issue({
@@ -58,7 +76,73 @@ const toneIssue = issue({
   reason: 'Ponticello — glassy, weak fundamental — in the upper half of the bow around 20s-35s and 50s-58s, where the bow sits too close to the bridge.',
   evidenceSummary: 'Recent score 58; severity needs_attention.',
 });
+const dynIssue = issue({
+  id: 'metric:dynamicControl', title: 'Dynamic shaping', metricKey: 'dynamicControl',
+  reason: 'Phrases are not shaped — one sits flat throughout, one peaks immediately, one keeps growing to its final note.',
+  evidenceSummary: 'Recent score 54; three phrases flagged.',
+});
+
 const FIXTURES: Fixture[] = [
+  {
+    // The case this whole layer exists for: a student asking how to play more
+    // musically. Every phrase here is measurably shaped wrong in a different
+    // way, so a response that says "focus on dynamics" is failing with the
+    // answer sitting right in front of it.
+    name: 'musicality: phrases shaped wrong in three different ways',
+    issues: [dynIssue],
+    input: {
+      instrument: 'violin',
+      piece: { title: 'Minuet in G', composer: 'J.S. Bach' },
+      skillLevel: 'beginner',
+      playerCategory: 'foundation',
+      metrics: [{
+        key: 'dynamicControl', score: 54, severity: 'needs_attention',
+        observationSummary: dynIssue.reason,
+        moments: [{ t: 44.2, note: 'phrase sounds flat in volume' }],
+      }],
+      patternFindings: [],
+      issues: [{ id: dynIssue.id, summary: `${dynIssue.title}: ${dynIssue.reason}`, quality: 'high' }],
+      musicalEvidence: {
+        key: 'G major',
+        key_confidence: 0.86,
+        phrases_total: 9,
+        phrases: [
+          {
+            id: 2, start_t: 12.4, end_t: 18.1, note_count: 12, slur_count: 3,
+            energy_shape: 'flat', peak_location: 0.5, shape: 'plateau',
+            peak_t: 15.2, melodic_contour: false,
+            intonation_stability: 'high', vibrato_consistency: 0,
+            selected_for: 'no dynamic shape',
+          },
+          {
+            id: 5, start_t: 44.2, end_t: 50.6, note_count: 14, slur_count: 4,
+            energy_shape: 'early_peak', peak_location: 0.08, shape: 'unclassified',
+            peak_t: 44.7, melodic_contour: false,
+            intonation_stability: 'moderate', vibrato_consistency: 0,
+            selected_for: 'peaks almost immediately',
+          },
+          {
+            id: 7, start_t: 63.0, end_t: 70.2, note_count: 16, slur_count: 5,
+            energy_shape: 'late_peak', peak_location: 0.94, shape: 'unclassified',
+            peak_t: 69.8, melodic_contour: false,
+            intonation_stability: 'high', vibrato_consistency: 0,
+            selected_for: 'still growing at the phrase end',
+          },
+        ],
+        tempo: {
+          bpm_estimate: 108, intended_bpm: 120, tendency: 'dragging',
+          drift_score: 61, rubato: false,
+          regions: [{ start_t: 45.0, end_t: 49.5, direction: 'dragged', deviation_pct: 11 }],
+        },
+        moments: [
+          { t: 47.9, note: 'D5', duration_s: 1.8, level: 0.22, phrase_position: 0.58, cents_off: -8, reason: 'long note played quietly — a chance to sustain and grow' },
+        ],
+        figures: [],
+      },
+    },
+    expectAnyKeyword: ['0:44', '44', 'phrase', 'peak', 'grow'],
+    expectPhraseFeedback: 2,
+  },
   {
     name: 'tone: ponticello fault',
     issues: [toneIssue],
@@ -153,28 +237,32 @@ async function runFixture(fixture: Fixture) {
   console.log(`\n${fixture.name}`);
   let response;
   try {
-    response = await client.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+    response = await client.chat.completions.create({
+      model: COACHING_MODEL,
       max_tokens: 1500,
-      system: SYSTEM_PROMPT,
-      output_config: { format: { type: 'json_schema', schema: OUTPUT_SCHEMA } },
-      messages: [{ role: 'user', content: buildUserContent(fixture.input) }],
+      response_format: RESPONSE_FORMAT,
+      // Reasoning off — it shares the completion budget and truncates the JSON.
+      ...COACHING_EXTRA_PARAMS,
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: buildUserContent(fixture.input) },
+      ],
     } as any);
   } catch (err) {
     check('API call succeeded', false, err instanceof Error ? err.message : String(err));
     return;
   }
 
-  const textBlock = (response as any).content?.find((b: any) => b.type === 'text');
-  if (!textBlock) {
-    check('response has a text block', false);
+  const text = (response as any).choices?.[0]?.message?.content;
+  if (!text) {
+    check('response has content', false);
     return;
   }
   let data: any;
   try {
-    data = JSON.parse(textBlock.text);
+    data = JSON.parse(text);
   } catch {
-    check('response is valid JSON', false, textBlock.text.slice(0, 200));
+    check('response is valid JSON', false, String(text).slice(0, 200));
     return;
   }
 
@@ -199,6 +287,60 @@ async function runFixture(fixture: Fixture) {
       `at least one root cause merges >${fixture.expectMergedCauseOver} planted issues`,
       grounded.plan.rootCauses.some((c) => c.issueIds.length > fixture.expectMergedCauseOver!),
       JSON.stringify(grounded.plan.rootCauses.map((c) => c.issueIds)),
+    );
+  }
+
+  // ── Musicality: the checks that fail generic advice ────────────────────
+  const allText = [
+    data.summary,
+    ...(data.insights ?? []).flatMap((i: any) => [i.observation, i.feedback, i.exercise]),
+    ...(data.root_causes ?? []).flatMap((c: any) => [c.label, c.explanation]),
+    ...(data.phrase_feedback ?? []).flatMap((p: any) => [p.observation, p.tip]),
+    ...(data.blocks ?? []).flatMap((b: any) => [b.title, b.why_this_drill]),
+  ].filter(Boolean).join(' ');
+
+  // The whole point of the musical evidence payload. A response with no
+  // timestamp is, definitionally, not pointing at anything the student can hear.
+  const timestamps = allText.match(/\b\d{1,2}:\d{2}\b|\b\d+(?:\.\d+)?\s?s(?:ec|econds)?\b/g) ?? [];
+  check(
+    'response cites at least one moment in time',
+    timestamps.length > 0,
+    allText.slice(0, 200),
+  );
+
+  const banned = BANNED_GENERIC_PHRASES.filter((phrase) =>
+    allText.toLowerCase().includes(phrase.toLowerCase()),
+  );
+  check(
+    'response avoids generic filler',
+    banned.length === 0,
+    banned.join(' | '),
+  );
+
+  if (fixture.expectPhraseFeedback != null) {
+    const pf = data.phrase_feedback ?? [];
+    check(
+      `gives phrase feedback on at least ${fixture.expectPhraseFeedback} phrases`,
+      pf.length >= fixture.expectPhraseFeedback,
+      `got ${pf.length}`,
+    );
+
+    // Every entry must point at a phrase that exists, or the results UI seeks
+    // the video to a moment that has nothing to do with the advice.
+    const known = new Map(
+      (fixture.input.musicalEvidence?.phrases ?? []).map((p: any) => [p.id, p]),
+    );
+    const bad = pf.filter((f: any) => {
+      const phrase = known.get(f.phraseId);
+      if (!phrase) return true;
+      return typeof f.start_t !== 'number'
+        || f.start_t < phrase.start_t - 1
+        || f.start_t > phrase.end_t + 1;
+    });
+    check(
+      'every phrase note points at a real phrase, at its real time',
+      bad.length === 0,
+      JSON.stringify(bad).slice(0, 200),
     );
   }
 

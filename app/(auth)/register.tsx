@@ -19,6 +19,9 @@ import { useOnboardingStore } from '../../src/store/useOnboardingStore';
 import { EXPERIENCE_LEVELS } from '../../src/constants/onboardingContent';
 import { Button } from '../../src/components/ui/Button';
 import { OAuthButtons } from '../../src/components/auth/OAuthButtons';
+import { track, trackSignUp } from '../../src/services/analytics';
+import { AnalyticsEvent } from '../../src/constants/analyticsEvents';
+import { errorReason } from '../../src/lib/analyticsUserProps';
 import { colors, spacing } from '../../src/constants/theme';
 import { PRIVACY_POLICY_URL, TERMS_OF_SERVICE_URL } from '../../src/constants/links';
 
@@ -54,6 +57,7 @@ export default function Register() {
     setLoading(true);
     try {
       const data = await signUp(email.trim(), password);
+      trackSignUp('email');
       setOnboardingComplete();
 
       if (data.session) {
@@ -75,6 +79,11 @@ export default function Register() {
         );
       }
     } catch (err: any) {
+      track(AnalyticsEvent.AUTH_FAILED, {
+        stage: 'sign_up',
+        method: 'email',
+        reason: errorReason(err),
+      });
       Alert.alert('Registration Failed', err.message ?? 'Something went wrong.');
     } finally {
       setLoading(false);

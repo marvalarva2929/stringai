@@ -23,6 +23,26 @@ prepare_react_native_project!
 # Required for MediaPipeTasksVision XCFramework binary pod.
 use_frameworks! :linkage => :static
 
+# React Native Firebase resolves the Firebase Apple SDK through Swift Package
+# Manager by default, which requires dynamic frameworks — incompatible with the
+# static linkage MediaPipe forces above. Fall back to CocoaPods, matching that
+# linkage.
+#
+# Note that the RNFB pods themselves are additionally excluded from
+# use_frameworks! via ios.forceStaticLinking in Podfile.properties.json: their
+# public headers #import React Native core headers by path
+# ("React/RCTBridgeModule.h"), which clang rejects as non-modular includes once
+# the pod is a framework module, failing the build under -Werror. Expo applies
+# the same exclusion to its own pods for the same reason. Keep that list in sync
+# with the installed @react-native-firebase packages.
+$RNFirebaseDisableSPM = true
+$RNFirebaseAsStaticFramework = true
+
+# Leaving $RNFirebaseAnalyticsWithoutAdIdSupport unset installs
+# FirebaseAnalytics/IdentitySupport, so the IDFA is read once ATT is authorised
+# and paid-install attribution works. AdSupport.framework is needed for that.
+$RNFirebaseAnalyticsEnableAdSupport = true
+
 target 'StringAI' do
   use_expo_modules!
 
@@ -82,5 +102,43 @@ use_frameworks! :linkage => podfile_properties['ios.useFrameworks'].to_sym if po
       :mac_catalyst_enabled => false,
       :ccache_enabled => ccache_enabled?(podfile_properties),
     )
+  end
+
+  # React Native Firebase autolinks a build phase that uploads dSYMs to
+  # Crashlytics, and it fails the whole build when GoogleService-Info.plist is
+  # missing. That plist is not in source control, and the app is deliberately
+  # built to run without it (AppDelegate skips FirebaseApp.configure(), and
+  # services/analytics.ts reports isAnalyticsConfigured === false) — so a
+  # checkout without Firebase set up must still compile. Guard the phase rather
+  # than letting it decide that.
+  #
+  # post_integrate, not post_install: CocoaPods adds this phase to the user
+  # project during integration, which happens after post_install runs. Re-applied
+  # on every pod install, since the phase is regenerated from RNFB's
+  # react-native.config.js each time.
+  post_integrate do |installer|
+    guard = <<~SH
+      # Added by Podfile post_integrate — see docs/FIREBASE_SETUP.md
+      if [ ! -f "${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/GoogleService-Info.plist" ]; then
+        echo "warning: GoogleService-Info.plist is not in the app bundle — skipping the Crashlytics dSYM upload. Crash reports will not be symbolicated. See docs/FIREBASE_SETUP.md"
+        exit 0
+      fi
+    SH
+
+    installer.aggregate_targets.each do |aggregate_target|
+      user_project = aggregate_target.user_project
+      next if user_project.nil?
+
+      patched = false
+      user_project.native_targets.each do |native_target|
+        native_target.shell_script_build_phases.each do |phase|
+          next unless phase.name.to_s.include?('[RNFB] Crashlytics Configuration')
+          next if phase.shell_script.include?('skipping the Crashlytics dSYM upload')
+          phase.shell_script = guard + phase.shell_script
+          patched = true
+        end
+      end
+      user_project.save if patched
+    end
   end
 end

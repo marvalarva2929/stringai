@@ -1,4 +1,5 @@
 import Expo
+import FirebaseCore
 import React
 import ReactAppDependencyProvider
 
@@ -13,6 +14,17 @@ public class AppDelegate: ExpoAppDelegate {
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
   ) -> Bool {
+    // Must precede React Native startup so Crashlytics can catch crashes during
+    // launch. Guarded on the plist rather than calling configure() bare: a bare
+    // call raises when GoogleService-Info.plist is missing, and the file is not
+    // in source control. Without it the app runs normally and the JS side
+    // reports isAnalyticsConfigured === false.
+    if FirebaseApp.app() == nil,
+       let plistPath = Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist"),
+       let options = FirebaseOptions(contentsOfFile: plistPath) {
+      FirebaseApp.configure(options: options)
+    }
+
     let delegate = ReactNativeDelegate()
     let factory = ExpoReactNativeFactory(delegate: delegate)
     delegate.dependencyProvider = RCTAppDependencyProvider()

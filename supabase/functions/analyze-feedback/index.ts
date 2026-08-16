@@ -6,53 +6,25 @@
 // repair free-form JSON.
 //
 // Deploy:  supabase functions deploy analyze-feedback
-// Secret:  supabase secrets set ANTHROPIC_API_KEY=sk-ant-...
+// Secret:  supabase secrets set HF_TOKEN=hf_...
 //
 // JWT verification is on by default, so only authenticated app users reach this
-// handler. Claude coaching is a Pro feature, so before spending any tokens we
-// check the caller's entitlement and return 402 to free users. Without this,
-// any signed-in account could call Claude without limit on our API key.
+// handler. AI coaching is a Pro feature, so before spending any tokens we check
+// the caller's entitlement and return 402 to free users. Without this, any
+// signed-in account could spend inference credits on our token.
 
-import Anthropic from 'npm:@anthropic-ai/sdk';
-import { createClient } from 'npm:@supabase/supabase-js@2';
-import { OUTPUT_SCHEMA, SYSTEM_PROMPT, buildUserContent, type CoachingInput } from '../_shared/coachingPrompt.ts';
-
-/**
- * Resolves the caller's entitlement from their JWT. Uses the service-role key
- * so the lookup isn't subject to the profiles RLS policy, and reads the token
- * from the request rather than trusting anything in the body.
- *
- * Returns 'free' whenever the caller can't be established — failing closed
- * means a misconfigured env var costs us a 402, not an unmetered Claude bill.
- */
-async function callerIsPro(req: Request): Promise<boolean> {
-  const jwt = req.headers.get('Authorization')?.replace(/^Bearer\s+/i, '');
-  if (!jwt) return false;
-
-  const url = Deno.env.get('SUPABASE_URL');
-  const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
-  if (!url || !serviceKey) return false;
-
-  const admin = createClient(url, serviceKey, { auth: { persistSession: false } });
-
-  const { data: userData, error: userErr } = await admin.auth.getUser(jwt);
-  if (userErr || !userData.user) return false;
-
-  const { data: profile, error: profileErr } = await admin
-    .from('profiles')
-    .select('entitlement, entitlement_expires_at')
-    .eq('id', userData.user.id)
-    .single();
-  if (profileErr || !profile) return false;
-
-  if (profile.entitlement !== 'pro') return false;
-
-  // An expired row is free until the RevenueCat webhook catches up.
-  if (profile.entitlement_expires_at && new Date(profile.entitlement_expires_at) <= new Date()) {
-    return false;
-  }
-  return true;
-}
+import OpenAI from 'npm:openai';
+import { resolveProCaller } from '../_shared/caller.ts';
+import { loadRecentChat } from '../_shared/loadCoachContext.ts';
+import {
+  COACHING_BASE_URL,
+  COACHING_MODEL,
+  COACHING_EXTRA_PARAMS,
+  RESPONSE_FORMAT,
+  SYSTEM_PROMPT,
+  buildUserContent,
+  type CoachingInput,
+} from '../_shared/coachingPrompt.ts';
 
 Deno.serve(async (req: Request) => {
   if (req.method !== 'POST') {
@@ -62,7 +34,8 @@ Deno.serve(async (req: Request) => {
   // Entitlement first: never build the prompt, never call Claude, for a free
   // user. The client treats 402 as "keep the local template feedback" and shows
   // no error, since free users hit this on every session by design.
-  if (!(await callerIsPro(req))) {
+  const caller = await resolveProCaller(req);
+  if (!caller) {
     return new Response(JSON.stringify({ error: 'entitlement_required' }), {
       status: 402,
       headers: { 'content-type': 'application/json' },
@@ -79,29 +52,48 @@ Deno.serve(async (req: Request) => {
     return new Response(JSON.stringify({ error: 'metrics required' }), { status: 400 });
   }
 
-  const client = new Anthropic({ apiKey: Deno.env.get('ANTHROPIC_API_KEY') });
-  const userContent = buildUserContent(input);
+  const client = new OpenAI({
+    baseURL: COACHING_BASE_URL,
+    apiKey: Deno.env.get('HF_TOKEN'),
+  });
+  // What the student has been asking about is evidence the measurements can't
+  // capture — "my shoulder aches", "I can't hear the difference". Loaded here
+  // rather than sent by the client so it cannot be forged.
+  const recentChat = await loadRecentChat(caller.admin, caller.userId).catch(() => []);
+  const userContent = buildUserContent({ ...input, recentChat });
 
   try {
-    const response = await client.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+    const response = await client.chat.completions.create({
+      model: COACHING_MODEL,
       max_tokens: 1500,
-      system: SYSTEM_PROMPT,
-      output_config: { format: { type: 'json_schema', schema: OUTPUT_SCHEMA } },
-      messages: [{ role: 'user', content: userContent }],
+      response_format: RESPONSE_FORMAT,
+      // Reasoning off — it shares the completion budget and truncates the JSON.
+      ...COACHING_EXTRA_PARAMS,
+      messages: [
+        // OpenAI-style: the system prompt is the first message rather than a
+        // top-level field.
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: userContent },
+      ],
     });
 
-    if (response.stop_reason === 'refusal' || response.stop_reason === 'max_tokens') {
-      return new Response(JSON.stringify({ error: `generation stopped: ${response.stop_reason}` }), { status: 502 });
+    const choice = response.choices?.[0];
+    // 'length' means the JSON was cut mid-structure — schema-invalid however
+    // strict the mode, so fail rather than hand the client a broken object.
+    if (choice?.finish_reason === 'length') {
+      return new Response(JSON.stringify({ error: 'generation stopped: max_tokens' }), { status: 502 });
+    }
+    if (choice?.message?.refusal) {
+      return new Response(JSON.stringify({ error: 'generation refused' }), { status: 502 });
     }
 
-    const textBlock = response.content.find((b) => b.type === 'text');
-    if (!textBlock || textBlock.type !== 'text') {
+    const text = choice?.message?.content;
+    if (!text) {
       return new Response(JSON.stringify({ error: 'empty model response' }), { status: 502 });
     }
 
-    // Structured outputs guarantee schema-valid JSON in the text block
-    return new Response(textBlock.text, {
+    // Structured outputs guarantee schema-valid JSON in the message content
+    return new Response(text, {
       headers: { 'content-type': 'application/json' },
     });
   } catch (err) {

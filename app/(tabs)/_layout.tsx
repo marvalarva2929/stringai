@@ -12,8 +12,6 @@ import Animated, {
 import * as Haptics from 'expo-haptics';
 import { colors } from '../../src/constants/theme';
 import { useAnalysisStore } from '../../src/store/useAnalysisStore';
-import { useEntitlementStore } from '../../src/store/useEntitlementStore';
-import { isPro } from '../../src/lib/entitlements';
 
 type TabDef = {
   name: string;
@@ -42,13 +40,12 @@ const TABS: TabDef[] = [
     ),
   },
   {
+    // Kept under its original route name so the tab count (and the centred +
+    // button's 2/2 split) stays stable. It is the chat entry point now — see
+    // renderRoute, which pushes /chat as a modal rather than focusing a tab.
     name: 'subscription',
-    renderIcon: (focused) => (
-      <Octicons
-        name="star-fill"
-        size={22}
-        color={focused ? colors.brand[600] : colors.muted}
-      />
+    renderIcon: () => (
+      <Ionicons name="chatbubble-ellipses-outline" size={22} color={colors.muted} />
     ),
   },
   {
@@ -131,7 +128,6 @@ function CustomTabBar({
   descriptors: any;
 }) {
   const insets = useSafeAreaInsets();
-  const subscribed = isPro(useEntitlementStore((s) => s.entitlement));
 
   // Respect tabBarStyle: { display: 'none' } set by individual screens
   const currentRoute = state.routes[state.index];
@@ -141,8 +137,8 @@ function CustomTabBar({
   // 'analyze' has its own center + button; 'train' is reached from the home
   // screen's practice-plan card, not a tab button. Both stay registered
   // routes (navigable), just not buttons here. That keeps the visible count
-  // fixed at 4 in every entitlement state, so an even 2/2 split always
-  // centers the + button — no spacer hacks needed.
+  // fixed at 4, so an even 2/2 split always centers the + button — no spacer
+  // hacks needed.
   const visibleRoutes = state.routes.filter(
     (r: any) => r.name !== 'analyze' && r.name !== 'train',
   );
@@ -153,23 +149,21 @@ function CustomTabBar({
   const renderRoute = (route: any) => {
     const isFocused = state.routes[state.index].name === route.name;
 
-    // The subscribe star doubles as the chat entry point once a user is
-    // Pro — there's nothing left to upsell them on, so the slot is repurposed
-    // rather than left empty or permanently hidden.
-    if (route.name === 'subscription' && subscribed) {
+    // Everyone in the app is a subscriber, so this slot — once the subscribe
+    // star — is permanently the chat entry point. Chat is a modal, so the tab
+    // itself never takes focus.
+    if (route.name === 'subscription') {
       return (
         <TabButton
           key={route.key}
           routeName={route.name}
           isFocused={false}
           onPress={() => router.push('/chat')}
-          iconOverride={() => <Ionicons name="chatbubble-ellipses-outline" size={22} color={colors.muted} />}
         />
       );
     }
 
     const onPress = () => {
-      if (route.name === 'subscription') { router.push('/paywall'); return; }
       if (!isFocused) navigation.navigate(route.name);
     };
     return <TabButton key={route.key} routeName={route.name} isFocused={isFocused} onPress={onPress} />;

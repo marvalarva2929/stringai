@@ -14,6 +14,7 @@
 
 import { Platform } from 'react-native';
 import Purchases, {
+  INTRO_ELIGIBILITY_STATUS,
   LOG_LEVEL,
   type CustomerInfo,
   type PurchasesOffering,
@@ -52,6 +53,22 @@ export async function identifyPurchaser(userId: string): Promise<CustomerInfo | 
   if (!configured) return null;
   const { customerInfo } = await Purchases.logIn(userId);
   return customerInfo;
+}
+
+/**
+ * Required by the RevenueCat → Firebase integration: without this subscriber
+ * attribute, RevenueCat cannot match a customer to a GA4 user, and the
+ * server-side subscription lifecycle events (renewal, cancellation, billing
+ * issue, refund) never arrive. Those are the only source of churn data, since
+ * they happen when the app is closed.
+ */
+export async function setFirebaseAppInstanceId(appInstanceId: string | null): Promise<void> {
+  if (!configured || !appInstanceId) return;
+  try {
+    await Purchases.setFirebaseAppInstanceID(appInstanceId);
+  } catch {
+    // Attribute writes are best-effort; a failure only costs attribution.
+  }
 }
 
 /** Returns RevenueCat to an anonymous id so the next user starts clean. */
@@ -93,6 +110,35 @@ export async function purchasePackage(pkg: PurchasesPackage): Promise<CustomerIn
 export async function restorePurchases(): Promise<CustomerInfo | null> {
   if (!configured) throw new Error('Purchases are unavailable on this build.');
   return Purchases.restorePurchases();
+}
+
+/**
+ * Which of the given products the user can actually start a free trial on.
+ *
+ * Apple grants one introductory offer per *subscription group*, not per
+ * product, so a user who already took the monthly plan's 7-day trial is
+ * ineligible for the annual plan's 14-day one. A product's `introPrice` is the
+ * offer definition and is present either way — advertising a trial off that
+ * alone would promise something the App Store then charges for immediately.
+ *
+ * iOS-only: Android always reports UNKNOWN. Anything other than a definite
+ * ELIGIBLE is treated as not eligible, per RevenueCat's own guidance to show
+ * non-intro pricing rather than risk a misleading claim.
+ *
+ * Returns the set of eligible product identifiers; empty on any failure.
+ */
+export async function checkTrialEligibility(productIds: string[]): Promise<Set<string>> {
+  if (!configured || productIds.length === 0) return new Set();
+  try {
+    const result = await Purchases.checkTrialOrIntroductoryPriceEligibility(productIds);
+    return new Set(
+      Object.entries(result)
+        .filter(([, e]) => e.status === INTRO_ELIGIBILITY_STATUS.INTRO_ELIGIBILITY_STATUS_ELIGIBLE)
+        .map(([productId]) => productId),
+    );
+  } catch {
+    return new Set();
+  }
 }
 
 /**

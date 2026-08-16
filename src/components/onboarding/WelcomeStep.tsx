@@ -12,9 +12,34 @@ import { colors, spacing, radius } from '../../constants/theme';
 import { STEP_COPY } from '../../constants/onboardingContent';
 import { haptic } from '../../lib/haptics';
 
-// The very first thing a new user sees: a full-bleed hero photo, the app
-// name, and one button. Everything else about the app is sold across the
-// steps that follow — this screen's only job is to feel good for two seconds.
+/**
+ * TODO(welcome-video): swap the hero photo for a ~15s clip of the developer.
+ *
+ * The install is sold by organic video in the developer's own voice, and then
+ * the app opens on stock-looking photography by someone the viewer has never
+ * seen. Closing that gap costs nothing and is the one thing a competitor
+ * cannot copy — continuity between the person who sold the install and the
+ * first screen of the product.
+ *
+ * To land it:
+ *   1. Drop the file at assets/onboarding/welcome-hero.mp4 and replace the
+ *      ImageBackground below with it, keeping the photo as the poster frame so
+ *      the first paint is never blank.
+ *   2. `expo-av` is already a dependency — use <Video> with isMuted, isLooping,
+ *      shouldPlay, resizeMode="cover". Autoplay must be muted or iOS silently
+ *      refuses to start it; offer tap-to-unmute rather than opening with sound.
+ *   3. Keep it bundled locally, not streamed — this is the first screen of a
+ *      cold launch and must not wait on a network.
+ *   4. Watch the binary. Fifteen seconds of 1080p H.264 at a sane bitrate is
+ *      ~2-4MB; anything much past that is worth re-encoding.
+ *
+ * The scrims and text block below sit on top either way, so only the background
+ * element changes.
+ */
+
+// The very first thing a new user sees: a full-bleed hero, the app name, and
+// one button. Everything else about the app is sold across the steps that
+// follow — this screen's only job is to feel good for two seconds.
 export function WelcomeStep({ onNext }: { onNext: () => void }) {
   const insets = useSafeAreaInsets();
 

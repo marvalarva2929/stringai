@@ -1,6 +1,7 @@
 import React from 'react';
 import { View, Text, StyleSheet, SafeAreaView } from 'react-native';
 import { colors, spacing } from '../../constants/theme';
+import { reportError } from '../../services/crashReporting';
 import { Button } from './Button';
 
 const styles = StyleSheet.create({
@@ -42,6 +43,12 @@ export class ErrorBoundary extends React.Component<Props, State> {
   }
 
   componentDidCatch(error: Error, info: React.ErrorInfo) {
+    // A render crash here replaces the whole app with this screen, so it is the
+    // most severe non-fatal the app can produce — always reported, unlike the
+    // dev-only console log below.
+    reportError(error, 'render', {
+      component_stack: info.componentStack?.slice(0, 400) ?? undefined,
+    });
     if (__DEV__) {
       console.error('Unhandled error caught by ErrorBoundary:', error, info.componentStack);
     }

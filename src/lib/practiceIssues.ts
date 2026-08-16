@@ -1,7 +1,7 @@
 import type { AnalysisResult } from '../types/analysis';
 import type { MetricHistoryEntry } from '../store/useAnalysisStore';
 import type { PracticeEvidence } from './practiceEvidence';
-import { buildSessionEvidence } from './practiceEvidence';
+import { sessionEvidenceFor, withoutStaleEvidence } from './practiceEvidence';
 
 // ─────────────────────────────────────────────────────────────
 // Issue query layer (Phase 1.2 / 1.4)
@@ -48,7 +48,7 @@ export function collectIssueSources(input: CollectIssueSourcesInput): IssueSourc
 
   for (const session of input.recentSessions ?? []) {
     if (byId.has(session.sessionId)) continue;
-    const evidence = session.sessionEvidence ?? buildSessionEvidence(session);
+    const evidence = sessionEvidenceFor(session);
     if (evidence.length === 0) continue;
     byId.set(session.sessionId, {
       sessionId: session.sessionId,
@@ -60,11 +60,15 @@ export function collectIssueSources(input: CollectIssueSourcesInput): IssueSourc
 
   for (const entry of input.metricHistory ?? []) {
     if (byId.has(entry.sessionId) || !entry.evidence?.length) continue;
+    // History has no raw material left, so stale findings can't be recomputed
+    // — only kept or dropped. A wrong claim is worse than a missing one.
+    const evidence = withoutStaleEvidence(entry.evidence, entry.evidenceVersion);
+    if (evidence.length === 0) continue;
     byId.set(entry.sessionId, {
       sessionId: entry.sessionId,
       recordedAt: entry.recordedAt,
       pieceId: entry.pieceId,
-      evidence: entry.evidence,
+      evidence,
     });
   }
 

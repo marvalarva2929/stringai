@@ -9,7 +9,19 @@ export interface PracticeRankingOptions {
   playerCategory?: PlayerCategory | null;
 }
 
+// Musical moments sit above the bare pitch-class finding they usually subsume.
+// "C# was flat 4 of 9 times" and "the G arpeggio kept landing under the third"
+// can describe the very same notes; the second is the better thing to practise,
+// and it comes with a drill that has actual notes in it. A moment only reaches
+// this tier when it carries a measured contrast — priority, computed in
+// musicalMoments.ts, is where an uncorroborated one loses ground.
 const KIND_BASE: Record<PracticeEvidenceKind, number> = {
+  figure_crossing: 132,
+  figure_shift: 130,
+  figure_intonation: 128,
+  figure_sequence: 126,
+  figure_speed: 124,
+  figure_ornament: 118,
   pitch_note: 120,
   pitch_tendency: 112,
   intonation_stability: 106,
@@ -37,6 +49,9 @@ const REFINEMENT_KINDS = new Set<PracticeEvidenceKind>([
   'vibrato',
   'bow_pattern',
   'pitch_tendency',
+  'figure_sequence',
+  'figure_ornament',
+  'figure_speed',
 ]);
 
 export function rankPracticeEvidence(

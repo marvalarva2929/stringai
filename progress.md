@@ -5,9 +5,11 @@
 > (`analyze-feedback`, `session-chat`, `delete-account`, `revenuecat-webhook`)
 > are complete, production-quality implementations — not stubs — and just need
 > `supabase functions deploy` run against the live project. The bow ML model has
-> since been trained (see `ml/cloud/pipeline_summary.json`). The paywall
-> (`app/paywall.tsx`) is a live screen, not commented out. Treat the rest of
-> this doc as historical context rather than current status.
+> since been trained (see `ml/cloud/pipeline_summary.json`). The app is now
+> subscription-only: `SubscribeGate` renders a mandatory paywall over the
+> navigator once activation ends, and the free tier (daily analysis quota,
+> per-feature locks) has been removed entirely. Treat the rest of this doc as
+> historical context rather than current status.
 
 ## Current Status: Bow ML Pipeline — Critical Path to Full L1-L10 Analysis
 
@@ -27,7 +29,7 @@
 | Routing | Expo Router (file-based) |
 | State | Zustand (+ persist middleware with AsyncStorage) |
 | Backend | Supabase (Postgres + Auth + Storage + Edge Functions) — written, not yet connected |
-| Payments | RevenueCat — wired, paywall commented out |
+| Payments | RevenueCat — subscription-only; mandatory paywall after activation |
 | Audio DSP | Custom on-device pipeline in `audioEngine.ts` |
 | Video | Native iOS `VideoAudioExtractor` module (AVFoundation) |
 | CV / Pose | Apple Vision (in `PoseCameraModule.swift`) — working for pose; bow detector pending |
@@ -112,7 +114,7 @@
 
 ### Foundation
 - [x] Expo + Expo Router project scaffolded (TypeScript, Zustand, NativeWind)
-- [x] Navigation: `(auth)` group, `(tabs)` group, `paywall` modal, root auth gate
+- [x] Navigation: `(auth)` group, `(tabs)` group, root auth gate, subscribe gate over the navigator
 - [x] Onboarding flow — 5-slide carousel
 - [x] Login + Register screens (UI complete, Supabase auth code written)
 - [x] Core UI components: Button, Card, ScoreGauge, MetricCard, AnalysisTimeline
@@ -521,7 +523,6 @@ Results screen (analyze.tsx or session/[id].tsx)
 - Real-time feedback overlay during recording (Phase 10)
 - Session chat with tool-use (Phase 16)
 - Android audio extraction
-- RevenueCat paywall (commented out)
 - YIN hop size 50ms → 25ms (planned Jun 21 alongside other audio improvements)
 - `sessionResultCache` for sessions from previous app runs (clears on restart; Supabase backfill will fix this)
 

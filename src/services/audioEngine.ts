@@ -547,247 +547,25 @@ function scoreDynamicControl(rms: Float32Array, hopSize: number, sampleRate: num
   const score = clamp(Math.round(0.30 * jitterScore + 0.35 * rangeScore + 0.35 * shapeScore));
   const occurrenceRate = 1 - score / 100;
 
-  // ─── 4. Phrase segmentation (for event detection) ───────────────────────
-  // Tune these constants against real recordings — all keyed to hopS so they
-  // stay correct regardless of hop size.
-  const SILENCE_GATE   = 0.015;
-  const SILENCE_FRAMES = Math.max(10, Math.round(0.30 / hopS)); // 300ms gap = phrase break
-  const MIN_PH_FRAMES  = Math.max(30, Math.round(3.0  / hopS)); // skip phrases < 3s
-  const FLAT_CV2       = 0.004;  // stricter: only truly monotone phrases flagged
-  const INV_SLOPE_NORM = -0.20;  // normalized slope threshold for falling classification
-  const RISING_SLOPE   = 0.15;   // normalized slope threshold for rising classification
-  const PEAK_EARLY     = 0.15;   // tightened: sforzando-like attack (28% was too aggressive)
-  const PEAK_LATE      = 0.82;   // peak in last 18% with positive slope = late swell
-  const CONSEC_FALLING = 3;      // flag dyn_inverted only after this many consecutive falling phrases
-  const MAX_EVENTS     = 5;
+  // ─── 4. Per-phrase shaping moved to lib/dynamicsShape.ts ─────────────────
+  // This used to run a private phrase segmentation (gate 0.015, min 3s, no
+  // subdivision) that disagreed with L6 in noteFusion.ts — so a shape
+  // observation could not be tied to a phrase id the results UI seeks with,
+  // and phrases under 3s had no shaping data at all.
+  //
+  // The score above is unaffected: jitter, range and the sliding-2s-window R²
+  // are all phrase-independent. Only event detection moved, and it now runs in
+  // sessionPipeline once the L6 phrases exist (they need bow speed, which is
+  // not available this early). sessionPipeline patches the events,
+  // flaggedTimestamps and observationSummary onto this metric.
 
-  const phrases: { start: number; end: number }[] = [];
-  let inPhrase = false, pStart = 0, silCnt = 0;
-  for (let i = 0; i <= rms.length; i++) {
-    const active = i < rms.length && rms[i] > SILENCE_GATE;
-    if (active) {
-      if (!inPhrase) { inPhrase = true; pStart = i; }
-      silCnt = 0;
-    } else if (inPhrase) {
-      silCnt++;
-      if (silCnt >= SILENCE_FRAMES || i === rms.length) {
-        const pEnd = i === rms.length ? i - 1 : i - silCnt;
-        if (pEnd - pStart >= MIN_PH_FRAMES) phrases.push({ start: pStart, end: pEnd });
-        inPhrase = false; silCnt = 0;
-      }
-    }
-  }
-
-  // ─── 5. Shape classifier ─────────────────────────────────────────────────
-  // Classifies each phrase into a musical shape before deciding whether to flag.
-  // Rising and falling are both valid choices — only truly shapeless or
-  // unexpectedly-shaped phrases get flagged.
-  function classifyPhraseShape(cv2: number, slopeNorm: number, peakPos: number): PhraseShape {
-    if (cv2 < FLAT_CV2) return 'plateau';
-    if (slopeNorm >= RISING_SLOPE && peakPos > 0.55) return 'rising';
-    if (slopeNorm <= INV_SLOPE_NORM && peakPos < 0.45) return 'falling';
-    if (peakPos >= 0.20 && peakPos <= 0.80) return 'arch';
-    return 'unclassified';
-  }
-
-  // Compute linear slope of pitch (cents) over a phrase for melodic contour correlation.
-  // Returns positive if pitch trends up, negative if pitch trends down, null if no data.
-  function phrasePitchSlope(startSec: number, endSec: number): number | null {
-    if (!pitchFrames) return null;
-    const frames = pitchFrames.filter(p => p.frequency !== null && p.timestamp >= startSec && p.timestamp <= endSec);
-    if (frames.length < 4) return null;
-    const cents = frames.map(p => 1200 * Math.log2(p.frequency! / 440));
-    const n = cents.length;
-    let sx = 0, sy = 0, sxy = 0, sx2 = 0;
-    for (let j = 0; j < n; j++) { sx += j; sy += cents[j]; sxy += j * cents[j]; sx2 += j * j; }
-    const den = n * sx2 - sx * sx;
-    return den !== 0 ? (n * sxy - sx * sy) / den : null;
-  }
-
-  // ─── 6. Issue detection ──────────────────────────────────────────────────
-  interface DynIssue { type: string; startSec: number; endSec: number; note: string; confidence: number; }
-  const issues: DynIssue[] = [];
-  const fmtT = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
-
-  // Per-phrase debug rows — populated inside the phrase loop below
-  const phraseDebugRows: DynPhraseDebug[] = [];
-
-  // A3: Narrow dynamic range (objective — never suppressed)
-  if (dynamicRatio < 2.5) {
-    const conf = 1 - Math.max(0, dynamicRatio - 1.0) / (2.5 - 1.0);
-    const r = dynamicRatio.toFixed(1);
-    issues.push({
-      type: 'dyn_narrow_range', startSec: 0, endSec: rms.length * hopS, confidence: conf,
-      note: dynamicRatio < 2.0
-        ? `Dynamic range is very narrow (${r}× contrast) — try using a full, heavy bow for forte and a light touch for piano. Aim for 5× or more.`
-        : `Dynamic range is limited (${r}× contrast) — push the contrast between your softest and loudest moments.`,
-    });
-  }
-
-  // B-types: per-phrase shape analysis
-  const flatPhrases: { startSec: number; endSec: number }[] = [];
-  let consecutiveFalling = 0;
-  let fallingRunStart = -1;
-
-  for (const phrase of phrases) {
-    const arr = Array.from(slowRms).slice(phrase.start, phrase.end + 1);
-    const n = arr.length;
-    if (n < 4) continue;
-
-    const mean = arr.reduce((a, b) => a + b, 0) / n;
-    const variance = arr.reduce((a, v) => a + (v - mean) ** 2, 0) / n;
-    const cv2 = variance / (mean * mean + 1e-10);
-
-    const pMax = Math.max(...arr);
-    const pMin = Math.min(...arr);
-    const range = pMax - pMin;
-
-    let sx = 0, sy = 0, sxy = 0, sx2 = 0;
-    for (let j = 0; j < n; j++) { sx += j; sy += arr[j]; sxy += j * arr[j]; sx2 += j * j; }
-    const den = n * sx2 - sx * sx;
-    const rawSlope = den !== 0 ? (n * sxy - sx * sy) / den : 0;
-    const slopeNorm = rawSlope * n / (range + 1e-8);
-
-    let peakIdx = 0;
-    for (let j = 1; j < n; j++) { if (arr[j] > arr[peakIdx]) peakIdx = j; }
-    const peakPos = peakIdx / (n - 1);
-
-    const startSec = phrase.start * hopS;
-    const endSec   = phrase.end   * hopS;
-
-    // Classify shape, then apply melodic-contour correction
-    let shape = classifyPhraseShape(cv2, slopeNorm, peakPos);
-
-    // If both RMS and pitch trend in the same direction, it's melodic contour — no flag
-    const pitchSlope = phrasePitchSlope(startSec, endSec);
-    if (pitchSlope !== null && shape !== 'plateau') {
-      const rmsDir = rawSlope > 0 ? 1 : rawSlope < 0 ? -1 : 0;
-      const pitchDir = pitchSlope > 50 ? 1 : pitchSlope < -50 ? -1 : 0; // >50 cents/frame = clear trend
-      if (rmsDir !== 0 && rmsDir === pitchDir) shape = 'melodic_contour';
-    }
-
-    // Reset or advance the consecutive-falling counter
-    if (shape === 'falling') {
-      consecutiveFalling++;
-      if (consecutiveFalling === 1) fallingRunStart = startSec;
-    } else {
-      consecutiveFalling = 0;
-      fallingRunStart = -1;
-    }
-
-    // Issue rules by shape
-    if (shape === 'plateau') {
-      // Flat — flag it
-      phraseDebugRows.push({ startSec, endSec, durS: endSec - startSec, cv2, slopeNorm, peakPos, shape, issue: 'dyn_flat_phrase', confidence: 0.40 + 0.1 * flatPhrases.length });
-      flatPhrases.push({ startSec, endSec });
-
-    } else if (shape === 'falling') {
-      // Single falling phrase → valid diminuendo, no flag; 3+ in a row → flag the run
-      const debugIssue = consecutiveFalling >= CONSEC_FALLING ? 'dyn_inverted_phrase' : undefined;
-      phraseDebugRows.push({ startSec, endSec, durS: endSec - startSec, cv2, slopeNorm, peakPos, shape, issue: debugIssue });
-      if (consecutiveFalling === CONSEC_FALLING) {
-        const conf = Math.min(1, 0.50 + (consecutiveFalling - CONSEC_FALLING) * 0.15);
-        issues.push({
-          type: 'dyn_inverted_phrase',
-          startSec: fallingRunStart,
-          endSec,
-          confidence: conf,
-          note: `${consecutiveFalling} phrases in a row are fading out — at ${fmtT(fallingRunStart)}, try letting at least one phrase build or hold steady.`,
-        });
-      }
-
-    } else if (shape === 'rising' || shape === 'arch' || shape === 'melodic_contour') {
-      // All valid — never flag shape issues
-      phraseDebugRows.push({ startSec, endSec, durS: endSec - startSec, cv2, slopeNorm, peakPos, shape });
-
-    } else {
-      // unclassified — apply tightened peak thresholds
-      if (peakPos < PEAK_EARLY) {
-        const conf = Math.min(1, (PEAK_EARLY - peakPos) / PEAK_EARLY * 1.5);
-        if (conf >= 0.3) {
-          const peakSec = (phrase.start + peakIdx) * hopS;
-          phraseDebugRows.push({ startSec, endSec, durS: endSec - startSec, cv2, slopeNorm, peakPos, shape, issue: 'dyn_peak_early', confidence: conf });
-          issues.push({
-            type: 'dyn_peak_early', startSec, endSec, confidence: conf,
-            note: `At ${fmtT(startSec)}, you peaked at ${fmtT(peakSec)} — very early in the phrase. Save the climax for later.`,
-          });
-        } else {
-          phraseDebugRows.push({ startSec, endSec, durS: endSec - startSec, cv2, slopeNorm, peakPos, shape });
-        }
-      } else if (peakPos > PEAK_LATE && slopeNorm > 0.1) {
-        const conf = Math.min(1, (peakPos - PEAK_LATE) / (1 - PEAK_LATE) * 1.5);
-        if (conf >= 0.3) {
-          phraseDebugRows.push({ startSec, endSec, durS: endSec - startSec, cv2, slopeNorm, peakPos, shape, issue: 'dyn_peak_late', confidence: conf });
-          issues.push({
-            type: 'dyn_peak_late', startSec, endSec, confidence: conf,
-            note: `At ${fmtT(startSec)}, volume keeps building right to the end of the phrase at ${fmtT(endSec)} — try leveling off earlier.`,
-          });
-        } else {
-          phraseDebugRows.push({ startSec, endSec, durS: endSec - startSec, cv2, slopeNorm, peakPos, shape });
-        }
-      } else {
-        phraseDebugRows.push({ startSec, endSec, durS: endSec - startSec, cv2, slopeNorm, peakPos, shape });
-      }
-    }
-  }
-
-  // Aggregate flat phrases into events
-  if (flatPhrases.length >= 3) {
-    issues.push({
-      type: 'dyn_flat_phrases',
-      startSec: flatPhrases[0].startSec,
-      endSec:   flatPhrases[flatPhrases.length - 1].endSec,
-      confidence: Math.min(1, flatPhrases.length / 4),
-      note: `${flatPhrases.length} phrases in a row sound flat in volume — try adding shape to each phrase: build toward a peak or taper at the end.`,
-    });
-  } else {
-    for (const fp of flatPhrases) {
-      issues.push({
-        type: 'dyn_flat_phrase', startSec: fp.startSec, endSec: fp.endSec,
-        confidence: 0.40 + 0.1 * flatPhrases.length,
-        note: `The phrase at ${fmtT(fp.startSec)}–${fmtT(fp.endSec)} sounds flat in volume — add shape by building toward a peak or tapering at the end.`,
-      });
-    }
-  }
-
-  // D2: Session-wide volume fade (linear regression over phrase means)
-  if (phrases.length >= 4) {
-    const phraseMeans = phrases.map(p => {
-      const sl = Array.from(slowRms).slice(p.start, p.end + 1).filter(v => v > SILENCE_GATE);
-      return sl.length > 0 ? sl.reduce((a, b) => a + b, 0) / sl.length : 0;
-    });
-    const pn = phraseMeans.length;
-    let px = 0, py = 0, pxy = 0, px2 = 0;
-    for (let i = 0; i < pn; i++) { px += i; py += phraseMeans[i]; pxy += i * phraseMeans[i]; px2 += i * i; }
-    const pDen = pn * px2 - px * px;
-    if (pDen !== 0) {
-      const pSlope = (pn * pxy - px * py) / pDen;
-      const normSlope = pSlope / (py / pn + 1e-10);
-      if (normSlope < -0.04) {
-        issues.push({
-          type: 'dyn_fade_over_session', startSec: 0, endSec: rms.length * hopS,
-          confidence: Math.min(1, Math.abs(normSlope) / 0.08),
-          note: 'Your volume gradually fades over the session — stay physically engaged and keep bow arm energy in the second half.',
-        });
-      }
-    }
-  }
-
-  // ─── 6. Rank, filter, cap ────────────────────────────────────────────────
-  const allIssuesBeforeFilter = [...issues];
-  const ranked = issues
-    .filter(e => e.confidence >= 0.30)
-    .sort((a, b) => b.confidence - a.confidence)
-    .slice(0, MAX_EVENTS);
-
-  // ─── 7. Specific observationSummary from top issue ───────────────────────
-  const observationSummary = ranked.length > 0
-    ? ranked[0].note
-    : score >= 78
-      ? 'Good dynamic control — clear and deliberate volume shaping throughout.'
-      : jitterScore < 50
-        ? 'Bow arm tension is causing erratic volume — focus on a smooth, relaxed bow stroke.'
-        : 'Dynamics were relatively flat — work on deliberate phrase arcs (louder at the peak, softer at the end).';
+  // ─── 7. Session-level fallback summary ───────────────────────────────────
+  // Replaced by sessionPipeline with the top phrase issue when one fires.
+  const observationSummary = score >= 78
+    ? 'Good dynamic control — clear and deliberate volume shaping throughout.'
+    : jitterScore < 50
+      ? 'Bow arm tension is causing erratic volume — focus on a smooth, relaxed bow stroke.'
+      : 'Dynamics were relatively flat — work on deliberate phrase arcs (louder at the peak, softer at the end).';
 
   // ─── 8. timeSeries: normalized slow envelope for waveform rendering ──────
   const sessionMax = Math.max(...Array.from(rms));
@@ -796,38 +574,30 @@ function scoreDynamicControl(rms: Float32Array, hopSize: number, sampleRate: num
     v: Math.min(1, v / (sessionMax + 1e-10)),
   }));
 
-  // ─── 9. Debug payload ────────────────────────────────────────────────────
+  // ─── 9. Debug payload — phrase rows are filled in by sessionPipeline ─────
   const _dynDebug: DynDebugInfo = {
     dynamicRatio, maxSlow, minSlow, jitterScore, rangeScore, shapeScore, score,
-    phrases: phraseDebugRows,
-    allIssues: allIssuesBeforeFilter.map(e => ({ type: e.type, startSec: e.startSec, endSec: e.endSec, confidence: e.confidence, note: e.note })),
-    ranked: ranked.map(e => ({ type: e.type, confidence: e.confidence })),
+    phrases: [],
+    allIssues: [],
+    ranked: [],
   };
 
   if (__DEV__) {
     const fmtN = (n: number, d = 3) => n.toFixed(d);
+    // Per-phrase rows are logged by sessionPipeline, which owns them now.
     console.log(
       `\n[DYN DEBUG] ratio=${fmtN(dynamicRatio, 2)}× max=${fmtN(maxSlow)} min=${fmtN(minSlow)}` +
-      `  jitter=${jitterScore} range=${rangeScore} shape=${shapeScore} → score=${score}` +
-      `  thresholds: FLAT_CV2=${FLAT_CV2} INV_SLOPE=${INV_SLOPE_NORM} PEAK_E=${PEAK_EARLY} PEAK_L=${PEAK_LATE}\n` +
-      `  Phrases (${phraseDebugRows.length}):\n` +
-      phraseDebugRows.map((p, i) =>
-        `    #${i + 1}  ${fmtT(p.startSec)}–${fmtT(p.endSec)}  ${fmtN(p.durS, 1)}s` +
-        `  cv²=${fmtN(p.cv2)}  slope=${fmtN(p.slopeNorm)}  peak@${fmtN(p.peakPos)}  [${p.shape}]` +
-        (p.issue ? `  → ${p.issue} (conf=${fmtN(p.confidence ?? 0)})` : '  → ok')
-      ).join('\n') +
-      `\n  All issues (${allIssuesBeforeFilter.length}):\n` +
-      allIssuesBeforeFilter.map(e => `    ${e.type}  ${fmtT(e.startSec)}  conf=${fmtN(e.confidence)}`).join('\n') +
-      `\n  Ranked output (${ranked.length}): ${ranked.map(e => e.type).join(', ') || 'none'}\n`
+      `  jitter=${jitterScore} range=${rangeScore} shape=${shapeScore} → score=${score}\n`
     );
   }
 
   return {
     key: 'dynamicControl',
     score,
-    flaggedTimestamps: ranked.map(e => ({ startSeconds: e.startSec, endSeconds: e.endSec, note: e.note })),
+    // Filled in by sessionPipeline from the L6 phrase analysis.
+    flaggedTimestamps: [],
     severity: severityFromScore(score),
-    events: ranked.map(e => ({ type: e.type, startSeconds: e.startSec, endSeconds: e.endSec })),
+    events: [],
     occurrenceRate,
     observationSummary,
     timeSeries,

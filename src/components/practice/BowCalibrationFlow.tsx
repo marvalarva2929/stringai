@@ -1,24 +1,43 @@
-import React, { useRef, useState } from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import React, { useEffect, useRef, useState } from 'react';
+import {
+  Image,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+  type ImageSourcePropType,
+  type StyleProp,
+  type ViewStyle,
+} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
-import Svg, { Circle, G, Line, Path, Polygon, Rect, Text as SvgText } from 'react-native-svg';
+import Svg, { Circle } from 'react-native-svg';
 import { computeCalibration, isCalibrationError } from '../../lib/calibrationCompute';
 import type { BowCalibration } from '../../types/calibration';
 import type { RawBowFrame } from '../../types/signals';
-import { radius, spacing } from '../../constants/theme';
+import { colors, radius, spacing } from '../../constants/theme';
+import {
+  CALIBRATION_COPY,
+  CALIBRATION_POSITIONS,
+  type CalibrationPosition,
+} from '../../constants/calibrationContent';
 import { DepthButton } from './DepthButton';
 
 export type CaptureBowClip = (durationMs: number) => Promise<RawBowFrame[]>;
 
-type Phase = 'intro' | 'position1' | 'position2' | 'review';
-type Stage = 'idle' | 'countdown' | 'capturing';
+/** Which card is on screen. */
+type Step = 'intro' | 'capture' | 'handoff' | 'review' | 'failed';
+/** Within a capture: moving into place, then holding for the clip. */
+type Stage = 'prep' | 'hold';
 
-// Time to get into (or move between) position before each 5-second hold.
-const COUNTDOWN_SECONDS = 5;
+// Time to get into (or move between) position before each hold.
+const PREP_MS = 5000;
 const CAPTURE_MS = 5000;
+// A beat between the two positions. Without it position 1's "1" is followed
+// straight by position 2's "5" and the two countdowns read as one.
+const HANDOFF_MS = 2200;
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const HOLD_COLOR = colors.score.excellent;
 
 /**
  * Rendered inside the -90° rotated landscape container on both the Analyze
@@ -26,6 +45,11 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
  * (~390pt tall). Layout is a row — visual on the left, copy + actions in a
  * panel on the right — and only the panel is tinted, leaving the camera
  * preview visible where the player needs to see themselves.
+ *
+ * The guiding constraint is that by the time the holds run the player is a
+ * couple of metres away and cannot touch the phone. So the intro (read in
+ * hand) carries the explanation, and each capture screen carries exactly one
+ * readable-at-distance instruction: whether to *move* or to *freeze*.
  */
 export function BowCalibrationFlow({
   captureBowClip,
@@ -41,31 +65,60 @@ export function BowCalibrationFlow({
   onSkip?: () => void;
   completeLabel?: string;
 }) {
-  const [phase, setPhase] = useState<Phase>('intro');
-  const [stage, setStage] = useState<Stage>('idle');
-  const [countdown, setCountdown] = useState(COUNTDOWN_SECONDS);
+  const [step, setStep] = useState<Step>('intro');
+  const [stage, setStage] = useState<Stage>('prep');
+  const [activeIndex, setActiveIndex] = useState<0 | 1>(0);
+  const [remaining, setRemaining] = useState(PREP_MS / 1000);
   const [error, setError] = useState<string | null>(null);
   const [calibration, setCalibration] = useState<BowCalibration | null>(null);
-  const clip1Ref = useRef<RawBowFrame[]>([]);
   const runningRef = useRef(false);
 
-  const captureReference = async (nextPhase: Extract<Phase, 'position1' | 'position2'>) => {
-    setPhase(nextPhase);
-    setStage('countdown');
+  // The sequence is a chain of awaited timers, so it has to be interruptible
+  // from outside: if the screen unmounts mid-hold the chain must stop rather
+  // than keep calling setState.
+  const cancelledRef = useRef(false);
+  const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  useEffect(() => {
+    return () => {
+      cancelledRef.current = true;
+      if (tickRef.current) clearInterval(tickRef.current);
+    };
+  }, []);
 
-    for (let n = COUNTDOWN_SECONDS; n > 0; n -= 1) {
-      setCountdown(n);
-      await sleep(1000);
-    }
+  /**
+   * Counts `durationMs` down against a wall-clock deadline. The old version
+   * chained `await sleep(1000)`, which drifted by a tick's worth of render
+   * time per second and could not be cancelled.
+   */
+  const runTimer = (durationMs: number) =>
+    new Promise<void>((resolve) => {
+      const endsAt = Date.now() + durationMs;
+      const finish = () => {
+        if (tickRef.current) clearInterval(tickRef.current);
+        tickRef.current = null;
+        resolve();
+      };
+      const tick = () => {
+        if (cancelledRef.current) return finish();
+        const left = Math.max(0, endsAt - Date.now());
+        setRemaining(left / 1000);
+        if (left <= 0) finish();
+      };
+      tickRef.current = setInterval(tick, 100);
+      tick();
+    });
 
-    // Keep the countdown running through the hold itself so the screen always
-    // shows one number: time to get in position, then time left to hold.
-    setStage('capturing');
+  const captureReference = async (position: CalibrationPosition) => {
+    setActiveIndex((position.index - 1) as 0 | 1);
+    setStep('capture');
+
+    setStage('prep');
+    await runTimer(PREP_MS);
+    if (cancelledRef.current) return [];
+
+    setStage('hold');
     const clip = captureBowClip(CAPTURE_MS);
-    for (let n = CAPTURE_MS / 1000; n > 0; n -= 1) {
-      setCountdown(n);
-      await sleep(1000);
-    }
+    await runTimer(CAPTURE_MS);
     return clip;
   };
 
@@ -75,48 +128,45 @@ export function BowCalibrationFlow({
     setError(null);
     setCalibration(null);
 
-    const clip1 = await captureReference('position1');
-    clip1Ref.current = clip1;
-    const clip2 = await captureReference('position2');
+    const clip1 = await captureReference(CALIBRATION_POSITIONS[0]);
+    if (cancelledRef.current) return;
+
+    setStep('handoff');
+    await runTimer(HANDOFF_MS);
+    if (cancelledRef.current) return;
+
+    const clip2 = await captureReference(CALIBRATION_POSITIONS[1]);
     runningRef.current = false;
+    if (cancelledRef.current) return;
 
     const outcome = computeCalibration(clip1, clip2);
     if (isCalibrationError(outcome)) {
-      clip1Ref.current = [];
-      // Don't loop the player back through calibration — a failed attempt just
-      // continues without it (bow metrics fall back to uncalibrated behaviour).
-      if (onSkip) {
-        onSkip();
-        return;
-      }
+      // Don't silently drop the player into recording — say what went wrong and
+      // let them choose. Continuing is still fine: bow metrics just fall back
+      // to their uncalibrated behaviour.
       setError(outcome.error);
-      setPhase('intro');
-      setStage('idle');
+      setStep('failed');
       return;
     }
 
     setCalibration(outcome);
-    setPhase('review');
-    setStage('idle');
+    setStep('review');
   };
 
-  if (phase === 'intro') {
+  if (step === 'intro') {
+    const { intro } = CALIBRATION_COPY;
     return (
       <Layout
-        visual={<ViolinDiagram mode="bridge" />}
+        visual={<PositionPair showHints />}
         panel={
           <>
             <View style={s.copy}>
-              <Text style={s.kicker}>Before you play</Text>
-              <Text style={s.title}>Calibration step</Text>
-              <Text style={s.subtitle}>
-                Teaches the camera where your bow meets the strings, so bow tracking is accurate.
-                Two 5-second holds — that's it.
-              </Text>
-              {error && <Text style={s.error}>{error}</Text>}
+              <Text style={s.kicker}>{intro.kicker}</Text>
+              <Text style={s.title}>{intro.title}</Text>
+              <Text style={s.subtitle}>{intro.body}</Text>
             </View>
             <View style={s.actions}>
-              <DepthButton label="Calibrate" icon="camera" onPress={startCalibration} />
+              <DepthButton label={intro.cta} icon="camera" onPress={startCalibration} />
               {onSkip ? (
                 <Pressable style={s.secondaryBtn} onPress={onSkip}>
                   <Text style={s.secondaryText}>Skip</Text>
@@ -133,7 +183,56 @@ export function BowCalibrationFlow({
     );
   }
 
-  if (phase === 'review' && calibration) {
+  if (step === 'handoff') {
+    const { handoff } = CALIBRATION_COPY;
+    const next = CALIBRATION_POSITIONS[1];
+    return (
+      <Layout
+        visual={<PositionPair activeIndex={1} />}
+        panel={
+          <View style={s.copy}>
+            <Text style={[s.kicker, { color: HOLD_COLOR }]}>{handoff.kicker}</Text>
+            <Text style={s.title}>{handoff.title}</Text>
+            <Text style={[s.subtitle, { color: next.accent }]}>{next.name}</Text>
+          </View>
+        }
+      />
+    );
+  }
+
+  if (step === 'failed') {
+    const { failure } = CALIBRATION_COPY;
+    const continueAnyway = onSkip ?? onCancel;
+    return (
+      <Layout
+        visual={
+          <View style={[s.badge, s.badgeWarn]}>
+            <Ionicons name="alert" size={44} color="#7c2d12" />
+          </View>
+        }
+        panel={
+          <>
+            <View style={s.copy}>
+              <Text style={s.kicker}>{failure.kicker}</Text>
+              <Text style={s.title}>{failure.title}</Text>
+              {error && <Text style={s.error}>{error}</Text>}
+            </View>
+            <View style={s.actions}>
+              <DepthButton label={failure.retry} icon="refresh" onPress={startCalibration} />
+              {continueAnyway ? (
+                <Pressable style={s.secondaryBtn} onPress={continueAnyway}>
+                  <Text style={s.secondaryText}>{failure.skip}</Text>
+                </Pressable>
+              ) : null}
+            </View>
+          </>
+        }
+      />
+    );
+  }
+
+  if (step === 'review' && calibration) {
+    const { review } = CALIBRATION_COPY;
     return (
       <Layout
         visual={
@@ -144,9 +243,9 @@ export function BowCalibrationFlow({
         panel={
           <>
             <View style={s.copy}>
-              <Text style={s.kicker}>Done</Text>
-              <Text style={s.title}>Calibration saved</Text>
-              <Text style={s.subtitle}>Use the same camera position for this take.</Text>
+              <Text style={s.kicker}>{review.kicker}</Text>
+              <Text style={s.title}>{review.title}</Text>
+              <Text style={s.subtitle}>{review.body}</Text>
             </View>
             <View style={s.actions}>
               <DepthButton label={completeLabel} icon="checkmark" onPress={() => onComplete(calibration)} />
@@ -157,18 +256,39 @@ export function BowCalibrationFlow({
     );
   }
 
-  // Capture screens are deliberately sparse: the big diagram, the position
-  // name, and one countdown number over a light scrim — nothing to read
-  // mid-hold. `stage` still runs the logic but doesn't change this layout.
-  const isFirst = phase === 'position1';
+  // ── Capture ────────────────────────────────────────────────────────────────
+  // Two stages, and the whole point of this screen is that they cannot be
+  // confused: "Get into position" on a draining white ring, then "HOLD STILL"
+  // on a filling green one. Previously both stages showed the same bare digit,
+  // so the player never knew when the clip had actually started.
+  const position = CALIBRATION_POSITIONS[activeIndex];
+  const isHold = stage === 'hold';
+  const total = (isHold ? CAPTURE_MS : PREP_MS) / 1000;
+  const fraction = Math.min(1, Math.max(0, remaining / total));
+  const progress = isHold ? 1 - fraction : fraction;
+  const ringColor = isHold ? HOLD_COLOR : '#fff';
+
   return (
-    <View style={s.captureRoot} pointerEvents="none">
-      <ViolinDiagram mode={isFirst ? 'bridge' : 'fingerboard'} width={480} />
+    <View style={[s.captureRoot, isHold && s.captureRootHold]} pointerEvents="none">
+      <View style={s.captureVisual}>
+        <PositionArt mode={position.mode} style={s.captureArt} />
+      </View>
       <View style={s.captureSide}>
-        <Text style={s.captureLabel}>
-          {isFirst ? 'Tip at the\nbridge' : 'Frog at the\nfingerboard'}
+        <Text style={[s.captureKicker, { color: position.accent }]}>
+          Position {position.index} of {CALIBRATION_POSITIONS.length}
         </Text>
-        <Text style={s.captureCountdown}>{countdown}</Text>
+        <Text style={[s.captureHeadline, isHold && s.captureHeadlineHold]}>
+          {isHold ? CALIBRATION_COPY.hold.headline : CALIBRATION_COPY.prep.headline}
+        </Text>
+        {/* Constant across both stages — the headline says what to do, this says
+            which position, and the diagram beside it says the rest. */}
+        <Text style={s.captureSub}>{position.name}</Text>
+        <CountdownRing
+          seconds={Math.max(1, Math.ceil(remaining))}
+          progress={progress}
+          color={ringColor}
+          label={isHold ? CALIBRATION_COPY.hold.numberLabel : CALIBRATION_COPY.prep.numberLabel}
+        />
       </View>
     </View>
   );
@@ -192,124 +312,112 @@ function Layout({ visual, panel }: { visual: React.ReactNode; panel: React.React
   );
 }
 
-// ── Violin diagram ───────────────────────────────────────────────────────────
-// Top-down view as the camera sees it: scroll left, body right, strings running
-// the length of the instrument, bow crossing them at the contact point being
-// calibrated.
-//
-// The outline is exactly symmetric about the y=80 centre line: the top edge is
-// authored as cubics through upper bout (half-width 36) → C-bout corner → flat
-// waist (23) → corner → lower bout (43) → end block, and the bottom edge is that
-// same run mirrored. Hand-authoring both edges produces a lopsided body.
-const BODY_PATH =
-  'M138 68 C150 45 162 43 176 44 C186 45 192 48 198 53 C204 56 207 57 212 57 ' +
-  'C217 57 221 55 226 52 C234 46 240 37 252 37 C274 38 293 53 297 71 ' +
-  'C299 76 299 84 297 89 C293 107 274 122 252 123 C240 123 234 114 226 108 ' +
-  'C221 105 217 103 212 103 C207 103 204 104 198 107 C192 112 186 115 176 116 ' +
-  'C162 117 150 115 138 92 Z';
-
-// Strings: nut (x=39, tightly spaced) → over the bridge → tailpiece (x=271, fanned).
-const STRING_YS: [number, number][] = [
-  [76.5, 74], [78.8, 78], [81.2, 82], [83.5, 86],
-];
-
-/** One f-hole with its upper and lower eyes; drawn twice, mirrored about y=80. */
-function FHole() {
-  const ink = 'rgba(255,255,255,0.6)';
+/**
+ * Both positions side by side, numbered and captioned. Used on the intro so the
+ * player sees the whole task before anything starts, and on the handoff with
+ * the position they're moving to highlighted.
+ *
+ * `showHints` is for the intro only, where the phone is still in hand. On the
+ * handoff the player is across the room and won't read them.
+ */
+function PositionPair({ activeIndex, showHints }: { activeIndex?: 0 | 1; showHints?: boolean }) {
   return (
-    <>
-      <Path d="M236 54 C230 60 228 68 231 76" fill="none" stroke={ink} strokeWidth={2.2} strokeLinecap="round" />
-      <Circle cx={237} cy={52} r={2.3} fill={ink} />
-      <Circle cx={230} cy={78} r={2.3} fill={ink} />
-    </>
-  );
-}
-
-function ViolinDiagram({ mode, width = 320 }: { mode: 'bridge' | 'fingerboard'; width?: number }) {
-  // The bow is vertical — i.e. perpendicular to the strings — in both modes, so
-  // the picture itself carries the "stay perpendicular" instruction, and the cyan
-  // right-angle marker at the contact point names it.
-  //
-  // Only the end of the bow that's actually on the strings is drawn; the rest runs
-  // off the canvas edge, since a real bow is far longer than this frame. Which end
-  // that is, and where it lands, is the whole difference between the two prompts:
-  //   bridge      → the TIP is on the strings by the bridge, stick trailing off the
-  //                 bottom toward the hand.
-  //   fingerboard → the FROG is on the strings by the fingerboard (hand right there),
-  //                 stick running off the top.
-  const isBridge = mode === 'bridge';
-  const bowX = isBridge ? 235 : 172;
-  const ink = 'rgba(255,255,255,0.6)';
-
-  return (
-    <View style={s.diagramWrap}>
-      <Svg width={width} height={(width * 190) / 320} viewBox="0 0 320 190">
-        <Path
-          d={BODY_PATH}
-          fill="rgba(255,255,255,0.14)"
-          stroke="rgba(255,255,255,0.75)"
-          strokeWidth={2.5}
-          strokeLinejoin="round"
-        />
-
-        <FHole />
-        <G transform="translate(0,160) scale(1,-1)">
-          <FHole />
-        </G>
-
-        {/* Fingerboard, tapering toward the nut */}
-        <Polygon points="56,74 148,69 148,91 56,86" fill="rgba(255,255,255,0.2)" stroke={ink} strokeWidth={2} strokeLinejoin="round" />
-
-        {/* Pegbox + scroll */}
-        <Polygon points="35,73 58,75 58,85 35,87" fill="rgba(255,255,255,0.18)" stroke={ink} strokeWidth={2} strokeLinejoin="round" />
-        <Circle cx={25} cy={80} r={9.5} fill="rgba(255,255,255,0.14)" stroke="rgba(255,255,255,0.65)" strokeWidth={2} />
-        <Circle cx={25} cy={80} r={3.5} fill="none" stroke="rgba(255,255,255,0.5)" strokeWidth={1.5} />
-
-        {/* Tailpiece */}
-        <Polygon points="258,71 287,75 287,85 258,89" fill="rgba(255,255,255,0.2)" stroke={ink} strokeWidth={2} strokeLinejoin="round" />
-
-        {/* Bridge — strings cross it here */}
-        <Line x1={245} y1={65} x2={245} y2={95} stroke="rgba(255,255,255,0.85)" strokeWidth={4} strokeLinecap="round" />
-
-        {STRING_YS.map(([yNut, yTail]) => (
-          <Line key={yNut} x1={39} y1={yNut} x2={271} y2={yTail} stroke="rgba(255,255,255,0.85)" strokeWidth={1.5} />
-        ))}
-
-        {/* Right-angle marker: bow ⟂ strings at the contact point */}
-        <Path
-          d={`M${bowX - 14} 80 L${bowX - 14} 66 L${bowX} 66`}
-          fill="none"
-          stroke="#22d3ee"
-          strokeWidth={1.6}
-        />
-
-        {isBridge ? (
-          <>
-            <Line x1={bowX} y1={56} x2={bowX} y2={190} stroke="#f59e0b" strokeWidth={6} strokeLinecap="round" />
-            <Line x1={bowX + 4} y1={64} x2={bowX + 4} y2={190} stroke="#fde68a" strokeWidth={1.8} />
-            <Polygon points={`${bowX - 5},68 ${bowX + 5},68 ${bowX},52`} fill="#fbbf24" />
-            <SvgText x={bowX + 13} y={62} fill="#fde68a" fontSize={13} fontWeight="800">tip</SvgText>
-          </>
-        ) : (
-          <>
-            <Line x1={bowX} y1={0} x2={bowX} y2={104} stroke="#f59e0b" strokeWidth={6} strokeLinecap="round" />
-            <Line x1={bowX + 4} y1={0} x2={bowX + 4} y2={96} stroke="#fde68a" strokeWidth={1.8} />
-            <Rect x={bowX - 8} y={96} width={16} height={18} rx={3} fill="#fbbf24" stroke="#78350f" strokeWidth={1} />
-            <SvgText x={bowX + 14} y={112} fill="#fde68a" fontSize={13} fontWeight="800">frog</SvgText>
-          </>
-        )}
-
-        {/* Landmark labels. The bridge label shifts clear of the bow in bridge mode. */}
-        <SvgText x={140} y={182} fill="rgba(255,255,255,0.8)" fontSize={13} fontWeight="700" textAnchor="middle">
-          fingerboard
-        </SvgText>
-        <SvgText x={isBridge ? 272 : 252} y={182} fill="rgba(255,255,255,0.8)" fontSize={13} fontWeight="700" textAnchor="middle">
-          bridge
-        </SvgText>
-      </Svg>
+    <View style={s.pair}>
+      {CALIBRATION_POSITIONS.map((position, i) => {
+        const dimmed = activeIndex !== undefined && activeIndex !== i;
+        return (
+          <View key={position.index} style={[s.pairCol, dimmed && s.pairColDim]}>
+            <View style={s.pairHeading}>
+              <View style={[s.chip, { backgroundColor: position.accent }]}>
+                <Text style={s.chipText}>{position.index}</Text>
+              </View>
+              <Text style={s.pairName} numberOfLines={1}>{position.name}</Text>
+            </View>
+            <PositionArt mode={position.mode} />
+            {showHints && <Text style={s.pairHint}>{position.hint}</Text>}
+          </View>
+        );
+      })}
     </View>
   );
 }
+
+/**
+ * The countdown digit inside a progress ring, always with a word under it
+ * saying what it counts. The ring runs the opposite way in each stage —
+ * draining while the player moves, filling while the clip records — so the two
+ * back-to-back 5-second counts are distinguishable at a glance from across the
+ * room, before any of the text is legible.
+ */
+function CountdownRing({
+  seconds,
+  progress,
+  color,
+  label,
+}: {
+  seconds: number;
+  progress: number;
+  color: string;
+  label: string;
+}) {
+  const SIZE = 124;
+  const STROKE = 7;
+  const r = (SIZE - STROKE) / 2;
+  const circumference = 2 * Math.PI * r;
+  return (
+    <View style={s.ringWrap}>
+      <View style={{ width: SIZE, height: SIZE }}>
+        <Svg width={SIZE} height={SIZE}>
+          <Circle
+            cx={SIZE / 2} cy={SIZE / 2} r={r}
+            stroke="rgba(255,255,255,0.18)" strokeWidth={STROKE} fill="none"
+          />
+          <Circle
+            cx={SIZE / 2} cy={SIZE / 2} r={r}
+            stroke={color} strokeWidth={STROKE} fill="none"
+            strokeLinecap="round"
+            strokeDasharray={circumference}
+            strokeDashoffset={circumference * (1 - progress)}
+            transform={`rotate(-90 ${SIZE / 2} ${SIZE / 2})`}
+          />
+        </Svg>
+        <View style={s.ringCentre}>
+          <Text style={[s.ringNumber, { color }]}>{seconds}</Text>
+        </View>
+      </View>
+      <Text style={s.ringLabel}>{label}</Text>
+    </View>
+  );
+}
+
+// ── Position artwork ─────────────────────────────────────────────────────────
+// Replaces the schematic violin diagram this flow used to draw in SVG. Those
+// two drawings differed only by where a stick crossed the strings, which read
+// as the same picture at a glance; these show the whole posture — bow angle,
+// where the hand sits, how far along the stick the contact is — so the player
+// can copy the pose rather than decode a diagram.
+//
+// The art is cut out against transparency, so it sits over the live camera
+// preview without a card behind it.
+const POSITION_ART: Record<'bridge' | 'fingerboard', ImageSourcePropType> = {
+  bridge: require('../../../assets/calibration/tip-bridge.png'),
+  fingerboard: require('../../../assets/calibration/frog-fingerboard.png'),
+};
+
+function PositionArt({
+  mode,
+  style,
+}: {
+  mode: 'bridge' | 'fingerboard';
+  style?: StyleProp<ViewStyle>;
+}) {
+  return (
+    <View style={[s.artWrap, style]}>
+      <Image source={POSITION_ART[mode]} style={s.art} resizeMode="contain" />
+    </View>
+  );
+}
+
 
 const PANEL_WIDTH = 320;
 
@@ -319,7 +427,7 @@ const s = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: spacing.lg,
+    paddingHorizontal: spacing.md,
   },
   panel: {
     width: PANEL_WIDTH,
@@ -359,32 +467,96 @@ const s = StyleSheet.create({
     fontWeight: '800',
     marginTop: spacing.sm,
   },
+
+  // ── Position pair (intro + handoff) ────────────────────────────────────────
+  pair: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'center',
+    gap: spacing.md,
+    width: '100%',
+  },
+  pairCol: { flex: 1, maxWidth: 230, gap: spacing.xs },
+  pairColDim: { opacity: 0.3 },
+  pairHeading: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  chip: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  chipText: { color: '#0f172a', fontSize: 13, fontWeight: '900' },
+  pairName: { flex: 1, color: '#fff', fontSize: 15, fontWeight: '900' },
+  pairHint: {
+    color: 'rgba(255,255,255,0.7)',
+    fontSize: 13,
+    lineHeight: 18,
+    fontWeight: '600',
+  },
+
+  // ── Capture ────────────────────────────────────────────────────────────────
   captureRoot: {
     flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: spacing.xl,
+    gap: spacing.lg,
+    paddingHorizontal: spacing.lg,
     backgroundColor: 'rgba(15,23,42,0.45)',
   },
+  /** The hold is the one moment the player must not move — tint the whole frame. */
+  captureRootHold: { backgroundColor: 'rgba(5,46,22,0.55)' },
+  captureVisual: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  captureArt: { maxWidth: 440 },
   captureSide: {
+    width: 300,
+    flexShrink: 0,
+    alignItems: 'flex-start',
+    gap: spacing.sm,
+  },
+  captureKicker: {
+    fontSize: 15,
+    fontWeight: '900',
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+  },
+  captureHeadline: {
+    color: '#fff',
+    fontSize: 32,
+    lineHeight: 37,
+    fontWeight: '900',
+  },
+  /** The single thing that has to read from two metres away. */
+  captureHeadlineHold: {
+    color: HOLD_COLOR,
+    fontSize: 46,
+    lineHeight: 50,
+    letterSpacing: 1,
+  },
+  captureSub: {
+    color: 'rgba(255,255,255,0.88)',
+    fontSize: 18,
+    lineHeight: 24,
+    fontWeight: '700',
+  },
+
+  // ── Countdown ring ─────────────────────────────────────────────────────────
+  ringWrap: { alignItems: 'center', alignSelf: 'stretch', gap: spacing.xs },
+  ringCentre: {
+    ...StyleSheet.absoluteFillObject,
     alignItems: 'center',
-    gap: spacing.md,
+    justifyContent: 'center',
   },
-  captureLabel: {
-    color: '#fff',
-    fontSize: 26,
-    lineHeight: 32,
-    fontWeight: '900',
-    textAlign: 'center',
+  ringNumber: { fontSize: 56, lineHeight: 62, fontWeight: '900' },
+  ringLabel: {
+    color: 'rgba(255,255,255,0.75)',
+    fontSize: 13,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+    letterSpacing: 0.8,
   },
-  captureCountdown: {
-    color: '#fff',
-    fontSize: 72,
-    lineHeight: 78,
-    fontWeight: '900',
-    textAlign: 'center',
-  },
+
   secondaryBtn: {
     height: 46,
     borderRadius: radius.lg,
@@ -403,5 +575,7 @@ const s = StyleSheet.create({
     justifyContent: 'center',
     backgroundColor: '#dcfce7',
   },
-  diagramWrap: { alignItems: 'center', justifyContent: 'center' },
+  badgeWarn: { backgroundColor: '#fed7aa' },
+  artWrap: { width: '100%', aspectRatio: 1280 / 853 },
+  art: { width: '100%', height: '100%' },
 });

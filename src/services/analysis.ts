@@ -2,6 +2,7 @@ import { supabase } from './supabase';
 import { AnalysisResult, MetricScore, SessionSummary, IntonationAnalysis, AudioAnalysisOutput, severityFromScore, VibratoAnalysis, LLMFeedback } from '../types/analysis';
 import { Piece } from '../types/piece';
 import { InstrumentId } from '../types/instrument';
+import type { MetricHistoryEntry, SessionHeadline } from '../store/useAnalysisStore';
 import { analyzeMediaFile } from './audioEngine';
 import { buildSessionFeedback } from './llmFeedback';
 
@@ -52,6 +53,7 @@ export async function runAudioAnalysis(
     console.warn('[audioEngine] Non-WAV file — falling back to mock metrics');
     await new Promise((r) => setTimeout(r, 1500));
     return {
+      usedMockMetrics: true,
       metrics: mockMetrics(),
       intonationAnalysis: mockIntonationAnalysis(),
       intonationStabilityAnalysis: { assessedCount: 0, unsteadyCount: 0, avgDriftCents: 0, worstNotes: [] },
@@ -74,24 +76,10 @@ export async function mockVideoMetrics(): Promise<MetricScore[]> {
   ];
 }
 
-export function computeOverallScore(
-  audioMetrics: MetricScore[],
-  videoMetrics: MetricScore[],
-  weights: Record<string, number>,
-): number {
-  const all = [...audioMetrics, ...videoMetrics];
-  let total = 0;
-  let weightSum = 0;
-
-  for (const metric of all) {
-    if (metric.measurementQuality === 'unavailable') continue;
-    const w = weights[metric.key] ?? 0;
-    total += metric.score * w;
-    weightSum += w;
-  }
-
-  return weightSum > 0 ? Math.round(total / weightSum) : 0;
-}
+// Scoring lives in src/lib/scoring.ts so it stays importable from plain Node
+// tests — this module pulls in supabase and expo-file-system, which don't.
+// Re-exported here because every existing caller imports it from this path.
+export { computeOverallScore, activeScoreWeights, HIDDEN_SCORE_KEYS } from '../lib/scoring';
 
 async function savePiece(piece: Piece, userId: string): Promise<void> {
   const { error } = await supabase.from('pieces').upsert({
@@ -138,10 +126,31 @@ export async function saveSession(result: AnalysisResult): Promise<void> {
 }
 
 /** Cache Claude coaching on the session row so re-viewing never re-calls the LLM. */
-export async function updateSessionLlmFeedback(sessionId: string, feedback: LLMFeedback): Promise<void> {
+export async function updateSessionLlmFeedback(
+  sessionId: string,
+  feedback: LLMFeedback,
+  /**
+   * The drill plan the student actually sees, stored in `sessions.coach_plan`
+   * so chat can talk about it by the names on screen.
+   *
+   * These are the DETERMINISTIC block titles from practiceBlocks.ts, not the
+   * LLM's. The model never invents a drill — applyCuratedCopy only overwrites a
+   * block's `reason` — so storing its titles meant chat described exercises the
+   * student had never seen. Deliberately not folded into llm_feedback: the plan
+   * is rendered from useCuratedPlanStore, and a second copy there could be read
+   * back as a stale source of truth. This copy is a record of what we told them.
+   */
+  coachPlan?: { title: string; minutes: number; whyThisDrill: string }[],
+  /** The session's musical picture — see lib/musicalEvidence.ts. */
+  musicalEvidence?: unknown,
+): Promise<void> {
   const { error } = await supabase
     .from('sessions')
-    .update({ llm_feedback: feedback })
+    .update({
+      llm_feedback: feedback,
+      ...(coachPlan ? { coach_plan: coachPlan } : {}),
+      ...(musicalEvidence ? { musical_evidence: musicalEvidence } : {}),
+    })
     .eq('id', sessionId);
   if (error) throw error;
 }
@@ -163,6 +172,81 @@ export function sessionToSummary(result: AnalysisResult): SessionSummary {
     piece: result.piece
       ? { id: result.piece.id, title: result.piece.title, composer: result.piece.composer }
       : undefined,
+  };
+}
+
+/**
+ * Pick the genuinely-measured figures out of a finished analysis. These live on
+ * intonationAnalysis / rhythmAnalysis / vibratoAnalysis, which are in-memory
+ * only, so without this they are gone by the next app launch and trends have to
+ * fall back to the internal 0-100 score.
+ */
+export function buildSessionHeadline(result: AnalysisResult): SessionHeadline {
+  const headline: SessionHeadline = {};
+
+  const intonation = result.intonationAnalysis;
+  if (intonation && intonation.totalNoteEvents > 0) {
+    headline.inTuneRate = intonation.inTuneRate;
+    headline.totalNotes = intonation.totalNoteEvents;
+    headline.tendencyCents = intonation.tendencyCents;
+  }
+
+  const stability = result.intonationStabilityAnalysis;
+  if (stability && stability.assessedCount > 0) {
+    headline.avgDriftCents = stability.avgDriftCents;
+  }
+
+  // rhythmAccuracy's occurrenceRate is a real fraction of off-grid notes
+  // (audioEngine computes it as 1 - onGridCount/iois.length), unlike the
+  // metrics whose occurrenceRate is just their score restated.
+  const rhythm = result.metrics.find((m) => m.key === 'rhythmAccuracy');
+  if (rhythm && rhythm.measurementQuality !== 'unavailable') {
+    headline.onGridRate = 1 - rhythm.occurrenceRate;
+  }
+  if (result.rhythmAnalysis?.bpmEst) {
+    headline.bpmEst = result.rhythmAnalysis.bpmEst;
+  }
+
+  // Likewise toneQuality's is a real fraction of session time (sectionSecs/duration).
+  const tone = result.metrics.find((m) => m.key === 'toneQuality');
+  if (tone && tone.measurementQuality !== 'unavailable') {
+    headline.cleanToneRate = 1 - tone.occurrenceRate;
+  }
+
+  const vibrato = result.vibratoAnalysis;
+  if (vibrato && vibrato.eligibleCount > 0) {
+    headline.vibratoEligible = vibrato.eligibleCount;
+    headline.vibratoAvgScore = vibrato.avgNoteScore;
+  }
+
+  return headline;
+}
+
+/**
+ * Build the persisted per-metric history record for a session.
+ *
+ * Drops the per-frame debug payloads: MetricScore carries `timeSeries`,
+ * `debugSeries` and `_dynDebug` for the live results screen, and persisting
+ * those across 13 metrics × every session would grow AsyncStorage without
+ * bound. Their type comments already say they aren't persisted.
+ */
+export function sessionToMetricHistoryEntry(result: AnalysisResult): MetricHistoryEntry {
+  const scores: MetricScore[] = result.metrics.map((metric) => {
+    const { timeSeries, debugSeries, _dynDebug, ...rest } = metric;
+    return rest;
+  });
+
+  return {
+    sessionId: result.sessionId,
+    recordedAt: result.recordedAt,
+    scores,
+    evidence: result.sessionEvidence,
+    // Carried so a later analysis improvement can tell this copy is stale.
+    // History keeps no raw material, so an unstamped entry can only be trusted
+    // or discarded — see withoutStaleEvidence.
+    evidenceVersion: result.evidenceVersion,
+    pieceId: result.piece?.id,
+    headline: buildSessionHeadline(result),
   };
 }
 

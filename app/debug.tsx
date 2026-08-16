@@ -21,6 +21,8 @@ import { colors, spacing, radius } from '../src/constants/theme';
 import { extractVideoFrames, DetectionFrame } from '../src/services/videoAnalysis';
 import { runSessionPipeline } from '../src/lib/sessionPipeline';
 import { analyzeBowUsage } from '../src/lib/bowAnalysis';
+import { ActivationDebugPanel } from '../src/components/activation/ActivationDebugPanel';
+import { TelemetryDebugPanel } from '../src/components/activation/TelemetryDebugPanel';
 
 // Compact view of a SessionPipelineOutput for on-screen display + raw-JSON share.
 interface PipelineSummary {
@@ -196,6 +198,9 @@ function DebugScreenInner() {
       </View>
 
       <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent}>
+        <ActivationDebugPanel />
+        <TelemetryDebugPanel />
+
         <Pressable style={styles.pickBtn} onPress={pickAndRun} disabled={running}>
           {running
             ? <ActivityIndicator color="#fff" />

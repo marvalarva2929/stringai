@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import {
   View,
   Text,
@@ -8,6 +8,7 @@ import {
   SafeAreaView,
   Modal,
   TouchableWithoutFeedback,
+  Dimensions,
 } from 'react-native';
 import Animated, { useSharedValue, useAnimatedStyle } from 'react-native-reanimated';
 import { FontAwesome6, Octicons } from '@expo/vector-icons';
@@ -19,12 +20,21 @@ import { TunerModal } from '../../src/components/tuner/TunerModal';
 import { ScoreGauge } from '../../src/components/ui/ScoreGauge';
 import { WeeklyGoalCard } from '../../src/components/home/WeeklyGoalCard';
 import { minutesPracticedThisWeek } from '../../src/lib/weeklyGoal';
+import { computeStreak } from '../../src/lib/streak';
 import { useDailyPracticePlan } from '../../src/hooks/useDailyPracticePlan';
+import { useActivationStore } from '../../src/store/useActivationStore';
+import { useSpotlightTarget } from '../../src/components/activation/useSpotlightTarget';
+import { useSpotlightStore } from '../../src/components/activation/spotlightStore';
+import { useCoachmarks } from '../../src/components/activation/useCoachmarks';
+import { SpotlightOverlay } from '../../src/components/activation/SpotlightOverlay';
+import { HOME_COACHMARKS } from '../../src/constants/activationScript';
 import { haptic } from '../../src/lib/haptics';
+import { qaCheckpoint } from '../../src/services/crashReporting';
 import { colors, spacing, radius } from '../../src/constants/theme';
 import { severityFromScore } from '../../src/types/analysis';
 
 const PLAN_DEPTH = 6;
+const SCREEN_H = Dimensions.get('window').height;
 
 const PILL_INFO: Record<'streak' | 'score', { icon: React.ReactNode; title: string; body: string }> = {
   streak: {
@@ -49,6 +59,10 @@ export default function HomeScreen() {
   const dailyPlan = useDailyPracticePlan();
   const currentPiece = profile?.currentPiece;
 
+  useEffect(() => {
+    qaCheckpoint('home_view'); // TEMPORARY — QA walkthrough checkpoint
+  }, []);
+
   const goalMinutes = profile?.weeklyGoalMinutes ?? weeklyGoalMinutes;
   const minutesThisWeek = useMemo(
     () => minutesPracticedThisWeek(sessionHistory),
@@ -70,21 +84,12 @@ export default function HomeScreen() {
       .slice(0, 10);
   }, [sessionHistory]);
 
+  // Always present — a brand-new user sees zeroes rather than an empty row.
   const stats = useMemo(() => {
-    if (sessionHistory.length === 0) return null;
+    if (sessionHistory.length === 0) return { avg: 0, streak: 0 };
     const scores = sessionHistory.map((s) => s.overallScore);
     const avg = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
-
-    const DAY = 86_400_000;
-    const today = new Date(); today.setHours(0, 0, 0, 0);
-    const dates = new Set(sessionHistory.map((s) => {
-      const d = new Date(s.recordedAt); d.setHours(0, 0, 0, 0); return d.getTime();
-    }));
-    let check = today.getTime();
-    if (!dates.has(check)) { check -= DAY; if (!dates.has(check)) return { avg, streak: 0 }; }
-    let streak = 0;
-    while (dates.has(check)) { streak++; check -= DAY; }
-    return { avg, streak };
+    return { avg, streak: computeStreak(sessionHistory) };
   }, [sessionHistory]);
 
   // Plan card depth animation
@@ -99,29 +104,79 @@ export default function HomeScreen() {
     transform: [{ translateY: recordOffset.value }],
   }));
 
+  // ── Activation stage 1 ───────────────────────────────────────
+  //
+  // The first thing after onboarding: point at the real buttons, in the order a
+  // player would use them — warm up, check where you stand, record.
+  const activationStep = useActivationStore((st) => st.step);
+  const planSpotlight = useSpotlightTarget('home.plan');
+  const statsSpotlight = useSpotlightTarget('home.stats');
+  const recordSpotlight = useSpotlightTarget('home.record');
+  const coach = useCoachmarks(HOME_COACHMARKS, activationStep === 'home', () => {
+    // The last step is the record button, so take them there rather than
+    // leaving them to find it again on their own.
+    useActivationStore.getState().advanceTo('capture');
+    router.push('/(tabs)/analyze');
+  });
+
+  // Bring the highlighted element into view before spotlighting it. The record
+  // button sits below the fold on shorter screens, and a cutout over something
+  // scrolled off-screen is worse than no cutout at all.
+  const scrollRef = useRef<ScrollView>(null);
+  const scrollYRef = useRef(0);
+  const activeTargetId = coach.step?.targetId;
+  // Subscribed rather than read once: on the first step the rect usually lands
+  // after this effect would have run, and re-running on the measurement is what
+  // makes the scroll reliable. It converges — once the target is inside the
+  // band, delta is 0 and the effect stops moving anything.
+  const activeRect = useSpotlightStore((st) => (activeTargetId ? st.rects[activeTargetId] : undefined));
+
+  useEffect(() => {
+    const rect = activeRect;
+    if (!activeTargetId || !rect) return;
+
+    const topBound = SCREEN_H * 0.16;
+    const bottomBound = SCREEN_H * 0.55;
+    let delta = 0;
+    if (rect.y < topBound) delta = rect.y - topBound;
+    else if (rect.y + rect.height > bottomBound) delta = rect.y + rect.height - bottomBound;
+    if (delta === 0) return;
+
+    scrollRef.current?.scrollTo({ y: Math.max(0, scrollYRef.current + delta), animated: true });
+    // Scrolling doesn't fire onLayout, so the rects are stale until we ask — and
+    // asking mid-animation is worse than not asking, since the element is still
+    // moving. The scroll-end handlers do the real work; this is the backstop.
+    const t = setTimeout(() => useSpotlightStore.getState().remeasure(), 900);
+    return () => clearTimeout(t);
+  }, [activeTargetId, activeRect]);
+
   return (
     <SafeAreaView style={s.safe}>
       <TunerModal visible={tunerOpen} onClose={() => setTunerOpen(false)} />
 
       <ScrollView
+        ref={scrollRef}
         contentContainerStyle={s.scroll}
         showsVerticalScrollIndicator={false}
+        scrollEventThrottle={16}
+        onScroll={(e) => { scrollYRef.current = e.nativeEvent.contentOffset.y; }}
+        onScrollEndDrag={() => useSpotlightStore.getState().remeasure()}
+        onMomentumScrollEnd={() => useSpotlightStore.getState().remeasure()}
       >
+        {/* ── Welcome header ───────────────────────────── */}
+        <Text style={s.welcome}>Welcome!</Text>
+
         {/* ── Streak / avg / tune pills ────────────────── */}
         <View style={s.pillRow}>
-          <View style={s.pillGroup}>
-            {stats && (
-              <>
-                <Pressable style={s.pillLight} onPress={() => { haptic.light(); setInfoPopup('streak'); }}>
-                  <FontAwesome6 name="fire" size={16} color="#f97316" />
-                  <Text style={s.pillLightText}>{stats.streak}</Text>
-                </Pressable>
-                <Pressable style={s.pillLight} onPress={() => { haptic.light(); setInfoPopup('score'); }}>
-                  <Octicons name="star-fill" size={16} color="#f59e0b" />
-                  <Text style={s.pillLightText}>{stats.avg}</Text>
-                </Pressable>
-              </>
-            )}
+          <View style={s.pillGroup} {...statsSpotlight}>
+            <Pressable style={s.pillLight} onPress={() => { haptic.light(); setInfoPopup('streak'); }}>
+              <FontAwesome6 name="fire" size={16} color="#f97316" />
+              <Text style={s.pillLightText}>{stats.streak}</Text>
+            </Pressable>
+            <Pressable style={s.pillLight} onPress={() => { haptic.light(); setInfoPopup('score'); }}>
+              <Octicons name="star-fill" size={16} color="#f59e0b" />
+              <Text style={s.pillLightText}>{stats.avg}</Text>
+            </Pressable>
           </View>
           <Pressable style={s.pill} onPress={() => setTunerOpen(true)}>
             <Text style={s.pillText}>♩ Tune</Text>
@@ -176,6 +231,7 @@ export default function HomeScreen() {
           onPressOut={() => { planOffset.value = 0; }}
           onPress={() => router.push('/(tabs)/train')}
           style={s.planCardOuter}
+          {...planSpotlight}
         >
           <View style={s.planCardBase} />
           <Animated.View style={[s.planCardSurface, planSurfaceStyle]}>
@@ -199,6 +255,7 @@ export default function HomeScreen() {
           onPressOut={() => { recordOffset.value = 0; }}
           onPress={() => router.push('/(tabs)/analyze')}
           style={s.recordButtonOuter}
+          {...recordSpotlight}
         >
           <View style={s.recordButtonBase} />
           <Animated.View style={[s.recordButtonSurface, recordSurfaceStyle]}>
@@ -217,7 +274,9 @@ export default function HomeScreen() {
         />
 
         {/* ── Continue recent sessions ─────────────────── */}
-        {recentSessions.length > 0 && (
+        {recentSessions.length === 0 ? (
+          <Text style={s.emptyRecent}>Your recent pieces will appear here</Text>
+        ) : (
           <>
             <Text style={s.orLabel}>Continue recent sessions</Text>
             <ScrollView
@@ -249,12 +308,30 @@ export default function HomeScreen() {
           </>
         )}
       </ScrollView>
+
+      <SpotlightOverlay
+        steps={HOME_COACHMARKS}
+        index={coach.index}
+        onNext={coach.next}
+        onSkip={coach.skip}
+        blocking={activationStep === 'home'}
+      />
     </SafeAreaView>
   );
 }
 
 const s = StyleSheet.create({
   safe: { flex: 1, backgroundColor: '#fff' },
+
+  // Welcome header — its own row, so it's free to be a full screen title.
+  // Negative margin pulls the pill row up out of the scroll container's gap.
+  welcome: {
+    fontSize: 34,
+    fontWeight: '900',
+    color: colors.text.primary,
+    textAlign: 'left',
+    marginBottom: -spacing.md,
+  },
 
   // Streak / avg / tune pill row (above plan card)
   pillRow: {
@@ -264,6 +341,7 @@ const s = StyleSheet.create({
   },
   pillGroup: {
     flexDirection: 'row',
+    alignItems: 'center',
     gap: spacing.sm,
   },
   pill: {
@@ -292,7 +370,9 @@ const s = StyleSheet.create({
     backgroundColor: '#fff',
     borderRadius: radius.full,
     paddingHorizontal: 14,
-    paddingVertical: 8,
+    // 1.5/3px borders make up the rest of the Tune pill's 8pt vertical
+    // padding, so both pills land on the same height.
+    paddingVertical: 6,
     borderWidth: 1.5,
     borderColor: '#e5e7eb',
     borderBottomWidth: 3,
@@ -478,6 +558,14 @@ const s = StyleSheet.create({
     fontWeight: '500',
     textAlign: 'center',
     marginVertical: -spacing.sm,
+  },
+
+  // Placeholder shown until the first session is recorded
+  emptyRecent: {
+    fontSize: 13,
+    color: colors.text.muted,
+    fontWeight: '500',
+    textAlign: 'center',
   },
 
   // Recent session cards (square, horizontally scrollable, popout style)

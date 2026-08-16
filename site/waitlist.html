@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Join the Waitlist — StringAI</title>
+  <meta name="description" content="StringAI is an AI violin practice coach coming soon to the App Store. Leave your email and we'll tell you the day it launches." />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="site">
+    <div class="wrap">
+      <a class="brand" href="index.html">String<span>AI</span></a>
+      <nav>
+        <a href="index.html">Home</a>
+        <a href="support.html">Support</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="solo">
+    <div class="wrap">
+      <section class="hero solo-hero">
+        <h1>StringAI is coming.</h1>
+      </section>
+
+      <section id="waitlist" class="waitlist solo-waitlist">
+        <p>Enter your email and we'll reach out when the app is ready.</p>
+        <form id="waitlist-form" novalidate>
+          <label class="sr-only" for="waitlist-email">Email address</label>
+          <input
+            id="waitlist-email"
+            name="email"
+            type="email"
+            inputmode="email"
+            autocomplete="email"
+            placeholder="you@example.com"
+            required
+          />
+          <button id="waitlist-submit" class="btn" type="submit">Notify me</button>
+        </form>
+        <p id="waitlist-status" class="waitlist-status" role="status" aria-live="polite"></p>
+      </section>
+    </div>
+  </main>
+
+  <script src="waitlist.js"></script>
+
+  <footer class="site">
+    <div class="wrap">
+      <span>© 2026 Joshua Vigel. StringAI.</span>
+      <span class="links">
+        <a href="privacy.html">Privacy Policy</a>
+        <a href="terms.html">Terms of Service</a>
+        <a href="support.html">Support</a>
+      </span>
+    </div>
+  </footer>
+</body>
+</html>

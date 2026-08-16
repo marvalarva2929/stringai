@@ -4,7 +4,7 @@
 
 AI-powered mobile tutor for string instruments (violin first). User picks a piece, records themselves, gets actionable piece-aware feedback — not generic scores, but "your F# on the D-string lands flat specifically when played with your 4th finger." Targets hobbyist players who can't afford frequent in-person lessons.
 
-**Tiers:** Free (2 lifetime analyses) · $9.99/mo · $59.99/yr
+**Access:** Subscription-only. Monthly (7-day free trial) or annual (14-day free trial). A mandatory paywall follows the first-run activation flow; there is no free tier.
 
 ---
 

@@ -4,6 +4,8 @@ import type { RankedPracticeEvidence } from './practiceRanking';
 import type { BowGeometryTarget } from './bowGeometryEvaluator';
 import { exercisesForMetric } from '../constants/exercises';
 import { METRIC_META } from '../constants/metricMeta';
+import { generateExercises } from './exercises/registry';
+import { buildTechniqueStaple } from './exercises/techniqueStaple';
 
 export type CoachIntensity = 'guided' | 'balanced' | 'advanced';
 
@@ -15,7 +17,21 @@ export type PracticeBlockType =
   | 'rhythm'
   | 'tone'
   | 'phrase_repair'
-  | 'review';
+  | 'review'
+  // Generated, musically-targeted drills (see src/lib/exercises/). Each is its
+  // own type because the type is what the player sees on the path — collapsing
+  // "the D→A crossing wave" and "the G arpeggio cycle" into one label would
+  // undo the whole point of generating them.
+  | 'arpeggio_cycle'
+  | 'figure_loop'
+  | 'finger_pattern'
+  | 'shifting_ladder'
+  | 'crossing_wave'
+  | 'bow_distribution'
+  | 'articulation'
+  | 'trill_chain'
+  | 'acceleration'
+  | 'etude_fragment';
 
 export type LiveSignal = 'pitch' | 'tone' | 'vibrato' | 'rhythm' | 'bow' | 'posture' | 'camera';
 
@@ -50,7 +66,18 @@ export interface PracticeSuccessCriteria {
  * captured take, and the thresholds it judges against. Optional on
  * PracticeBlock so unmigrated blocks keep the self-report result screen.
  */
-export type EvaluatorId = 'pitchLanding' | 'vibrato' | 'bowGeometry' | 'toneFault' | 'dynamicsShape';
+export type EvaluatorId =
+  | 'pitchLanding'
+  | 'vibrato'
+  | 'bowGeometry'
+  | 'toneFault'
+  | 'dynamicsShape'
+  | 'hold'
+  | 'scale'
+  | 'sequence'
+  | 'rhythm'
+  | 'trill'
+  | 'attack';
 
 export interface PitchLandingEvaluatorParams {
   evaluatorId: 'pitchLanding';
@@ -100,9 +127,41 @@ export interface ScaleEvaluatorParams {
   scaleName: string;
   centsThreshold: number;
   minConfidence?: number;
+  /** Score out of 100 needed to pass. See sequenceScore.ts. */
+  passMark?: number;
   /** Octave-specific MIDI note of the flagged issue, so the judged sequence is
    *  rooted in the same register the instructions point to (see scaleNoteSequence). */
   rootMidiNote?: number;
+}
+
+/** One click of a paced drill: the note to play, plus what to watch for. */
+export interface SequenceStep {
+  /** Octave-qualified note name, e.g. "F#4". */
+  note: string;
+  /**
+   * Short hint shown under the big note during the take — "cross to A",
+   * "shift to 3rd", "4th finger". This is what makes a generated sequence
+   * playable without the player having to work out what it is testing.
+   */
+  annotation?: string;
+}
+
+/**
+ * The general paced-note-sequence drill: the app shows a note per click and
+ * grades each one against what it asked for. `scale` is the special case where
+ * the sequence is derived from a scale name; everything the exercise generators
+ * produce — arpeggio cycles, shifting ladders, crossing waves, the player's own
+ * extracted figure — is an explicit sequence and comes through here.
+ */
+export interface SequenceEvaluatorParams {
+  evaluatorId: 'sequence';
+  steps: SequenceStep[];
+  centsThreshold: number;
+  /** Click tempo for the take. Acceleration drills raise it between rounds. */
+  bpm: number;
+  minConfidence?: number;
+  /** Score out of 100 needed to pass. See sequenceScore.ts. */
+  passMark?: number;
 }
 
 export interface RhythmEvaluatorParams {
@@ -120,6 +179,21 @@ export interface RhythmEvaluatorParams {
   minConfidence?: number;
 }
 
+export interface TrillEvaluatorParams {
+  evaluatorId: 'trill';
+  requiredAlternations: number;
+  /** Semitones between the two trill notes. */
+  intervalSemitones: number;
+  maxGapCv: number;
+}
+
+export interface AttackEvaluatorParams {
+  evaluatorId: 'attack';
+  stroke: import('./attackEvaluator').StrokeName;
+  requiredMatchFraction: number;
+  minNotes?: number;
+}
+
 export type EvaluatorParams =
   | PitchLandingEvaluatorParams
   | VibratoEvaluatorParams
@@ -128,7 +202,10 @@ export type EvaluatorParams =
   | DynamicsShapeEvaluatorParams
   | HoldEvaluatorParams
   | ScaleEvaluatorParams
-  | RhythmEvaluatorParams;
+  | SequenceEvaluatorParams
+  | RhythmEvaluatorParams
+  | TrillEvaluatorParams
+  | AttackEvaluatorParams;
 
 export interface PracticeTarget {
   metricKey: MetricKey;
@@ -149,6 +226,13 @@ export interface PracticeBlock {
   title: string;
   subtitle: string;
   reason: string;
+  /**
+   * The sentence that connects the finding to the drill — "this is that same
+   * crossing, on open strings, slow enough to hear the arm change level".
+   * Without it a targeted drill still reads as a generic one that happened to
+   * appear after a bad take.
+   */
+  bridge?: string;
   estimatedMinutes: number;
   coachIntensity: CoachIntensity;
   instructions: string[];
@@ -170,6 +254,10 @@ export interface PracticeBlockBuildOptions {
    *  cold start (show the record-a-baseline prompt) from a clean session with no
    *  flagged issues (show maintenance work, not "record your first session"). */
   hasAnalyzedSessions?: boolean;
+  /** Key of the music being worked on, so the warm-up uses its notes. */
+  keyName?: string | null;
+  /** Whether the player has been taught to shift out of first position. */
+  canShift?: boolean;
 }
 
 export function coachIntensityFor(
@@ -196,6 +284,23 @@ export function targetPlanMinutes(weeklyGoalMinutes?: number | null): number {
 }
 
 /**
+ * Generated drills are distinguished by what they actually ask the player to
+ * play. Two crossing waves on the same string pair are the same work twice; a
+ * D→A wave and a G→D wave are not, and collapsing them would throw away the
+ * targeting that makes them worth generating.
+ */
+const TARGETED_TYPES = new Set<PracticeBlockType>([
+  'arpeggio_cycle',
+  'figure_loop',
+  'finger_pattern',
+  'shifting_ladder',
+  'crossing_wave',
+  'trill_chain',
+  'acceleration',
+  'etude_fragment',
+]);
+
+/**
  * Two blocks describe the same drill, so evidence for one corroborates the other.
  * Only `pitch_landing` distinguishes by target: a second bad note is worth its own
  * drill, whereas a second scale or a second bow drill is the same work twice.
@@ -203,7 +308,18 @@ export function targetPlanMinutes(weeklyGoalMinutes?: number | null): number {
 function sameBlockIdentity(a: PracticeBlock, b: PracticeBlock): boolean {
   if (a.type !== b.type) return false;
   if (a.type === 'pitch_landing') return a.target.pitchClass === b.target.pitchClass;
+  if (TARGETED_TYPES.has(a.type)) {
+    // Same drill only when it is literally the same notes.
+    return sequenceKey(a) === sequenceKey(b);
+  }
   return true;
+}
+
+/** The notes a drill asks for, as a comparable string. */
+function sequenceKey(block: PracticeBlock): string {
+  const evaluator = block.evaluator;
+  if (evaluator?.evaluatorId === 'sequence') return evaluator.steps.map((s) => s.note).join(',');
+  return `${block.target.string ?? ''}:${block.target.midiNote ?? ''}:${block.target.scaleName ?? ''}`;
 }
 
 /** Fold `refs` into `block`, skipping evidence it already cites. */
@@ -215,12 +331,31 @@ function attachEvidence(block: PracticeBlock, refs: PracticeEvidenceRef[]): void
   }
 }
 
+/**
+ * A plan of pure passage-repair is all medicine and no diet. A measured fault
+ * always outranks a scale nothing flagged, so left to the ranker the warm-up
+ * never appears — it needs a reserved slot rather than a fair fight. Below three
+ * blocks there isn't room, and repair is the better use of a short session.
+ */
+const MIN_BLOCKS_FOR_STAPLE = 3;
+
 export function buildPracticeBlocks(
   ranked: RankedPracticeEvidence[],
   options: PracticeBlockBuildOptions = {},
 ): PracticeBlock[] {
-  const maxBlocks = targetBlockCount(options.weeklyGoalMinutes);
+  const totalSlots = targetBlockCount(options.weeklyGoalMinutes);
   const intensity = coachIntensityFor(options.playerCategory, options.weeklyGoalMinutes);
+  const wantsStaple = totalSlots >= MIN_BLOCKS_FOR_STAPLE;
+  const staple = wantsStaple
+    ? buildTechniqueStaple({
+        intensity,
+        skillLevel: options.skillLevel,
+        keyName: options.keyName,
+        canShift: options.canShift,
+      })
+    : null;
+  // The staple takes a slot, so the evidence-driven drills compete for the rest.
+  const maxBlocks = staple ? totalSlots - 1 : totalSlots;
   const blocks: PracticeBlock[] = [];
   const usedMetrics = new Set<MetricKey>();
 
@@ -236,8 +371,15 @@ export function buildPracticeBlocks(
         continue;
       }
 
+      // One drill per metric stops three near-identical exercises for one weak
+      // area. Generated drills are exempt for the same reason `scale_lock` is:
+      // they are already distinguished by their target, and every musical moment
+      // carries `pitchAccuracy`, so the rule would otherwise cap a whole plan at
+      // exactly one targeted exercise.
+      const exemptFromMetricCap =
+        candidate.type === 'scale_lock' || TARGETED_TYPES.has(candidate.type);
       const metricTaken =
-        candidate.type !== 'scale_lock' && usedMetrics.has(candidate.target.metricKey) && blocks.length > 0;
+        !exemptFromMetricCap && usedMetrics.has(candidate.target.metricKey) && blocks.length > 0;
 
       // Evidence the analyzer could not actually measure may corroborate an
       // existing block but must never seed a technique drill of its own — that
@@ -262,7 +404,8 @@ export function buildPracticeBlocks(
       ? maintenanceBlocks(intensity, options.weeklyGoalMinutes)
       : starterBlocks(intensity, options.weeklyGoalMinutes);
   }
-  return blocks;
+  // Warm-up first, then the repair work — the order a real practice session runs in.
+  return staple ? [staple, ...blocks] : blocks;
 }
 
 function blocksForEvidence(
@@ -273,6 +416,16 @@ function blocksForEvidence(
   if (!evidence.measurementAvailable && evidence.requiresCamera) {
     return [reviewBlock(evidence, intensity, 'Live camera data is not reliable yet for this target.')];
   }
+
+  // Generated drills first: when a moment carries enough musical context to
+  // produce real notes, that beats any template. Falls through when it doesn't.
+  const generated = generateExercises({
+    evidence,
+    intensity,
+    skillLevel: options.skillLevel,
+    canShift: options.canShift,
+  });
+  if (generated.length > 0) return generated;
 
   switch (evidence.kind) {
     case 'pitch_note':

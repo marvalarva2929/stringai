@@ -9,6 +9,7 @@ import type {
 import type { MetricHistoryEntry } from '../store/useAnalysisStore';
 import { METRIC_META } from '../constants/metricMeta';
 import { collectIssueSources, mergeIssues } from './practiceIssues';
+import { buildMusicalMoments } from './musicalMoments';
 
 export type PracticeEvidenceKind =
   | 'pitch_note'
@@ -19,7 +20,15 @@ export type PracticeEvidenceKind =
   | 'tone'
   | 'bow_pattern'
   | 'phrase'
-  | 'metric_fallback';
+  | 'metric_fallback'
+  // L7.5 musical moments — a figure that went wrong, not a metric that scored
+  // low. These are what let an exercise say "arpeggios in G" (see musicalMoments.ts).
+  | 'figure_intonation'
+  | 'figure_crossing'
+  | 'figure_shift'
+  | 'figure_speed'
+  | 'figure_ornament'
+  | 'figure_sequence';
 
 export interface PracticeEvidenceTarget {
   metricKey?: MetricKey;
@@ -32,6 +41,28 @@ export interface PracticeEvidenceTarget {
   startSeconds?: number;
   endSeconds?: number;
   phraseId?: number;
+  // ── Musical context (L7.5). Present on figure_* evidence; this is what the
+  // exercise generators read to produce real, key-correct note sequences.
+  figureKind?: import('./musicalContext').FigureKind | 'phrase';
+  /** e.g. "G major" — accepted verbatim by scaleSequence.parseScaleName. */
+  keyName?: string;
+  /** e.g. "D7", "G major" — the harmony an arpeggio figure spelled. */
+  chordLabel?: string;
+  strings?: string[];
+  /**
+   * For crossing findings: the pairs actually crossed, most-frequent first,
+   * each low-to-high ('G-D'). Distinct from `strings`, which is every string
+   * touched — a passage over G, D and A never crosses G-A.
+   */
+  stringPairs?: string[];
+  fromPosition?: string;
+  toPosition?: string;
+  notesPerSecond?: number;
+  /** The player's own notes from the flagged figure — the extracted-figure drill. */
+  midiSequence?: number[];
+  noteSequence?: string[];
+  /** `figure_ornament` only: [lower, upper] MIDI of the alternating pair. */
+  trillPair?: [number, number];
   /** Detected tempo (BPM) from the flagged session's rhythm analysis — seeds the
    *  click-track drill at the tempo the player actually struggled at, instead of
    *  a generic default. */
@@ -49,6 +80,13 @@ export interface PracticeEvidence {
   metricKey: MetricKey;
   title: string;
   reason: string;
+  /**
+   * How this compares with the rest of the take — "your crossing runs averaged
+   * 24¢ further off than everything else". Present only when a real group
+   * comparison cleared its sample and effect-size floors, because this sentence
+   * is the difference between a tally and a diagnosis and must never be guessed.
+   */
+  contrast?: string;
   evidenceSummary: string;
   priority: number;
   confidence: number;
@@ -72,6 +110,66 @@ export interface PracticeEvidenceInput {
   metricHistory?: MetricHistoryEntry[];
   sessionWindow?: number;
   playerCategory?: PlayerCategory | null;
+}
+
+/**
+ * Bumped whenever the *meaning* of frozen evidence changes — a new evidence
+ * kind, a changed id scheme, a corrected field.
+ *
+ * Evidence is computed once at analysis time and persisted, which is what makes
+ * the results screen and the practice plan agree. The cost is that improving
+ * the analysis does nothing for sessions already recorded: they keep serving
+ * whatever they froze. A crossing finding that named the wrong pair of strings
+ * went on naming it long after the bug was fixed.
+ *
+ * History:
+ *   1  original metric/pitch/vibrato/rhythm evidence
+ *   2  musical moments (figure_*), and crossing findings that name the pair
+ *      actually crossed rather than the outer edges of the strings touched
+ */
+export const EVIDENCE_VERSION = 2;
+
+/**
+ * The evidence to trust for a session.
+ *
+ * Recomputes when the frozen copy predates the current analysis, which a rich
+ * AnalysisResult can always do — it still carries the raw material. Falls back
+ * to the frozen copy when there is nothing to recompute from.
+ */
+export function sessionEvidenceFor(session: AnalysisResult): PracticeEvidence[] {
+  const frozen = session.sessionEvidence;
+  if (frozen && session.evidenceVersion === EVIDENCE_VERSION) return frozen;
+  const recomputed = buildSessionEvidence(session);
+  // An empty recompute means the raw analyses are gone (a session rehydrated
+  // from storage without them); the stale copy beats nothing at all.
+  if (recomputed.length === 0 && frozen) return frozen;
+  return recomputed;
+}
+
+/** Evidence kinds whose meaning changed in v2 — see EVIDENCE_VERSION. */
+const V2_KINDS = new Set<PracticeEvidenceKind>([
+  'figure_intonation',
+  'figure_crossing',
+  'figure_shift',
+  'figure_speed',
+  'figure_ornament',
+  'figure_sequence',
+]);
+
+/**
+ * Drop evidence from an older version that can no longer be recomputed.
+ *
+ * For history entries there is no raw material left, so a stale figure finding
+ * cannot be corrected — only kept or dropped. Kept, it goes on telling the
+ * player their G-E crossings drifted when they never crossed G to E. A missing
+ * finding is recoverable (the next take regenerates it); a wrong one is not.
+ */
+export function withoutStaleEvidence(
+  evidence: PracticeEvidence[],
+  version: number | undefined,
+): PracticeEvidence[] {
+  if (version === EVIDENCE_VERSION) return evidence;
+  return evidence.filter((item) => !V2_KINDS.has(item.kind));
 }
 
 export interface PracticeEvidenceResult {
@@ -157,7 +255,7 @@ export function computeMetricAverages(
     }
   } else {
     for (const session of normalizeSessions(recentSessions, sessionWindow)) {
-      for (const score of session.metrics) {
+      for (const score of session.metrics ?? []) {
         const scores = accumulator.get(score.key) ?? [];
         scores.push(score.score);
         accumulator.set(score.key, scores);
@@ -303,7 +401,7 @@ function addStabilityEvidence(byId: Map<string, PracticeEvidence>, session: Anal
 }
 
 function addVibratoEvidence(byId: Map<string, PracticeEvidence>, session: AnalysisResult): void {
-  const vibratoMetric = session.metrics.find((m) => m.key === 'vibrato');
+  const vibratoMetric = (session.metrics ?? []).find((m) => m.key === 'vibrato');
   const analysis = session.vibratoAnalysis;
   if (!analysis && (!vibratoMetric || vibratoMetric.score >= 78)) return;
 
@@ -349,7 +447,7 @@ function addVibratoEvidence(byId: Map<string, PracticeEvidence>, session: Analys
 
 function addRhythmEvidence(byId: Map<string, PracticeEvidence>, session: AnalysisResult): void {
   const rhythm = session.rhythmAnalysis;
-  const metric = session.metrics.find((m) => m.key === 'rhythmAccuracy');
+  const metric = (session.metrics ?? []).find((m) => m.key === 'rhythmAccuracy');
   if (!rhythm && (!metric || metric.score >= 78)) return;
   const issueCount = (rhythm?.rushCount ?? 0) + (rhythm?.dragCount ?? 0);
   if (rhythm && issueCount === 0 && rhythm.gridScore >= 78) return;
@@ -423,7 +521,7 @@ function dominantFaultType(metric: MetricScore): string | undefined {
 }
 
 function addMetricEvidence(byId: Map<string, PracticeEvidence>, session: AnalysisResult): void {
-  for (const metric of session.metrics) {
+  for (const metric of session.metrics ?? []) {
     if (UNTRACKED_METRICS.has(metric.key)) continue;
     if (metric.score >= 78 || !metricMeasurementAvailable(metric)) continue;
     const kind = METRIC_TO_KIND[metric.key] ?? 'metric_fallback';
@@ -550,8 +648,19 @@ function formatEvidenceValue(value: number): string {
  * results screen and the daily plan read the exact same issues — one source of
  * truth rather than two independent derivations.
  */
+/**
+ * `metrics` is required on the type but absent in practice on sessions
+ * rehydrated from storage or fetched back in degraded form. That was harmless
+ * while this only ran at analysis time; recomputing stale evidence means it now
+ * runs against exactly those sessions, and an unguarded `.find` there takes the
+ * whole results screen down.
+ */
 export function buildSessionEvidence(session: AnalysisResult): PracticeEvidence[] {
   const byId = new Map<string, PracticeEvidence>();
+  // Musical moments go in first so that when a figure finding and a bare
+  // pitch-class finding describe the same notes, the ranker sees both and the
+  // richer one wins on its own merits rather than by insertion order.
+  for (const moment of buildMusicalMoments(session)) pushEvidence(byId, moment);
   addPitchNoteEvidence(byId, session);
   addStabilityEvidence(byId, session);
   addVibratoEvidence(byId, session);

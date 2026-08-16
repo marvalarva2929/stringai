@@ -40,6 +40,8 @@ export interface PracticePlanInput {
   playerCategory?: PlayerCategory | null;
   weeklyGoalMinutes?: number | null;
   skillLevel?: SkillLevel;
+  /** Whether the player has been taught to shift out of first position. */
+  canShift?: boolean;
   sessionWindow?: number;
   /** Defaults to daily. Session/piece scopes filter the evidence window down to
    *  the matching sessions and stamp a distinct plan id. */
@@ -121,11 +123,19 @@ export function computePracticePlan(
   const ranked = rankPracticeEvidence(evidenceResult.evidence, {
     playerCategory: input.playerCategory,
   });
+  // Key of the most recent scoped session, so the warm-up is in the key the
+  // player has actually been working in rather than a default.
+  const keyName = scopedSessions
+    .map((session) => session.musicalContext?.key)
+    .find((key) => key != null && key.confidence >= 0.3)?.name;
+
   const blocks = buildPracticeBlocks(ranked, {
     playerCategory: input.playerCategory,
     weeklyGoalMinutes: input.weeklyGoalMinutes,
     skillLevel: input.skillLevel,
     hasAnalyzedSessions: evidenceResult.sessionCount > 0,
+    keyName,
+    canShift: input.canShift,
   });
 
   const generatedAt = new Date().toISOString();
@@ -167,11 +177,14 @@ function distributeBlockMinutes(blocks: PracticeBlock[], targetMinutes: number):
 }
 
 function primaryFocus(blocks: PracticeBlock[], evidence: PracticeEvidence[]): string {
-  const firstBlock = blocks[0];
-  if (firstBlock?.type === 'pitch_landing' && firstBlock.target.pitchClass) {
-    return `${firstBlock.target.pitchClass} landing`;
+  // The warm-up sits first in the plan but is not what the session is *about*
+  // — it cites no evidence precisely because nothing flagged it. Naming it in
+  // the hero would bury the actual finding behind "Hand-frame check".
+  const focusBlock = blocks.find((block) => block.evidenceRefs.length > 0) ?? blocks[0];
+  if (focusBlock?.type === 'pitch_landing' && focusBlock.target.pitchClass) {
+    return `${focusBlock.target.pitchClass} landing`;
   }
-  if (firstBlock) return firstBlock.title;
+  if (focusBlock) return focusBlock.title;
   return evidence[0]?.title ?? 'Baseline practice';
 }
 

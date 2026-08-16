@@ -6,6 +6,9 @@ import { Ionicons } from '@expo/vector-icons';
 import { colors, spacing, radius } from '../../constants/theme';
 import { haptic } from '../../lib/haptics';
 import { STEP_COPY } from '../../constants/onboardingContent';
+import { AnalyticsEvent } from '../../constants/analyticsEvents';
+import { track } from '../../services/analytics';
+import { requestTrackingPermission } from '../../services/trackingPermission';
 import { ReminderTimeChips } from './ReminderTimeChips';
 
 interface PermissionsStepProps {
@@ -33,8 +36,29 @@ export function PermissionsStep({
 
   const requestBoth = async () => {
     haptic.light();
-    if (!cameraGranted) await requestCameraPermission();
-    if (!micGranted) await requestMicPermission();
+    if (!cameraGranted) {
+      const res = await requestCameraPermission();
+      track(AnalyticsEvent.ONBOARDING_PERMISSION_RESULT, {
+        permission: 'camera',
+        granted: res.granted,
+      });
+    }
+    if (!micGranted) {
+      const res = await requestMicPermission();
+      track(AnalyticsEvent.ONBOARDING_PERMISSION_RESULT, {
+        permission: 'microphone',
+        granted: res.granted,
+      });
+    }
+    // ATT rides on the same tap, after the two permissions the user actually
+    // came here for. Prompting cold on first launch is the version people
+    // dismiss reflexively, and Apple requires the prompt to appear at all.
+    const att = await requestTrackingPermission();
+    track(AnalyticsEvent.ONBOARDING_PERMISSION_RESULT, {
+      permission: 'att',
+      granted: att === 'granted',
+      status: att,
+    });
   };
 
   return (

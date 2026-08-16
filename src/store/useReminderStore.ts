@@ -2,6 +2,8 @@ import { create } from 'zustand';
 import { persist, createJSONStorage, StateStorage } from 'zustand/middleware';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { scheduleDailyReminder, cancelReminders } from '../lib/notifications';
+import { AnalyticsEvent } from '../constants/analyticsEvents';
+import { track } from '../services/analytics';
 
 const safeStorage: StateStorage = {
   getItem: (name) => AsyncStorage.getItem(name).catch(() => null),
@@ -30,11 +32,15 @@ export const useReminderStore = create<ReminderState>()(
       enable: async (hour, minute) => {
         await scheduleDailyReminder(hour, minute);
         set({ enabled: true, hour, minute });
+        // Reminder opt-in is one of the strongest retention predictors, and the
+        // chosen hour explains a lot about who sticks.
+        track(AnalyticsEvent.REMINDER_ENABLED, { hour });
       },
 
       disable: async () => {
         await cancelReminders();
         set({ enabled: false });
+        track(AnalyticsEvent.REMINDER_DISABLED);
       },
     }),
     {

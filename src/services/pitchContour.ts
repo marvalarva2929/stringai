@@ -25,6 +25,12 @@ const VIBRATO_RATE_CENTER_HZ   = 5.5; // ideal rate; sweet spot ±1.5 Hz, slope 
 const VIBRATO_AC_THRESHOLD_NORMAL = 0.22; // periodicity gate for full-length segments
 const VIBRATO_AC_THRESHOLD_SHORT  = 0.12; // relaxed gate for segments < 2 vibrato cycles
 const VIBRATO_CONSISTENCY_MAX  = 0.75; // cvMAD above this → inconsistency flag
+// Trend removal before measuring. A note with no vibrato still moves in pitch — bow-change
+// dips, a scooped attack, slow drift, a missed onset gluing two notes together. All of that
+// is below 3 Hz, so subtracting a center line smoothed at this cutoff leaves only the
+// vibrato band and stops non-vibrato motion from being measured as vibrato depth.
+const VIBRATO_TREND_CUTOFF_HZ = 2.5;
+const VIBRATO_TRIM_S = 0.08; // attack/release transient trimmed from each end before measuring
 const THIRD_LABELS = ['first', 'second', 'last'] as const;
 
 // Intonation-stability thresholds. avgStd is the drift of the (vibrato-detrended) pitch
@@ -325,42 +331,98 @@ export function scoreIntonationStability(
 export function classifyVibratoSegment(
   devs: number[],
   hopHz: number,
-): { rate: number; depth: number; periodicityScore: number; consistencyOk: boolean; feedbackNotes: string[]; noteScore: number; isVibrato: boolean } {
-  const n = devs.length;
+): { rate: number; depth: number; periodicityScore: number; consistencyOk: boolean; feedbackNotes: string[]; noteScore: number; detected: boolean; isVibrato: boolean; oscCents: number[] } {
   // Clip at ±150¢ before any statistics — real vibrato never exceeds ~±50¢ and YIN octave
   // errors (±1200¢) would otherwise explode both variance and autocorrelation.
   const CLIP = 150;
-  const clipped = devs.map((d) => Math.max(-CLIP, Math.min(CLIP, d)));
-  const mean = clipped.reduce((a, b) => a + b, 0) / n;
-  const variance = clipped.reduce((acc, d) => acc + (d - mean) ** 2, 0) / n;
-  const depth = Math.sqrt(variance) * Math.SQRT2;
+  const clippedFull = devs.map((d) => Math.max(-CLIP, Math.min(CLIP, d)));
 
-  if (depth < VIBRATO_DEPTH_MIN_CENTS) {
-    return { rate: 0, depth, periodicityScore: 0, consistencyOk: true, feedbackNotes: ['no vibrato detected'], noteScore: 0, isVibrato: false };
-  }
+  // Remove the sub-3 Hz trend so only the vibrato band is measured. Without this, a scooped
+  // attack or a slow drift on a note with NO vibrato produces 20–40¢ of "depth" and an
+  // autocorrelation that peaks at the shortest lag searched — which is how flat notes ended
+  // up labelled "too wide" or "shallow" instead of "no vibrato".
+  const trendWin = Math.min(clippedFull.length, Math.max(3, Math.round(hopHz / VIBRATO_TREND_CUTOFF_HZ)));
+  const trend = smoothCenterLine(clippedFull, trendWin);
+  const oscFull = clippedFull.map((d, i) => d - trend[i]);
 
-  // Normalized autocorrelation across lags corresponding to 3–8 Hz (use clipped signal)
-  const lagMin = Math.max(2, Math.round(hopHz / VIBRATO_RATE_MAX_HZ));
-  const lagMax = Math.min(n - 2, Math.round(hopHz / VIBRATO_RATE_MIN_HZ));
-  let bestLag = lagMin, bestAC = -Infinity;
+  // Trim the attack/release transients, which survive detrending as one-off spikes.
+  const trimN = Math.round(hopHz * VIBRATO_TRIM_S);
+  const osc = oscFull.length - 2 * trimN >= VIBRATO_MIN_FRAMES
+    ? oscFull.slice(trimN, oscFull.length - trimN)
+    : oscFull;
+
+  const none = (extra: Partial<{ rate: number; depth: number; periodicityScore: number }> = {}) => ({
+    rate: 0, depth: 0, periodicityScore: 0, consistencyOk: true,
+    feedbackNotes: ['no vibrato detected'], noteScore: 0,
+    detected: false, isVibrato: false, oscCents: oscFull, ...extra,
+  });
+
+  const n = osc.length;
+  const mean = osc.reduce((a, b) => a + b, 0) / n;
+  const variance = osc.reduce((acc, d) => acc + (d - mean) ** 2, 0) / n;
+  const residualDepth = Math.sqrt(variance) * Math.SQRT2;
+  if (variance <= 0) return none();
+
+  // Normalized autocorrelation across the 3–8 Hz band, plus one lag of margin on each side
+  // so the band-edge lags can still be tested for peak-ness.
+  const lagMin = Math.max(2, Math.round(hopHz / VIBRATO_RATE_MAX_HZ) - 1);
+  const lagMax = Math.min(n - 2, Math.round(hopHz / VIBRATO_RATE_MIN_HZ) + 1);
+  if (lagMax <= lagMin + 1) return none({ depth: residualDepth });
+  const ac: number[] = [];
   for (let lag = lagMin; lag <= lagMax; lag++) {
     let sum = 0;
-    for (let i = 0; i < n - lag; i++) sum += (clipped[i] - mean) * (clipped[i + lag] - mean);
-    const ac = sum / ((n - lag) * variance);
-    if (ac > bestAC) { bestAC = ac; bestLag = lag; }
+    for (let i = 0; i < n - lag; i++) sum += (osc[i] - mean) * (osc[i + lag] - mean);
+    ac[lag] = sum / ((n - lag) * variance);
   }
-  const rate = hopHz / bestLag;
+
+  // Require a genuine interior peak. Noise and leftover trend produce an autocorrelation that
+  // falls off monotonically — its argmax is pinned to whichever lag bounds the search, which
+  // is why the old argmax-only rate was *always* inside 3–8 Hz and the rate gate never fired.
+  // Only a real oscillation puts a local maximum at its own period.
+  const peaks: number[] = [];
+  for (let lag = lagMin + 1; lag < lagMax; lag++) {
+    if (ac[lag] >= ac[lag - 1] && ac[lag] > ac[lag + 1]) peaks.push(lag);
+  }
+  if (peaks.length === 0) return none({ depth: residualDepth });
+  // Autocorrelation peaks again at multiples of the true period, so the global max can sit on
+  // a harmonic and report a rate 2–3× too slow. Take the shortest lag that is nearly as strong.
+  const strongestAC = Math.max(...peaks.map((l) => ac[l]));
+  const bestLag = peaks.find((l) => ac[l] >= 0.85 * strongestAC)!;
+  const bestAC = ac[bestLag];
+
+  // Parabolic interpolation: at a 40 Hz hop, adjacent lags near 6 Hz are ~1 Hz apart, so an
+  // un-refined hopHz/lag would quantize the rate straight across the 4/7 Hz fault boundaries.
+  const a = ac[bestLag - 1], b = bestAC, c = ac[bestLag + 1];
+  const denom = a - 2 * b + c;
+  const refinedLag = denom !== 0
+    ? bestLag + Math.max(-0.5, Math.min(0.5, 0.5 * (a - c) / denom))
+    : bestLag;
+
+  const rate = hopHz / refinedLag;
   const periodicityScore = Math.max(0, bestAC);
 
-  // Thirds consistency (use clipped signal)
+  // Detrending attenuates (and just above cutoff, amplifies) the band being measured, so undo
+  // the filter's exact gain at the detected rate: H(f) = |1 − Dirichlet_win(f)|.
+  const x = Math.PI * rate / hopHz;
+  const dirichlet = Math.abs(Math.sin(x)) < 1e-9 ? 1 : Math.sin(x * trendWin) / (trendWin * Math.sin(x));
+  const trendGain = Math.abs(1 - dirichlet);
+  const depth = trendGain > 0.2 ? residualDepth / trendGain : residualDepth;
+
+  const rateInRange = rate >= VIBRATO_RATE_MIN_HZ && rate <= VIBRATO_RATE_MAX_HZ;
+  if (!rateInRange || depth < VIBRATO_DEPTH_MIN_CENTS) {
+    return none({ depth, rate: rateInRange ? rate : 0, periodicityScore });
+  }
+
+  // Thirds consistency — measured on the detrended oscillation, so it reports whether the
+  // vibrato depth holds up, not whether the note's pitch center wandered.
   const third = Math.max(1, Math.floor(n / 3));
   const thirdMADs = [0, 1, 2].map((t) => {
-    const sl = clipped.slice(t * third, (t + 1) * third);
+    const sl = osc.slice(t * third, (t + 1) * third);
     if (sl.length === 0) return 0;
-    const sliceMean = sl.reduce((a, d) => a + d, 0) / sl.length;
-    return sl.reduce((a, d) => a + Math.abs(d - sliceMean), 0) / sl.length;
+    const sliceMean = sl.reduce((acc, d) => acc + d, 0) / sl.length;
+    return sl.reduce((acc, d) => acc + Math.abs(d - sliceMean), 0) / sl.length;
   });
-  const meanMAD = thirdMADs.reduce((a, b) => a + b) / 3;
+  const meanMAD = thirdMADs.reduce((p, q) => p + q) / 3;
   const cvMAD = Math.sqrt(thirdMADs.reduce((acc, m) => acc + (m - meanMAD) ** 2, 0) / 3) / (meanMAD + 0.1);
   const consistencyOk = cvMAD < VIBRATO_CONSISTENCY_MAX;
   const dominantThird = thirdMADs.indexOf(Math.max(...thirdMADs));
@@ -368,19 +430,6 @@ export function classifyVibratoSegment(
   // Short segments have few AC pairs — lower the gate and let depth carry more weight
   const minCycleFrames = Math.round(hopHz / VIBRATO_RATE_MIN_HZ);
   const acThreshold = n < 2 * minCycleFrames ? VIBRATO_AC_THRESHOLD_SHORT : VIBRATO_AC_THRESHOLD_NORMAL;
-
-  // Rate gate — must be computed before the early returns below
-  const rateInRange = rate >= VIBRATO_RATE_MIN_HZ && rate <= VIBRATO_RATE_MAX_HZ;
-
-  // Hard gate only when the note clearly cannot be vibrato:
-  //   • rate is out of the 3–8 Hz range, OR
-  //   • AC is very low AND depth is marginal (likely noise / no real oscillation).
-  // A note with good depth AND in-range rate IS real vibrato even if irregular —
-  // AC = 0 for genuinely uneven human vibrato should score ~60, not 20.
-  // The scoring formula below handles low AC naturally via periodicityNorm = 0.
-  if (!rateInRange || (periodicityScore < 0.05 && depth < VIBRATO_DEPTH_MIN_CENTS * 2)) {
-    return { rate, depth, periodicityScore, consistencyOk, feedbackNotes: ['vibrato rhythm is too uneven to measure — try for a steadier wrist motion'], noteScore: 20, isVibrato: false };
-  }
 
   // Feedback strings — multiple issues can apply to one note; thresholds are intentionally lenient
   const feedbackNotes: string[] = [];
@@ -412,10 +461,14 @@ export function classifyVibratoSegment(
     0.20 * rateScore,
   );
 
-  // isVibrato is a presence flag — requires AC above threshold for a clean positive signal
-  const isVibrato = rateInRange && periodicityScore >= acThreshold;
-
-  return { rate, depth, periodicityScore, consistencyOk, feedbackNotes, noteScore, isVibrato };
+  // `detected` means a band-limited oscillation was actually found (interior AC peak, in-range
+  // rate, real depth) — that is the presence question the UI asks. `isVibrato` is the stricter
+  // flag: a *clean* periodic signal. Vibrato that is present but too irregular to clear the AC
+  // gate lands between the two, and is reported as uneven rather than absent.
+  return {
+    rate, depth, periodicityScore, consistencyOk, feedbackNotes, noteScore,
+    detected: true, isVibrato: periodicityScore >= acThreshold, oscCents: oscFull,
+  };
 }
 
 // ─── UI-facing vibrato fault classification ──────────────────────────────────
@@ -439,8 +492,13 @@ export const VIBRATO_DISPLAY = {
   DEPTH_TARGET_HI: VIBRATO_DEPTH_SWEET_HIGH,
 } as const;
 
-/** True when a persisted note actually contained measurable vibrato. */
-export function hasVibrato(note: { rateHz: number; depthCents: number }): boolean {
+/**
+ * True when a persisted note actually contained measurable vibrato. Prefers the engine's
+ * `detected` flag; the rate/depth fallback is only for analyses persisted before that field
+ * existed (on fresh analyses rate is 0 whenever nothing was detected, so the two agree).
+ */
+export function hasVibrato(note: { rateHz: number; depthCents: number; detected?: boolean }): boolean {
+  if (note.detected !== undefined) return note.detected;
   return note.rateHz >= VIBRATO_RATE_MIN_HZ &&
          note.rateHz <= VIBRATO_RATE_MAX_HZ &&
          note.depthCents >= VIBRATO_DEPTH_MIN_CENTS;
@@ -457,12 +515,19 @@ export function classifyVibratoFaults(note: {
   depthCents: number;
   periodicityScore: number;
   consistencyOk: boolean;
+  detected?: boolean;
 }): VibratoFault[] {
-  // Depth-gate early return in classifyVibratoSegment: rate 0, depth below minimum.
-  if (note.rateHz === 0 || note.depthCents < VIBRATO_DEPTH_MIN_CENTS) return ['none'];
-  // Hard-gate case: rate outside 3–8 Hz means the oscillation couldn't be
-  // measured as vibrato — its rate/depth numbers are unreliable, report only this.
-  if (note.rateHz < VIBRATO_RATE_MIN_HZ || note.rateHz > VIBRATO_RATE_MAX_HZ) return ['uneven'];
+  // Nothing oscillating in the vibrato band. Checked first — a flat note's rate and depth are
+  // leftover measurement noise, and reading faults off them is what produced spurious
+  // "too wide" / "shallow depth" verdicts on notes played with no vibrato at all.
+  if (note.detected === false) return ['none'];
+
+  if (note.detected === undefined) {
+    // Analyses persisted before `detected` existed. The old engine signalled "nothing found"
+    // with rate 0 / sub-minimum depth, and "couldn't measure it" with an out-of-band rate.
+    if (note.rateHz === 0 || note.depthCents < VIBRATO_DEPTH_MIN_CENTS) return ['none'];
+    if (note.rateHz < VIBRATO_RATE_MIN_HZ || note.rateHz > VIBRATO_RATE_MAX_HZ) return ['uneven'];
+  }
 
   const faults: VibratoFault[] = [];
   if (note.depthCents < VIBRATO_DEPTH_SWEET_LOW) faults.push('shallow');
@@ -540,8 +605,11 @@ export function segmentVibratoNotes(pitches: PitchFrame[], onsets?: number[]): V
       depthCents: Math.round(result.depth * 10) / 10,
       periodicityScore: Math.round(result.periodicityScore * 100) / 100,
       consistencyOk: result.consistencyOk,
+      detected: result.detected,
       feedbackNotes: result.feedbackNotes,
-      cents: devs.map((c) => Math.round(c * 10) / 10),
+      // The detrended trace, not the raw deviation: the drawer overlays an ideal vibrato sine
+      // on this, so a drifting note must not draw a big slope that reads as huge vibrato.
+      cents: result.oscCents.map((c) => Math.round(c * 10) / 10),
     };
   });
 }

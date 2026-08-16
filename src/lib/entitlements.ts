@@ -1,14 +1,20 @@
 /**
- * Entitlement rules — the single source of truth for what each tier can do.
+ * Entitlement rules — the single source of truth for what a subscription grants.
  *
  * Pure and dependency-free (no zustand, no RevenueCat, no Supabase) so the
- * gating rules can be unit-tested in plain Node, matching the convention in
+ * rules can be unit-tested in plain Node, matching the convention in
  * practiceProgress.ts / bowAnalysis.ts.
  *
- * Trial and Pro are the SAME entitlement. The App Store introductory offer
- * grants the `pro` entitlement for its 7 days, so no gate ever branches on
- * trial — `inTrial` exists only so the paywall and settings can say
- * "4 days left". Keep it that way: a gate that checks `inTrial` is a bug.
+ * The app is subscription-only. There is no reduced free experience: a user
+ * without the `pro` entitlement sees the paywall, not a smaller app. That is
+ * why there is exactly one gate here (`requiresSubscription`) rather than a
+ * per-feature predicate for each locked thing — nothing inside the app is
+ * reachable without a subscription, so nothing inside the app needs to ask.
+ *
+ * Trial and paid are the SAME entitlement. The App Store introductory offer
+ * grants `pro` for its 7 or 14 days, so no gate ever branches on trial —
+ * `inTrial` exists only so the paywall and settings can say "4 days left".
+ * Keep it that way: a gate that checks `inTrial` is a bug.
  */
 
 export type Tier = 'free' | 'pro';
@@ -16,9 +22,8 @@ export type Tier = 'free' | 'pro';
 /** RevenueCat's entitlement identifier, configured in the RevenueCat dashboard. */
 export const PRO_ENTITLEMENT_ID = 'pro';
 
-export const FREE_DAILY_ANALYSES = 3;
-
 export interface Entitlement {
+  /** `free` means "no active subscription" — i.e. blocked at the paywall. */
   tier: Tier;
   /** Display only — never gate on this. See file header. */
   inTrial: boolean;
@@ -26,85 +31,73 @@ export interface Entitlement {
   trialEndsAt: string | null;
   /** ISO timestamp the subscription lapses, or null for a lifetime/free row. */
   expiresAt: string | null;
-  analysesUsedToday: number;
-  /**
-   * The day `analysesUsedToday` was counted against, as `YYYY-MM-DD`.
-   * Lets the counter roll over on read rather than needing a scheduled reset.
-   */
-  analysesCountDate: string;
 }
 
-/**
- * `YYYY-MM-DD` in the device's local timezone.
- *
- * Only meaningful for guests. For signed-in users the server's `current_date`
- * is authoritative (see `consume_analysis`), and a user who crosses midnight in
- * a different timezone than the database may see the client's remaining-count
- * hint disagree with the server by a few hours. The server always wins, so the
- * worst case is a stale number in the UI, never a bypassed cap.
- */
-export function localDateKey(now: Date = new Date()): string {
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, '0');
-  const d = String(now.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
+export function freeEntitlement(): Entitlement {
+  return { tier: 'free', inTrial: false, trialEndsAt: null, expiresAt: null };
 }
 
-export function freeEntitlement(now: Date = new Date()): Entitlement {
-  return {
-    tier: 'free',
-    inTrial: false,
-    trialEndsAt: null,
-    expiresAt: null,
-    analysesUsedToday: 0,
-    analysesCountDate: localDateKey(now),
-  };
-}
-
-/** Usage rolled over to `today` — zero once the stored count is from a past day. */
-export function analysesUsedOn(e: Entitlement, today: string = localDateKey()): number {
-  return e.analysesCountDate === today ? e.analysesUsedToday : 0;
-}
-
-// ── The gates ──────────────────────────────────────────────────
+// ── The gate ───────────────────────────────────────────────────
 
 export const isPro = (e: Entitlement): boolean => e.tier === 'pro';
 
-/** Live in-app camera recording (the pose-camera module). */
-export const canRecordLive = isPro;
-
-/** L10 Claude coaching. Free users fall back to buildSessionFeedback(). */
-export const canUseLlmCoaching = isPro;
-
-/** Post-session curated exercises (the per-piece practice plan after a recording). */
-export const canUseCuratedExercises = isPro;
-
-/** Phase 6. Free tier only — trial and Pro are always ad-free. */
-export const showAds = (e: Entitlement): boolean => !isPro(e);
-
-export function analysesRemaining(e: Entitlement, today: string = localDateKey()): number {
-  if (isPro(e)) return Infinity;
-  return Math.max(0, FREE_DAILY_ANALYSES - analysesUsedOn(e, today));
-}
-
-export function canAnalyze(e: Entitlement, today: string = localDateKey()): boolean {
-  return analysesRemaining(e, today) > 0;
-}
-
 /**
- * Optimistic local decrement for guests. Signed-in users must go through the
- * `consume_analysis` RPC instead — this never writes to the server.
+ * The only entitlement gate in the app. True means the subscribe screen is
+ * shown over everything (see the SubscribeGate in app/_layout.tsx).
  */
-export function consumeAnalysis(e: Entitlement, today: string = localDateKey()): Entitlement {
-  if (isPro(e)) return e;
-  return { ...e, analysesUsedToday: analysesUsedOn(e, today) + 1, analysesCountDate: today };
-}
+export const requiresSubscription = (e: Entitlement): boolean => !isPro(e);
 
 /** Whole days until the trial converts. 0 once it has elapsed. */
 export function trialDaysRemaining(e: Entitlement, now: Date = new Date()): number {
   if (!e.inTrial || !e.trialEndsAt) return 0;
   const ms = new Date(e.trialEndsAt).getTime() - now.getTime();
   return ms <= 0 ? 0 : Math.ceil(ms / 86_400_000);
+}
+
+// ── Introductory offers ────────────────────────────────────────
+
+/**
+ * The shape of RevenueCat's `PurchasesIntroPrice` that we actually read.
+ * Structurally typed rather than imported from react-native-purchases so this
+ * module stays runnable under plain Node in tests — same reasoning as
+ * CustomerInfoLike below.
+ */
+export interface IntroPriceLike {
+  /** DAY | WEEK | MONTH | YEAR. */
+  periodUnit: string;
+  periodNumberOfUnits: number;
+  /** Billing cycles the offer covers. A free trial is always 1. */
+  cycles?: number;
+}
+
+const DAYS_PER_UNIT: Record<string, number> = {
+  DAY: 1,
+  WEEK: 7,
+  // Approximations, and deliberately so: these only ever produce the number in
+  // "Start a 14-Day Free Trial". App Store trials are configured in days or
+  // weeks in practice, so the month/year rows are just defensive.
+  MONTH: 30,
+  YEAR: 365,
+};
+
+/**
+ * Trial length in days from a RevenueCat intro offer, or null when there is no
+ * offer (or its period unit is unrecognised — better to fall back to plain
+ * pricing than to advertise a duration we cannot name).
+ *
+ * Both plans carry an intro offer of different lengths, so this must be read
+ * per package. Note that the presence of an intro offer is not the same as the
+ * user being *eligible* for it: Apple grants one introductory offer per
+ * subscription group, so someone who used the monthly trial cannot then take
+ * the annual one. Eligibility is a separate runtime check — see
+ * checkTrialEligibility in services/purchases.ts.
+ */
+export function introTrialDays(intro: IntroPriceLike | null | undefined): number | null {
+  if (!intro) return null;
+  const perUnit = DAYS_PER_UNIT[intro.periodUnit?.toUpperCase()];
+  if (!perUnit || !intro.periodNumberOfUnits) return null;
+  const cycles = intro.cycles && intro.cycles > 0 ? intro.cycles : 1;
+  return perUnit * intro.periodNumberOfUnits * cycles;
 }
 
 // ── Mapping RevenueCat's CustomerInfo onto an Entitlement ──────
@@ -118,24 +111,15 @@ export interface CustomerInfoLike {
   };
 }
 
-/**
- * Derives the entitlement from RevenueCat, carrying the daily counter over from
- * `previous` — RevenueCat knows nothing about analysis counts.
- */
-export function entitlementFromCustomerInfo(
-  info: CustomerInfoLike,
-  previous: Entitlement,
-): Entitlement {
+/** Derives the entitlement from RevenueCat's customer info. */
+export function entitlementFromCustomerInfo(info: CustomerInfoLike): Entitlement {
   const active = info.entitlements.active[PRO_ENTITLEMENT_ID];
-  if (!active) {
-    return { ...previous, tier: 'free', inTrial: false, trialEndsAt: null, expiresAt: null };
-  }
+  if (!active) return freeEntitlement();
   // RevenueCat types periodType as a bare string; the native SDKs emit 'TRIAL'
   // but their docs write 'trial'. Compare case-insensitively rather than bet.
   const inTrial = active.periodType?.toUpperCase() === 'TRIAL';
   const expiresAt = active.expirationDate ?? null;
   return {
-    ...previous,
     tier: 'pro',
     inTrial,
     trialEndsAt: inTrial ? expiresAt : null,

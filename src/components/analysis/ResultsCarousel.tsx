@@ -1,9 +1,19 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
-  View, Text, StyleSheet, Pressable, ScrollView, TextInput,
-  KeyboardAvoidingView, Platform, Modal,
-  TouchableWithoutFeedback, Dimensions,
-  Animated as RNAnimated, Easing,
+  ActivityIndicator,
+  Animated as RNAnimated,
+  Dimensions,
+  Easing,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableWithoutFeedback,
+  View,
 } from 'react-native';
 import Animated, {
   useSharedValue, useAnimatedStyle, withTiming, withSpring, interpolateColor,
@@ -12,12 +22,16 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons, FontAwesome6 } from '@expo/vector-icons';
 import Svg, { Circle, Line, Polygon, Path, Rect, Text as SvgText } from 'react-native-svg';
 import { useWindowDimensions } from 'react-native';
-import { router } from 'expo-router';
 import { InlineVideoPlayer } from './InlineVideoPlayer';
+import { DemoVideoPlaceholder } from './DemoVideoPlaceholder';
 import { colors, spacing, radius } from '../../constants/theme';
 import { haptic } from '../../lib/haptics';
-import { useEntitlementStore } from '../../store/useEntitlementStore';
-import { canUseLlmCoaching } from '../../lib/entitlements';
+import { useActivationStore } from '../../store/useActivationStore';
+import { useSpotlightTarget } from '../activation/useSpotlightTarget';
+import { useSpotlightStore } from '../activation/spotlightStore';
+import { useCoachmarks } from '../activation/useCoachmarks';
+import { SpotlightOverlay } from '../activation/SpotlightOverlay';
+import { CAROUSEL_COACHMARKS, OVERVIEW_PAGE_INDEX } from '../../constants/activationScript';
 import {
   AnalysisResult, MetricScore, MetricKey, FlaggedTimestamp, TechniqueEvent, ToneFault,
   IntonationAnalysis, VibratoAnalysis, PitchClassIssue, VibratoNoteResult,
@@ -30,6 +44,15 @@ import {
   classifyVibratoFaults, hasVibrato, VIBRATO_DISPLAY, VibratoFault,
 } from '../../services/pitchContour';
 import { FAULT_MESSAGE as TONE_FAULT_COPY } from '../../services/toneAnalysis';
+import { CATEGORIES, type CategoryId } from '../../constants/categories';
+import { AnalyticsEvent } from '../../constants/analyticsEvents';
+import { track } from '../../services/analytics';
+import { fetchChatReply } from '../../services/sessionChat';
+import { EntitlementRequiredError } from '../../services/llmFeedback';
+import { errorReason } from '../../lib/analyticsUserProps';
+import { useCoachContext } from '../../hooks/useCoachContext';
+import { MarkdownText } from '../ui/MarkdownText';
+import { ProblemSpotsPage } from './ProblemSpotsPage';
 
 // ─────────────────────────────────────────────────────────────
 // Constants
@@ -41,18 +64,10 @@ const IDEAL_RATE_HZ = 5.5;
 const IDEAL_DEPTH_CENTS = 25;
 const PITCH_HOP_HZ = 40;
 
-type CategoryId = 'intonation' | 'vibrato' | 'tone' | 'dynamics' | 'bow' | 'posture' | 'rhythm';
-type PageId = 'celebration' | 'overview' | CategoryId | 'chat';
+type PageId = 'celebration' | 'overview' | CategoryId | 'moments' | 'chat';
 
-const CATEGORIES: { id: CategoryId; label: string; keys: MetricKey[] }[] = [
-  { id: 'intonation', label: 'Intonation',   keys: ['pitchAccuracy', 'intonationStability'] },
-  { id: 'vibrato',    label: 'Vibrato',       keys: ['vibrato'] },
-  { id: 'tone',       label: 'Tone Quality',  keys: ['toneQuality'] },
-  { id: 'dynamics',   label: 'Dynamics',      keys: ['dynamicControl'] },
-  { id: 'bow',        label: 'Bow Technique', keys: ['bowSmoothness', 'bowPlacement', 'bowAngle', 'bowDistribution'] },
-  { id: 'posture',    label: 'Posture',       keys: ['posture', 'leftHandWrist', 'bowArmLevel'] },
-  { id: 'rhythm',     label: 'Rhythm',        keys: ['rhythmAccuracy'] },
-];
+// CATEGORIES now lives in src/constants/categories.ts so the Progress screen and
+// piece detail speak the same vocabulary as this carousel.
 
 // Categories hidden from the UI until their scoring is reliable enough to show.
 // Remove a category from this set to re-enable it everywhere.
@@ -63,7 +78,15 @@ const HIDDEN_CATS = new Set<CategoryId>([]);
 
 const VISIBLE_CATEGORIES = CATEGORIES.filter(c => !HIDDEN_CATS.has(c.id));
 
-const PAGES: PageId[] = ['celebration', 'overview', ...VISIBLE_CATEGORIES.map(c => c.id as PageId), 'chat'];
+// 'moments' sits immediately before the Practice handoff on purpose: the last
+// thing seen before the plan should be the specific passages the plan answers.
+const PAGES: PageId[] = [
+  'celebration',
+  'overview',
+  ...VISIBLE_CATEGORIES.map(c => c.id as PageId),
+  'moments',
+  'chat',
+];
 
 const METRIC_LABELS: Record<string, string> = {
   pitchAccuracy: 'Pitch Accuracy', intonationStability: 'Intonation Stability',
@@ -437,15 +460,11 @@ function RadarChart({ metrics }: { metrics: MetricScore[] }) {
 // Celebration page (first slide)
 // ─────────────────────────────────────────────────────────────
 
-// Leads the results screen for Pro users: the LLM's overall take (and, once
-// grounded, its top root cause) is the first text on screen, above the score
-// reveal — while it's still in flight this shows a loading state instead of
-// silently swapping static→real text later. Free users get a compact upsell
-// strip instead (never the full-page ChatPageLocked treatment here).
+// Leads the results screen: the LLM's overall take (and, once grounded, its
+// top root cause) is the first text on screen, above the score reveal — while
+// it's still in flight this shows a loading state instead of silently swapping
+// static→real text later.
 function CoachLeadSection({ result }: { result: AnalysisResult }) {
-  const coachingUnlocked = canUseLlmCoaching(useEntitlementStore((st) => st.entitlement));
-  if (!coachingUnlocked) return <CoachTeaserStrip />;
-
   if (result.coachingPending) {
     return (
       <View style={s.coachLeadCard}>
@@ -472,16 +491,6 @@ function CoachLeadSection({ result }: { result: AnalysisResult }) {
         </View>
       )}
     </View>
-  );
-}
-
-function CoachTeaserStrip() {
-  return (
-    <Pressable style={s.coachTeaserStrip} onPress={() => router.push('/paywall')}>
-      <Ionicons name="sparkles" size={16} color={colors.brand[300]} />
-      <Text style={s.coachTeaserText} numberOfLines={1}>Unlock AI coaching for a deeper breakdown</Text>
-      <Ionicons name="chevron-forward" size={16} color={TEXT_MUTED} />
-    </Pressable>
   );
 }
 
@@ -1673,12 +1682,16 @@ function OverviewPage({ result, onTimestampPress }: {
         <View style={s.phraseFeedbackSection}>
           <Text style={s.findingsTitle}>PHRASE NOTES</Text>
           {result.llmFeedback.phraseFeedback.map(pf => {
+            // Prefer the phrase we still hold; fall back to the time the model
+            // echoed back, so a session re-opened from history (which has no
+            // phraseFeatures) still seeks correctly.
             const phrase = result.phraseFeatures?.find(p => p.id === pf.phraseId);
+            const seekTo = phrase?.start_t ?? pf.start_t;
             return (
               <Pressable
                 key={pf.phraseId}
                 style={s.phraseFeedbackRow}
-                onPress={phrase ? () => onTimestampPress?.(phrase.start_t) : undefined}
+                onPress={seekTo !== undefined ? () => onTimestampPress?.(seekTo) : undefined}
               >
                 <Text style={s.phraseFeedbackObs}>{pf.observation}</Text>
                 <Text style={s.phraseFeedbackTip}>{pf.tip}</Text>
@@ -2103,108 +2116,66 @@ const { scrollRef, showHint, onLayout, onContentSizeChange, onScroll, scrollToEn
 // Chat page
 // ─────────────────────────────────────────────────────────────
 
-interface ChatMessage { role: 'coach' | 'user'; text: string; }
-
-function buildChatReply(userText: string, result: AnalysisResult): string {
-  const t = userText.toLowerCase();
-  const catScores = VISIBLE_CATEGORIES.map(c => ({ ...c, score: avgScore(result.metrics, c.keys) })).sort((a, b) => a.score - b.score);
-  const worst = catScores[0], best = catScores[catScores.length - 1];
-  const overall = result.overallScore;
-
-  if (/score|overall|how did|how was|rating/.test(t)) {
-    const feel = overall >= 80 ? 'strong' : overall >= 60 ? 'solid' : 'a work-in-progress';
-    return `Your overall score was ${overall}/100 — a ${feel} session. Strongest: ${best.label} (${best.score}). Main area to work on: ${worst.label} (${worst.score}).`;
-  }
-  for (const cat of catScores) {
-    if (t.includes(cat.label.toLowerCase()) || t.includes(cat.id)) {
-      const catMetrics = cat.keys.map(k => result.metrics.find(m => m.key === k)).filter(Boolean) as MetricScore[];
-      const obs = catMetrics.filter(m => m.occurrenceRate > 0.05).map(m => m.observationSummary).join(' ');
-      const item = result.llmFeedback?.items.find(i => cat.keys.includes(i.metricKey));
-      return `Your ${cat.label} score was ${cat.score}/100. ${obs} ${item?.feedback ?? ''}`.trim();
-    }
-  }
-  if (/practice|work on|improve|fix|drill|exercise/.test(t)) {
-    const item = result.llmFeedback?.items[0];
-    const ex = item?.exercise ? `\n\nTry this: ${item.exercise}` : '';
-    return `Focus on ${worst.label} first. ${item?.feedback ?? 'Short, focused repetitions will give you the fastest gains.'}${ex}`;
-  }
-  if (/progress|trend|last time|previous|better|worse/.test(t)) {
-    if (result.overallDelta !== undefined) {
-      const dir = result.overallDelta >= 0 ? 'up' : 'down';
-      return `Your score went ${dir} ${Math.abs(result.overallDelta)} points from your last session. ${result.overallDelta >= 0 ? 'Keep building on that.' : "Focus on the fundamentals and it'll come back."}`;
-    }
-    return `No previous session to compare yet. Keep recording and I'll be able to show you trends.`;
-  }
-  if (/inton|pitch|note|tuning|flat|sharp/.test(t)) {
-    const ia = result.intonationAnalysis;
-    if (ia) return `You had ${ia.outOfTuneCount} out-of-tune events. Tendency: ${ia.overallTendency ?? 'mixed'}. ${ia.problemNotes[0] ? `Trickiest note: ${ia.problemNotes[0].pitchClass} (${ia.problemNotes[0].tendency}).` : ''}`;
-  }
-  if (/vibrato/.test(t)) {
-    const va = result.vibratoAnalysis;
-    if (va) {
-      const feel = va.avgNoteScore >= 70 ? 'sounding consistent' : 'still developing';
-      return `Vibrato detected on ${va.eligibleCount} eligible notes and is ${feel}. Average note score: ${Math.round(va.avgNoteScore)}.`;
-    }
-  }
-  if (/how long|duration|minute|second/.test(t)) {
-    const m = Math.floor(result.durationSeconds / 60), sec = Math.round(result.durationSeconds % 60);
-    return `Your session was ${m}m ${sec}s long.${m < 5 ? ' Longer sessions give more data to work with.' : ''}`;
-  }
-  return `Based on your session, I'd focus on ${catScores.slice(0, 2).map(c => c.label).join(' and ')}. Ask me about any specific category, what to practise, or how you're progressing.`;
-}
-
 /**
- * The free tier's Chat page. Shows the opening line of the coaching the user
- * would get, then covers it — the highest-intent upsell surface in the app, so
- * it must look like something is actually behind it rather than be hidden.
+ * The carousel's chat used to be `buildChatReply` — a regex rule engine that
+ * never called the model, while the locked-state copy on this very page sold it
+ * as "personalised coaching from Claude". It also had a different view of the
+ * student than the standalone chat screen.
+ *
+ * Both now call the same Edge Function with the same CoachContext, so there is
+ * one coach with one memory regardless of where the student opens it.
  */
-function ChatPageLocked({ result }: { result: AnalysisResult }) {
-  const teaser =
-    result.llmFeedback?.overallTake ??
-    `I've analysed your session — score ${result.overallScore}/100.`;
-
-  return (
-    <View style={s.chatLockedWrap}>
-      <View style={s.chatLockedPreview} pointerEvents="none">
-        <View style={[s.chatBubble, s.chatBubbleCoach]}>
-          <Text style={[s.chatBubbleText, s.chatBubbleTextCoach]} numberOfLines={3}>
-            {teaser}
-          </Text>
-        </View>
-        <View style={[s.chatBubble, s.chatBubbleCoach, s.chatLockedGhost]} />
-        <View style={[s.chatBubble, s.chatBubbleCoach, s.chatLockedGhostShort]} />
-      </View>
-
-      <View style={s.chatLockedCard}>
-        <View style={s.chatLockedIcon}>
-          <Ionicons name="lock-closed" size={20} color={colors.brand[600]} />
-        </View>
-        <Text style={s.chatLockedTitle}>Unlock AI coaching</Text>
-        <Text style={s.chatLockedBody}>
-          Ask Maestro about this session and get personalised coaching from Claude — why each
-          issue happens, and exactly what to practise next.
-        </Text>
-        <Pressable style={s.chatLockedBtn} onPress={() => router.push('/paywall')}>
-          <Text style={s.chatLockedBtnText}>Start 7-day free trial</Text>
-        </Pressable>
-      </View>
-    </View>
-  );
-}
+interface ChatMessage { role: 'coach' | 'user'; text: string; }
 
 function ChatPage({ result }: { result: AnalysisResult }) {
   const [messages, setMessages] = useState<ChatMessage[]>([
-    { role: 'coach', text: `I've analysed your session — score ${result.overallScore}/100. Ask me anything about your playing, what to practise, or specific categories.` },
+    { role: 'coach', text: `I've analyzed your session — score ${result.overallScore}/100. Ask me anything about your playing, what to practice, or specific categories.` },
   ]);
   const [draft, setDraft] = useState('');
+  const [sending, setSending] = useState(false);
   const scrollRef = useRef<ScrollView>(null);
+  const coachContext = useCoachContext();
 
-  const send = () => {
-    const text = draft.trim(); if (!text) return;
-    const reply = buildChatReply(text, result);
-    setMessages(prev => [...prev, { role: 'user', text }, { role: 'coach', text: reply }]);
+  const send = async () => {
+    const text = draft.trim();
+    if (!text || sending) return;
+
+    const next: ChatMessage[] = [...messages, { role: 'user', text }];
+    setMessages(next);
     setDraft('');
+    setSending(true);
     setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
+    track(AnalyticsEvent.CHAT_MESSAGE_SENT, {
+      surface: 'results_carousel',
+      turn_index: next.filter((m) => m.role === 'user').length,
+    });
+
+    try {
+      // Drop the opening greeting — it's UI copy, not conversation.
+      const history = next.slice(1).map((m) => ({
+        role: m.role === 'coach' ? ('assistant' as const) : ('user' as const),
+        content: m.text,
+      }));
+      const reply = await fetchChatReply(history, coachContext, result.sessionId);
+      setMessages((prev) => [...prev, { role: 'coach', text: reply }]);
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'coach',
+          text:
+            err instanceof EntitlementRequiredError
+              ? 'Chat coaching is a Pro feature — upgrade to keep talking through your sessions.'
+              : 'Something went wrong reaching your coach. Give it another try.',
+        },
+      ]);
+      if (!(err instanceof EntitlementRequiredError)) {
+        track(AnalyticsEvent.APP_ERROR, { domain: 'chat', reason: errorReason(err) });
+      }
+    } finally {
+      setSending(false);
+      setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
+    }
   };
 
   return (
@@ -2213,7 +2184,7 @@ function ChatPage({ result }: { result: AnalysisResult }) {
         <ScrollView ref={scrollRef} style={s.chatScroll} contentContainerStyle={s.chatContent} showsVerticalScrollIndicator={false}>
           {messages.length === 1 && (
             <View style={s.chatSuggestions}>
-              {['What should I practise?', 'How was my intonation?', 'How was my bow technique?', 'How am I progressing?'].map(q => (
+              {['What should I practice?', 'How was my intonation?', 'How was my bow technique?', 'How am I progressing?'].map(q => (
                 <Pressable key={q} style={s.chatChip} onPress={() => setDraft(q)}>
                   <Text style={s.chatChipText}>{q}</Text>
                 </Pressable>
@@ -2222,15 +2193,29 @@ function ChatPage({ result }: { result: AnalysisResult }) {
           )}
           {messages.map((msg, i) => (
             <View key={i} style={[s.chatBubble, msg.role === 'user' ? s.chatBubbleUser : s.chatBubbleCoach]}>
-              <Text style={[s.chatBubbleText, msg.role === 'user' ? s.chatBubbleTextUser : s.chatBubbleTextCoach]}>{msg.text}</Text>
+              {msg.role === 'user' ? (
+                <Text style={[s.chatBubbleText, s.chatBubbleTextUser]}>{msg.text}</Text>
+              ) : (
+                <MarkdownText style={[s.chatBubbleText, s.chatBubbleTextCoach]}>{msg.text}</MarkdownText>
+              )}
             </View>
           ))}
         </ScrollView>
+        {sending && (
+          <View style={s.chatBubble}>
+            <ActivityIndicator size="small" color={colors.brand[300]} />
+          </View>
+        )}
         <View style={s.chatInputRow}>
           <TextInput style={s.chatInput} value={draft} onChangeText={setDraft}
             placeholder="Ask about your session…" placeholderTextColor={colors.text.muted}
+            editable={!sending}
             onSubmitEditing={send} returnKeyType="send" />
-          <Pressable style={[s.chatSendBtn, !draft.trim() && s.chatSendBtnOff]} onPress={send} disabled={!draft.trim()}>
+          <Pressable
+            style={[s.chatSendBtn, (!draft.trim() || sending) && s.chatSendBtnOff]}
+            onPress={send}
+            disabled={!draft.trim() || sending}
+          >
             <Ionicons name="send" size={18} color={draft.trim() ? '#fff' : 'rgba(255,255,255,0.4)'} />
           </Pressable>
         </View>
@@ -2251,17 +2236,28 @@ function PageContent({ idx, result, isActive }: {
   const { top } = useSafeAreaInsets();
   const pageId = PAGES[idx];
   const cat = CATEGORIES.find(c => c.id === pageId);
-  const showVideo = !!result.videoUri && pageId !== 'celebration' && pageId !== 'chat';
-  const coachingUnlocked = canUseLlmCoaching(useEntitlementStore((st) => st.entitlement));
+  const hasVideoSlot = pageId !== 'celebration' && pageId !== 'chat';
+  const showVideo = !!result.videoUri && hasVideoSlot;
+  // The activation sample analysis has no recording behind it. Rather than
+  // silently dropping the player (and quietly reflowing every card), show what
+  // the user is missing at the exact moment they can see what it would buy them.
+  const showVideoPlaceholder = !result.videoUri && !!result.isDemo && hasVideoSlot;
+  // All ten pages are mounted at once, so only the page the coachmark points at
+  // may claim the id — otherwise an off-screen copy overwrites the rect.
+  const videoSpotlight = useSpotlightTarget(idx === OVERVIEW_PAGE_INDEX ? 'carousel.video' : null);
+  const scoreSpotlight = useSpotlightTarget(idx === OVERVIEW_PAGE_INDEX ? 'carousel.score' : null);
 
   const pageTitle =
     pageId === 'celebration' ? 'Results' :
     pageId === 'overview'    ? 'Summary' :
     pageId === 'chat'        ? 'Ask Maestro' :
+    pageId === 'moments'     ? 'Problem spots' :
     (cat?.label ?? '');
 
   const pageScore: number | null =
-    pageId === 'celebration' || pageId === 'chat' ? null :
+    // Problem spots is a list of places, not a graded category — a score in the
+    // header would invite reading it as "how bad were the bad bits".
+    pageId === 'celebration' || pageId === 'chat' || pageId === 'moments' ? null :
     pageId === 'overview' ? result.overallScore :
     cat ? avgScore(result.metrics, cat.keys) : null;
 
@@ -2287,11 +2283,18 @@ function PageContent({ idx, result, isActive }: {
       <View style={[s.slideTitleRow, { paddingTop: top + 8 }]}>
         <Text style={s.pageTitle}>{pageTitle}</Text>
         {pageScore !== null && (
-          <Text style={[s.pageTitleScore, { color: scoreColor(pageScore) }]}>{pageScore}</Text>
+          <View {...scoreSpotlight}>
+            <Text style={[s.pageTitleScore, { color: scoreColor(pageScore) }]}>{pageScore}</Text>
+          </View>
         )}
       </View>
+      {showVideoPlaceholder && (
+        <View style={s.videoWrapper} {...videoSpotlight}>
+          <DemoVideoPlaceholder />
+        </View>
+      )}
       {showVideo && (
-        <View style={s.videoWrapper}>
+        <View style={s.videoWrapper} {...videoSpotlight}>
           <InlineVideoPlayer
             uri={result.videoUri!}
             seekVersion={seekVersion}
@@ -2308,7 +2311,8 @@ function PageContent({ idx, result, isActive }: {
       {pageId === 'celebration' && <CelebrationPage result={result} />}
       {pageId === 'overview' && <OverviewPage result={result} onTimestampPress={handleTimestampPress} />}
       {cat && <CategoryPage catId={cat.id} result={result} onTimestampPress={handleTimestampPress} onSegmentPress={handleSegmentPress} playbackSeconds={playbackSeconds} />}
-      {pageId === 'chat' && (coachingUnlocked ? <ChatPage result={result} /> : <ChatPageLocked result={result} />)}
+      {pageId === 'moments' && <ProblemSpotsPage result={result} onSegmentPress={handleSegmentPress} />}
+      {pageId === 'chat' && <ChatPage result={result} />}
     </View>
   );
 }
@@ -2443,11 +2447,51 @@ export function ResultsCarousel({ result, onDone, onHome }: ResultsCarouselProps
   const [pageIdx, setPageIdx] = useState(0);
   const pageIdxRef = useRef(0);
   const carouselScrollRef = useRef<ScrollView>(null);
+  // How far into the results someone actually got, and how long they stayed.
+  // Depth is the engagement signal here — a score glanced at and dismissed is a
+  // very different session from one where every category page was read.
+  const maxPageRef = useRef(0);
+  const openedAtRef = useRef(Date.now());
+
+  useEffect(() => {
+    openedAtRef.current = Date.now();
+    track(AnalyticsEvent.RESULTS_VIEWED, {
+      is_demo: !!result.isDemo,
+      overall_score: result.overallScore,
+      has_coaching: !!result.llmFeedback,
+    });
+  }, [result.sessionId]);
+
+  const exitResults = (via: 'done' | 'home') => {
+    track(AnalyticsEvent.RESULTS_EXIT, {
+      via,
+      max_page_reached: maxPageRef.current,
+      page_count: PAGES.length,
+      ms_on_results: Date.now() - openedAtRef.current,
+      is_demo: !!result.isDemo,
+    });
+  };
+
+  // Activation stage 4: walk the user through this screen with coachmarks.
+  const activationStep = useActivationStore((st) => st.step);
+  const coachmarksActive = activationStep === 'carousel';
+  const coach = useCoachmarks(CAROUSEL_COACHMARKS, coachmarksActive, () => {
+    // Take them into the exercises rather than closing the overlay and hoping
+    // they find the Practice button — that hand-off is exactly where a guided
+    // flow loses people.
+    useActivationStore.getState().advanceTo('practice');
+    exitResults('done');
+    onDone();
+  });
+  const dotsSpotlight = useSpotlightTarget('carousel.dots');
+  const nextSpotlight = useSpotlightTarget('carousel.next');
 
   const updatePage = (page: number) => {
     if (page === pageIdxRef.current || page < 0 || page >= PAGES.length) return;
     setPageIdx(page);
     pageIdxRef.current = page;
+    if (page > maxPageRef.current) maxPageRef.current = page;
+    track(AnalyticsEvent.RESULTS_PAGE_VIEW, { page_index: page, page_name: PAGES[page] });
   };
 
   const navigateTo = (newIdx: number) => {
@@ -2457,12 +2501,34 @@ export function ResultsCarousel({ result, onDone, onHome }: ResultsCarouselProps
     updatePage(newIdx);
   };
 
+  // Coachmark steps declare the page they belong on, so the walkthrough moves
+  // the carousel itself rather than depending on the user finding the right
+  // swipe — the overlay sits on top and would swallow it anyway.
+  const coachPage = coach.step?.page;
+  useEffect(() => {
+    if (coachPage === undefined || coachPage === pageIdxRef.current) return;
+    carouselScrollRef.current?.scrollTo({ x: coachPage * screenW, animated: true });
+    updatePage(coachPage);
+    // Targets on a page are re-measured when the scroll settles (see the
+    // scroll-end handlers below) — measuring mid-animation is what put the
+    // cutouts to the right of the elements they were meant to be hugging.
+    // This is only a backstop for platforms that skip momentum events on a
+    // programmatic scroll.
+    const t = setTimeout(() => useSpotlightStore.getState().remeasure(), 900);
+    return () => clearTimeout(t);
+  }, [coachPage, screenW]);
+
+  const settled = (x: number) => {
+    updatePage(Math.round(x / screenW));
+    useSpotlightStore.getState().remeasure();
+  };
+
   return (
     <View style={s.root}>
       {/* Home button — absolutely overlaid top-right, exits to the home tab */}
       <Pressable
         style={[s.homeBtn, { position: 'absolute', top: insets.top + 8, right: spacing.lg, zIndex: 20 }]}
-        onPress={() => { haptic.light(); onHome(); }}
+        onPress={() => { haptic.light(); exitResults('home'); onHome(); }}
       >
         <Ionicons name="home" size={14} color="#fff" />
         <Text style={s.homeBtnText}>Home</Text>
@@ -2479,8 +2545,8 @@ export function ResultsCarousel({ result, onDone, onHome }: ResultsCarouselProps
           style={{ flex: 1 }}
           contentContainerStyle={{ height: '100%' }}
           scrollEventThrottle={16}
-          onScrollEndDrag={(e) => updatePage(Math.round(e.nativeEvent.contentOffset.x / screenW))}
-          onMomentumScrollEnd={(e) => updatePage(Math.round(e.nativeEvent.contentOffset.x / screenW))}
+          onScrollEndDrag={(e) => settled(e.nativeEvent.contentOffset.x)}
+          onMomentumScrollEnd={(e) => settled(e.nativeEvent.contentOffset.x)}
         >
           {PAGES.map((_, i) => (
             <View key={i} style={{ width: screenW }}>
@@ -2498,18 +2564,31 @@ export function ResultsCarousel({ result, onDone, onHome }: ResultsCarouselProps
           onPress={() => navigateTo(pageIdx - 1)}
           disabled={pageIdx === 0}
         />
-        <View style={s.floatingDots}>
+        <View style={s.floatingDots} {...dotsSpotlight}>
           {PAGES.map((_, i) => (
             <AnimatedDot key={i} active={i === pageIdx} onPress={() => navigateTo(i)} />
           ))}
         </View>
-        <NavButton
-          label={pageIdx === PAGES.length - 1 ? 'Practice' : 'Next'}
-          variant="next"
-          onPress={() => (pageIdx === PAGES.length - 1 ? onDone() : navigateTo(pageIdx + 1))}
-          disabled={false}
-        />
+        <View {...nextSpotlight}>
+          <NavButton
+            label={pageIdx === PAGES.length - 1 ? 'Practice' : 'Next'}
+            variant="next"
+            onPress={() => {
+              if (pageIdx === PAGES.length - 1) { exitResults('done'); onDone(); }
+              else navigateTo(pageIdx + 1);
+            }}
+            disabled={false}
+          />
+        </View>
       </View>
+
+      <SpotlightOverlay
+        steps={CAROUSEL_COACHMARKS}
+        index={coach.index}
+        onNext={coach.next}
+        onSkip={coach.skip}
+        blocking={coachmarksActive}
+      />
     </View>
   );
 }
@@ -2660,20 +2739,6 @@ const s = StyleSheet.create({
     backgroundColor: 'rgba(255,255,255,0.14)',
   },
   coachLeadPendingText: { fontSize: 12, color: TEXT_MUTED, marginTop: 2 },
-  coachTeaserStrip: {
-    width: '100%',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    backgroundColor: CARD_BG,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: CARD_BORDER,
-    paddingHorizontal: spacing.md,
-    paddingVertical: 12,
-  },
-  coachTeaserText: { flex: 1, fontSize: 13, fontWeight: '600', color: TEXT_SECONDARY },
-
   // Overview
   overviewContent: { paddingHorizontal: spacing.lg, paddingBottom: spacing.lg, paddingTop: spacing.md, gap: spacing.md },
   overviewTitle: { fontSize: 26, fontWeight: '900', color: TEXT_PRIMARY, lineHeight: 32 },
@@ -2856,39 +2921,6 @@ const s = StyleSheet.create({
   chatChip: { backgroundColor: CARD_BG, borderRadius: radius.full, paddingHorizontal: 14, paddingVertical: 8, borderWidth: 1.5, borderColor: CARD_BORDER },
   chatChipText: { fontSize: 13, fontWeight: '600', color: TEXT_SECONDARY },
   // Locked chat (free tier)
-  chatLockedWrap: { flex: 1, padding: spacing.md },
-  chatLockedPreview: { gap: spacing.sm, opacity: 0.35 },
-  chatLockedGhost: { height: 46, width: '78%', backgroundColor: CARD_BG },
-  chatLockedGhostShort: { height: 46, width: '55%', backgroundColor: CARD_BG },
-  chatLockedCard: {
-    marginTop: spacing.lg,
-    alignItems: 'center',
-    gap: spacing.sm,
-    padding: spacing.lg,
-    borderRadius: radius.lg,
-    backgroundColor: CARD_BG,
-    borderWidth: 1,
-    borderColor: CARD_BORDER,
-  },
-  chatLockedIcon: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: colors.brand[50],
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  chatLockedTitle: { fontSize: 17, fontWeight: '800', color: colors.text.primary },
-  chatLockedBody: { fontSize: 13, lineHeight: 19, color: colors.text.muted, textAlign: 'center' },
-  chatLockedBtn: {
-    marginTop: spacing.xs,
-    backgroundColor: colors.brand[600],
-    borderRadius: radius.md,
-    paddingHorizontal: spacing.lg,
-    paddingVertical: 12,
-  },
-  chatLockedBtnText: { color: '#fff', fontWeight: '700', fontSize: 14 },
-
   chatBubble: { maxWidth: '85%', borderRadius: 16, paddingHorizontal: 14, paddingVertical: 10 },
   chatBubbleCoach: { alignSelf: 'flex-start', backgroundColor: CARD_BG, borderWidth: 1, borderColor: CARD_BORDER },
   chatBubbleUser: { alignSelf: 'flex-end', backgroundColor: colors.brand[600] },

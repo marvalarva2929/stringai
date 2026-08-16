@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { View, Text, Pressable, StyleSheet, SafeAreaView, ScrollView, ActivityIndicator } from 'react-native';
+import { View, Text, Pressable, StyleSheet, SafeAreaView, ScrollView, ActivityIndicator, Dimensions } from 'react-native';
 import { router, useLocalSearchParams } from 'expo-router';
 import Animated, {
   FadeIn,
@@ -16,13 +16,19 @@ import { Ionicons, FontAwesome6 } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { usePracticePlan } from '../../src/hooks/useDailyPracticePlan';
 import { scopeFromParams, scopeToParams, type PlanScope } from '../../src/lib/practicePlan';
-import type { PracticeBlock } from '../../src/lib/practiceBlocks';
+import type { PracticeBlock, SequenceStep } from '../../src/lib/practiceBlocks';
 import {
   usePracticeProgressStore,
   completedBlockIdsFor,
   nextIncompleteBlock,
 } from '../../src/store/usePracticeProgressStore';
-import { buildRunnerSteps, targetLine, coachHint } from '../../src/lib/practiceCopy';
+import { buildRunnerSteps, targetLine, coachHint, toneCue } from '../../src/lib/practiceCopy';
+import { EvidencePanel } from '../../src/components/practice/EvidencePanel';
+import { ThirdPositionGate } from '../../src/components/practice/ThirdPositionGate';
+import { useTechniqueSkillStore } from '../../src/store/useTechniqueSkillStore';
+import { needsShifting } from '../../src/lib/exercises/types';
+import { usePracticeAttemptStore, scoreHistoryFor, type ScoreHistory } from '../../src/store/usePracticeAttemptStore';
+import { useAnalysisStore } from '../../src/store/useAnalysisStore';
 import { DepthButton } from '../../src/components/practice/DepthButton';
 import { PracticeGraphic } from '../../src/components/practice/PracticeGraphic';
 import { SignalTiles } from '../../src/components/practice/SignalTiles';
@@ -36,13 +42,20 @@ import type { PracticeEvaluation } from '../../src/lib/practiceEvaluator';
 import { useCalibrationStore } from '../../src/store/useCalibrationStore';
 import { TakeCameraCapture } from '../../src/components/practice/TakeCameraCapture';
 import { TuneNoteRow } from '../../src/components/practice/TuneNoteRow';
-import { CentsGauge } from '../../src/components/practice/CentsGauge';
+import { CentsGauge, noteColor } from '../../src/components/practice/CentsGauge';
+import { scoreBand, type SequenceScore } from '../../src/lib/sequenceScore';
 import { useMetronome } from '../../src/hooks/useMetronome';
+import { useMetronomeStore } from '../../src/store/useMetronomeStore';
+import { useSequencePreview } from '../../src/hooks/useSequencePreview';
 import { useAttemptCompare } from '../../src/hooks/useAttemptCompare';
 import { useTakeLiveFeedback } from '../../src/hooks/useTakeLiveFeedback';
 import { isMicPitchAvailable, startMicPitch, stopMicPitch } from '../../src/services/micPitch';
-import { scaleNoteSequence } from '../../src/lib/scaleSequence';
+import { sequenceStepsFor, sequenceBpmFor, DEFAULT_SEQUENCE_BPM } from '../../src/lib/sequenceSteps';
+import { noteNameToMidi } from '../../src/lib/pitchNaming';
 import { CALIBRATION_ENABLED } from '../../src/constants/featureFlags';
+import { track } from '../../src/services/analytics';
+import { AnalyticsEvent } from '../../src/constants/analyticsEvents';
+import { createStopwatch } from '../../src/lib/analyticsTiming';
 
 type Phase = 'intro' | 'reps' | 'take' | 'judging' | 'result';
 
@@ -89,6 +102,38 @@ function PracticeLessonContent({
     [completedByPlan, plan.id],
   );
 
+  const addAttempt = usePracticeAttemptStore((st) => st.addAttempt);
+  const sessionCache = useAnalysisStore((st) => st.sessionResultCache);
+  const metricHistory = useAnalysisStore((st) => st.metricHistory);
+
+  // Which piece this work counts toward. A piece-scoped plan says so directly;
+  // a session plan has to trace back through the session it came from. Falls
+  // back to metricHistory because sessionResultCache is in-memory only, and
+  // progress that vanishes on relaunch is worse than no progress at all.
+  const pieceId = useMemo(() => {
+    if (scope.kind === 'piece') return scope.pieceId;
+    const sessionId = scope.kind === 'session'
+      ? scope.sessionId
+      : block.evidenceRefs[0]?.sourceSessionId;
+    if (!sessionId) return undefined;
+    return sessionCache?.[sessionId]?.piece?.id
+      ?? metricHistory.find((entry) => entry.sessionId === sessionId)?.pieceId;
+  }, [scope, block.evidenceRefs, sessionCache, metricHistory]);
+
+  // A drill that leaves first position must not be handed to someone who has
+  // never been taught to shift — they'd invent a fingering and drill it in.
+  const thirdPosition = useTechniqueSkillStore((st) => st.thirdPosition);
+  const stepsForBlock = useMemo(() => sequenceStepsFor(block.evaluator), [block.evaluator]);
+  const blockNeedsShifting = useMemo(
+    () => needsShifting(
+      stepsForBlock.map((step) => noteNameToMidi(step.note)).filter((m): m is number => m != null),
+      block.target.string as never,
+    ),
+    [stepsForBlock, block.target.string],
+  );
+  const [gateDismissed, setGateDismissed] = useState(false);
+  const showGate = blockNeedsShifting && thirdPosition === 'unknown' && !gateDismissed;
+
   const [phase, setPhase] = useState<Phase>('intro');
   const [stepIndex, setStepIndex] = useState(0);
   const [capturedTake, setCapturedTake] = useState<CapturedTake | null>(null);
@@ -107,6 +152,28 @@ function PracticeLessonContent({
   const [rhythmTempoDirection, setRhythmTempoDirection] = useState<'up' | 'down' | 'same'>('same');
   const RHYTHM_BPM_STEP = 8;
 
+  // Manual tempo offset for sequence drills, owned here so it survives a
+  // retake — the whole point is that someone who missed at tempo can drop it
+  // and go again without losing the setting.
+  // Read BEFORE this take is recorded, so the comparison is against past
+  // attempts rather than including the one just played.
+  const attemptLog = usePracticeAttemptStore((st) => st.attempts);
+  const scoreHistory = useMemo(
+    () => scoreHistoryFor(attemptLog, block.id),
+    [attemptLog, block.id],
+  );
+
+  const [bpmOffset, setBpmOffset] = useState(0);
+  const baseSequenceBpm = sequenceBpmFor(block.evaluator);
+  const sequenceBpm = clampSequenceBpm(baseSequenceBpm + bpmOffset);
+  const previewSteps = useMemo(() => sequenceStepsFor(block.evaluator), [block.evaluator]);
+  const canAdjustTempo = previewSteps.length > 0;
+  const nudgeTempo = (delta: number) => {
+    haptic.light();
+    setBpmOffset((current) =>
+      clampSequenceBpm(baseSequenceBpm + current + delta) - baseSequenceBpm);
+  };
+
   // Coarse progress across the whole lesson for the top bar.
   const progress =
     phase === 'intro' ? 0.04
@@ -115,8 +182,42 @@ function PracticeLessonContent({
     : phase === 'judging' ? 0.94
     : 1;
 
+  // Time-on-block and retake count are the difficulty signal: a drill everyone
+  // retakes three times is a drill that needs rewriting.
+  const blockWatch = useRef(createStopwatch());
+  const retakeCount = useRef(0);
+
+  useEffect(() => {
+    blockWatch.current = createStopwatch();
+    retakeCount.current = 0;
+  }, [block.id]);
+
   const advanceToNext = () => {
+    track(AnalyticsEvent.PRACTICE_BLOCK_COMPLETE, {
+      scope: scope.kind,
+      block_id: block.id,
+      block_type: block.type,
+      index: plan.blocks.findIndex((b) => b.id === block.id),
+      ms: blockWatch.current.elapsed(),
+      retakes: retakeCount.current,
+    });
     markBlockComplete(plan.id, block.id);
+    // The join between "I did the drill" and "the issue improved". Without this
+    // the app can watch a problem get better but can never say its advice had
+    // anything to do with it — which is the whole of the piece-progress story.
+    addAttempt({
+      at: new Date().toISOString(),
+      planId: plan.id,
+      blockId: block.id,
+      blockType: block.type,
+      blockTitle: block.title,
+      issueIds: block.evidenceRefs.map((ref) => ref.evidenceId),
+      pieceId,
+      passed: evaluation?.passed,
+      successCount: evaluation?.successCount,
+      attempts: evaluation?.attempts,
+      score: evaluation?.score?.score,
+    });
     const nextBlock = nextIncompleteBlock(plan, [...completedIds, block.id]);
     if (nextBlock) {
       router.replace({ pathname: '/practice/[id]', params: { id: nextBlock.id, ...scopeParams } });
@@ -149,6 +250,7 @@ function PracticeLessonContent({
 
   const skipToTake = () => {
     haptic.light();
+    track(AnalyticsEvent.PRACTICE_BLOCK_SKIP_TAKE, { block_id: block.id, block_type: block.type });
     if (needsCalibration()) {
       router.push('/practice/calibrate');
       return;
@@ -157,6 +259,12 @@ function PracticeLessonContent({
   };
 
   const retake = () => {
+    retakeCount.current += 1;
+    track(AnalyticsEvent.PRACTICE_BLOCK_RETAKE, {
+      block_id: block.id,
+      block_type: block.type,
+      attempt: retakeCount.current,
+    });
     setCapturedTake(null);
     setEvaluation(null);
     setPhase('take');
@@ -171,6 +279,17 @@ function PracticeLessonContent({
     if (phase === 'judging') { retake(); return; }
     if (phase === 'result') { retake(); return; }
   };
+
+  if (showGate) {
+    return (
+      <SafeAreaView style={s.safe}>
+        <ThirdPositionGate
+          onAnswered={() => setGateDismissed(true)}
+          onDismiss={() => { setGateDismissed(true); router.back(); }}
+        />
+      </SafeAreaView>
+    );
+  }
 
   return (
     <View style={s.root}>
@@ -200,6 +319,9 @@ function PracticeLessonContent({
               block={block}
               coach={coach}
               insets={insets}
+              previewSteps={previewSteps}
+              tempo={canAdjustTempo ? sequenceBpm : null}
+              onTempoChange={nudgeTempo}
               onStart={onPrimary}
               onSkipToTake={skipToTake}
             />
@@ -208,6 +330,8 @@ function PracticeLessonContent({
             <RepsPhase
               block={block}
               coach={coach}
+              previewSteps={previewSteps}
+              previewBpm={canAdjustTempo ? sequenceBpm : DEFAULT_SEQUENCE_BPM}
               step={step}
               stepIndex={stepIndex}
               stepCount={steps.length}
@@ -220,6 +344,7 @@ function PracticeLessonContent({
               block={block}
               insets={insets}
               rhythmBpm={rhythmBpm}
+              bpmOffset={bpmOffset}
               onCaptured={(take) => {
                 if (block.evaluator) {
                   setCapturedTake(take);
@@ -257,6 +382,9 @@ function PracticeLessonContent({
               take={capturedTake}
               nextTempo={rhythmParams ? rhythmBpm : null}
               tempoDirection={rhythmParams ? rhythmTempoDirection : null}
+              scoreHistory={scoreHistory}
+              slowerTempo={canAdjustTempo ? clampSequenceBpm(sequenceBpm - BPM_STEP) : null}
+              onSlower={() => { nudgeTempo(-BPM_STEP); retake(); }}
               onPass={advanceToNext}
               onRetry={retake}
             />
@@ -272,12 +400,20 @@ function IntroPhase({
   block,
   coach,
   insets,
+  previewSteps,
+  tempo,
+  onTempoChange,
   onStart,
   onSkipToTake,
 }: {
   block: PracticeBlock;
   coach: PracticeBlock['coachIntensity'];
   insets: ReturnType<typeof useSafeAreaInsets>;
+  /** The exercise's notes, so it can be played back before the take. */
+  previewSteps: SequenceStep[];
+  /** Current click tempo for a paced drill; null when the drill isn't paced. */
+  tempo: number | null;
+  onTempoChange: (delta: number) => void;
   onStart: () => void;
   onSkipToTake: () => void;
 }) {
@@ -294,16 +430,24 @@ function IntroPhase({
               <Text style={s.overviewMeta}>About {Math.max(3, block.estimatedMinutes)} min · {coach} coach</Text>
             </View>
           </View>
-          <View style={s.overviewList}>
-            <OverviewRow label="Why this drill" value={block.reason} />
-            <OverviewRow label="Target" value={targetLine(block)} />
-            <OverviewRow label="Pass condition" value={block.successCriteria.summary} />
-          </View>
         </View>
+
+        {/* First thing on the screen, deliberately: hearing the exercise is the
+            most useful thing you can do before playing it, and buried under the
+            evidence panel it sat below the fold and went unseen. */}
+        {previewSteps.length > 0 && (
+          <PreviewRow steps={previewSteps} bpm={tempo ?? DEFAULT_SEQUENCE_BPM} />
+        )}
+
+        {tempo != null && <TempoRow tempo={tempo} onChange={onTempoChange} />}
+
+        {/* The case for this drill: the clip, the finding, the comparison, and
+            the bridge to what you're about to play. */}
+        <EvidencePanel block={block} />
 
         <CoachBubble
           tone="dark"
-          message="Three things before you record: the exact target, the sound to listen for, and the pass condition. I'll guide the reps from there."
+          message={`Listen for ${toneCue(block)}. I'll walk you through the reps, then grade the take.`}
         />
 
         <TuneNoteRow block={block} />
@@ -322,17 +466,92 @@ function IntroPhase({
 }
 
 // ─── Reps ─────────────────────────────────────────────────────────────────
+/**
+ * "Hear the exercise" — the whole sequence, in order, at tempo.
+ *
+ * Reading a column of note names and imagining how they go is a separate skill
+ * from the one the drill is training. Hearing it once is how anyone learns a
+ * passage from a teacher.
+ */
+function PreviewRow({ steps, bpm }: { steps: SequenceStep[]; bpm: number }) {
+  const preview = useSequencePreview(steps, bpm);
+  return (
+    <Pressable
+      style={({ pressed }) => [s.previewRow, pressed && s.previewRowPressed]}
+      onPress={preview.toggle}
+      disabled={preview.loading}
+    >
+      <View style={s.previewIcon}>
+        {preview.loading
+          ? <ActivityIndicator color={colors.brand[700]} />
+          : <Ionicons name={preview.playing ? 'stop' : 'play'} size={20} color={colors.brand[700]} />}
+      </View>
+      <View style={s.previewCopy}>
+        <Text style={s.previewLabel}>
+          {preview.playing ? 'Playing the exercise…' : 'Hear the exercise'}
+        </Text>
+        <Text style={s.previewHint}>
+          All {steps.length} notes in order at {bpm} BPM — how it should sound.
+        </Text>
+      </View>
+    </Pressable>
+  );
+}
+
+/**
+ * Tempo control for a click-paced drill.
+ *
+ * Prescribing a tempo and offering no way to change it makes the drill a test
+ * rather than practice — the player who can't keep up has nothing to do but
+ * fail it repeatedly. Slowing down until it's clean is the actual method.
+ */
+function TempoRow({ tempo, onChange }: { tempo: number; onChange: (delta: number) => void }) {
+  return (
+    <View style={s.tempoRow}>
+      <View style={s.tempoCopy}>
+        <Text style={s.tempoLabel}>Tempo</Text>
+        <Text style={s.tempoHint}>Slow it down until every note lands, then build back up.</Text>
+      </View>
+      <Pressable
+        style={({ pressed }) => [s.tempoBtn, pressed && s.tempoBtnPressed]}
+        onPress={() => onChange(-BPM_STEP)}
+        hitSlop={6}
+        accessibilityLabel="Slower"
+      >
+        <Ionicons name="remove" size={20} color={colors.brand[700]} />
+      </Pressable>
+      <View style={s.tempoValue}>
+        <Text style={s.tempoNumber}>{tempo}</Text>
+        <Text style={s.tempoUnit}>BPM</Text>
+      </View>
+      <Pressable
+        style={({ pressed }) => [s.tempoBtn, pressed && s.tempoBtnPressed]}
+        onPress={() => onChange(BPM_STEP)}
+        hitSlop={6}
+        accessibilityLabel="Faster"
+      >
+        <Ionicons name="add" size={20} color={colors.brand[700]} />
+      </Pressable>
+    </View>
+  );
+}
+
 function RepsPhase({
   block,
   coach,
   step,
   stepIndex,
   stepCount,
+  previewSteps,
+  previewBpm,
   insets,
   onContinue,
 }: {
   block: PracticeBlock;
   coach: PracticeBlock['coachIntensity'];
+  /** The exercise's notes, so it can be played back before the take. */
+  previewSteps: SequenceStep[];
+  previewBpm: number;
   step: ReturnType<typeof buildRunnerSteps>[number];
   stepIndex: number;
   stepCount: number;
@@ -351,7 +570,7 @@ function RepsPhase({
         </View>
 
         <View style={s.stage}>
-          <PracticeGraphic type={block.type} pulseKey={stepIndex} />
+          <PracticeGraphic type={block.type} size={260} pulseKey={stepIndex} />
         </View>
 
         <Animated.View
@@ -375,6 +594,11 @@ function RepsPhase({
         </Animated.View>
 
         <CoachBubble tone="dark" message={coachHint(block, stepIndex, coach)} />
+        {/* Also here, not just on the intro: this is the last chance to hear the
+            exercise before the take starts. */}
+        {previewSteps.length > 0 && (
+          <PreviewRow steps={previewSteps} bpm={previewBpm} />
+        )}
         <TuneNoteRow block={block} />
         <SignalTiles signals={block.liveMode.signals} />
       </ScrollView>
@@ -390,13 +614,20 @@ function RepsPhase({
   );
 }
 
-// Slow enough for a beginner to place each finger cleanly between clicks.
-const SCALE_METRONOME_BPM = 60;
 // "Get ready" count-in before a click-paced take's metronome/recording begins —
 // enough beats to cover at least 4 seconds at tempo (a faster tempo needs more
-// beats to still add up to 4s), computed per-bpm since rhythm takes run at an
-// adaptive tempo instead of scale's fixed one.
+// beats to still add up to 4s), computed per-bpm since rhythm and acceleration
+// takes run at tempos the drill chooses.
 const MIN_PREP_MS = 4000;
+
+/** How far one tap moves a sequence drill's tempo. */
+const BPM_STEP = 6;
+const MIN_SEQUENCE_BPM = 34;
+const MAX_SEQUENCE_BPM = 132;
+function clampSequenceBpm(bpm: number): number {
+  return Math.max(MIN_SEQUENCE_BPM, Math.min(MAX_SEQUENCE_BPM, Math.round(bpm)));
+}
+
 function beatMsFor(bpm: number): number {
   return Math.round(60000 / bpm);
 }
@@ -406,6 +637,17 @@ function prepBeatsFor(bpm: number): number {
 // "Get ready" count-in length for every other exercise (no metronome, so a
 // plain numeric countdown instead of beats).
 const PREP_SECONDS_DEFAULT = 3;
+
+// The note circle scales with the screen. takeBody centres its children and
+// does not scroll, so a fixed size that looks generous on a Pro Max pushes the
+// counters off the bottom of an SE.
+const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
+const NOTE_CIRCLE = Math.round(
+  Math.max(150, Math.min(220, Math.min(SCREEN_W * 0.55, SCREEN_H * 0.26))),
+);
+
+/** The gauge reads ±50¢; past that a number is a wrong note, not a needle. */
+const GAUGE_RANGE_CENTS = 50;
 // Extra recording time past the hold's minimum, so auto-stop doesn't cut the
 // note off right at the wire.
 const HOLD_STOP_GRACE_S = 1;
@@ -459,6 +701,7 @@ function TakePhase({
   block,
   insets,
   rhythmBpm,
+  bpmOffset = 0,
   onCaptured,
 }: {
   block: PracticeBlock;
@@ -466,26 +709,34 @@ function TakePhase({
   /** Current adaptive tempo for a rhythm block, owned by the parent (see
    *  PracticeLessonContent) so it survives a retake. */
   rhythmBpm?: number;
+  /** Player's manual tempo adjustment for a sequence drill, in BPM. */
+  bpmOffset?: number;
   onCaptured: (take: CapturedTake | null) => void;
 }) {
   const canRecordAudio = block.liveMode.requiresMic && !block.liveMode.requiresCamera;
   const canRecordCamera = block.evaluator?.evaluatorId === 'bowGeometry';
-  const scaleSequence = useMemo(
-    () =>
-      block.evaluator?.evaluatorId === 'scale'
-        ? scaleNoteSequence(block.evaluator.scaleName, block.evaluator.rootMidiNote)
-        : [],
-    [block.evaluator],
-  );
-  const isScale = scaleSequence.length > 0;
+  // The note-per-click list this take will show and be graded against — one
+  // source, shared with runEvaluator, so the screen can never disagree with
+  // the verdict about which note beat i was.
+  const steps = useMemo(() => sequenceStepsFor(block.evaluator), [block.evaluator]);
+  const isSequence = steps.length > 0;
   const rhythmParams = block.evaluator?.evaluatorId === 'rhythm' ? block.evaluator : null;
   const isRhythm = !!rhythmParams;
-  // Both scale and rhythm takes are paced by a click track instead of ending
+  // Both sequence and rhythm takes are paced by a click track instead of ending
   // on silence or a fixed timer.
-  const usesMetronome = isScale || isRhythm;
-  const metronomeBpm = isScale ? SCALE_METRONOME_BPM : rhythmParams ? (rhythmBpm ?? rhythmParams.startBpm) : SCALE_METRONOME_BPM;
-  const metronomeBeatCount = isScale ? scaleSequence.length : rhythmParams ? rhythmParams.beatCount : 0;
-  const beatMs = beatMsFor(metronomeBpm);
+  const usesMetronome = isSequence || isRhythm;
+  // A sequence drill's tempo is the player's to lower. Struggling at the
+  // prescribed tempo is the normal case, not a failure state, and a drill you
+  // can only attempt at one speed is a drill most people abandon.
+  const baseBpm = isSequence
+    ? sequenceBpmFor(block.evaluator)
+    : rhythmParams
+      ? (rhythmBpm ?? rhythmParams.startBpm)
+      : DEFAULT_SEQUENCE_BPM;
+  // Rhythm blocks run their own adaptive tempo ladder, so manual override only
+  // applies to sequence drills.
+  const metronomeBpm = isSequence ? clampSequenceBpm(baseBpm + bpmOffset) : baseBpm;
+  const metronomeBeatCount = isSequence ? steps.length : rhythmParams ? rhythmParams.beatCount : 0;
   // Fixed-length takes (hold, camera, no-live-signal self-report) count down;
   // everything else is open-ended and ends when the player stops playing.
   const fixedSeconds = usesMetronome ? null : fixedTakeSeconds(block, canRecordAudio, canRecordCamera);
@@ -493,9 +744,13 @@ function TakePhase({
 
   const beatTimestampsRef = useRef<number[]>([]);
   const recordingStartedAtRef = useRef(0);
+  // Only `sound` is read, not `enabled`: a drill that grades against beat timestamps
+  // needs the metronome running regardless: the setting governs whether the player
+  // HEARS it, and the beat callbacks still drive the on-screen pulse when muted.
+  const metronomeSoundOn = useMetronomeStore((s) => s.sound);
   const metronome = useMetronome(metronomeBpm, metronomeBeatCount, () => {
     beatTimestampsRef.current.push((Date.now() - recordingStartedAtRef.current) / 1000);
-  });
+  }, { muted: !metronomeSoundOn });
 
   const [recording, setRecording] = useState(false);
   const [preparing, setPreparing] = useState(false);
@@ -513,11 +768,25 @@ function TakePhase({
   const [liveActive, setLiveActive] = useState(false);
   const dot = useSharedValue(1);
 
+  // The note the player is being asked for right now, on a paced take.
+  const currentStep = isSequence && metronome.currentBeat >= 0 ? steps[metronome.currentBeat] : null;
+  const nextStep = isSequence && metronome.currentBeat >= 0 ? steps[metronome.currentBeat + 1] : null;
+
   // Live pitch while recording, so the player can hear-and-see they're sharp
   // *during* the take instead of being told about it afterwards. Advisory only:
   // the verdict still comes from the recorded clip.
-  const live = useTakeLiveFeedback(liveActive, block.target.midiNote);
-  const showLive = liveActive && !usesMetronome && !canRecordCamera;
+  //
+  // On a paced take the target changes every click, so the gauge follows the
+  // note currently on screen rather than the block's single overall target —
+  // otherwise it would read every note but one as wildly out of tune.
+  const liveTargetMidi = isSequence
+    ? (currentStep ? noteNameToMidi(currentStep.note) ?? undefined : undefined)
+    : block.target.midiNote;
+  const live = useTakeLiveFeedback(liveActive, liveTargetMidi);
+  // Sequence takes get the gauge too: hearing that you're 20¢ flat while the
+  // note is still sounding is the whole point of a tuning exercise, and waiting
+  // until the take is graded to find out is far too late to fix it.
+  const showLive = liveActive && !isRhythm && !canRecordCamera;
 
   const clearTimers = () => {
     if (timerRef.current) clearInterval(timerRef.current);
@@ -583,7 +852,7 @@ function TakePhase({
     // Started *after* the recorder: the native tap reconfigures the shared audio
     // session, and doing that first can interrupt the clip we're grading on. If
     // it can't start (Android, Expo Go), the take runs fine with no live gauge.
-    if (canRecordAudio && !usesMetronome && isMicPitchAvailable()) {
+    if (canRecordAudio && !isRhythm && isMicPitchAvailable()) {
       try {
         await startMicPitch();
         setLiveActive(true);
@@ -604,7 +873,13 @@ function TakePhase({
       }, TAKE_CHECK_MS);
     }
 
-    if (usesMetronome) metronome.start();
+    // The metronome runs the count-in and the graded beats on one clock, so
+    // the recorder's async startup above lands entirely before the first click
+    // rather than in the gap between two of them.
+    if (usesMetronome) {
+      setPreparing(false);
+      metronome.start({ leadInBeats: prepBeatsFor(metronomeBpm) });
+    }
   };
 
   const start = () => {
@@ -612,11 +887,10 @@ function TakePhase({
     setPermissionDenied(false);
     setPreparing(true);
 
+    // A click-paced take opens the mic first and counts in from the metronome
+    // itself; only the un-paced takes need the screen's own countdown.
     if (usesMetronome) {
-      setCountdown(prepBeatsFor(metronomeBpm));
-      // Count-in click so the player hears the tempo right away, before the
-      // graded take's own metronome starts.
-      metronome.playClick();
+      beginTake();
       return;
     }
 
@@ -624,22 +898,16 @@ function TakePhase({
   };
 
   useEffect(() => {
-    if (!preparing) return;
+    if (!preparing || usesMetronome) return;
     if (countdown <= 0) {
       setPreparing(false);
       beginTake();
       return;
     }
-    const t = setTimeout(() => {
-      const next = countdown - 1;
-      setCountdown(next);
-      // The final count-in beat is beginTake()'s own first click (beat 0) —
-      // skip it here so the two don't double up.
-      if (usesMetronome && next > 0) metronome.playClick();
-    }, usesMetronome ? beatMs : 1000);
+    const t = setTimeout(() => setCountdown(countdown - 1), 1000);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [preparing, countdown]);
+  }, [preparing, countdown, usesMetronome]);
 
   const stop = async () => {
     // The silence watcher, the fixed-length timer and the metronome can all
@@ -704,9 +972,6 @@ function TakePhase({
   }, [elapsed]);
 
   const needsCamera = block.liveMode.requiresCamera;
-  const currentNote = isScale && metronome.currentBeat >= 0 ? scaleSequence[metronome.currentBeat] : null;
-  const nextNote = isScale && metronome.currentBeat >= 0 ? scaleSequence[metronome.currentBeat + 1] : null;
-
   // How many notes the pass condition is asking for, so the live counter can
   // show progress toward it rather than an unanchored tally.
   const targetReps = block.successCriteria.targetStreak ?? block.successCriteria.repetitions ?? null;
@@ -714,8 +979,8 @@ function TakePhase({
   // A recording take must always answer two questions on screen: what is it
   // doing, and what ends it?
   const remaining = fixedSeconds != null ? Math.max(0, fixedSeconds - elapsed) : 0;
-  const recordingLabel = isScale
-    ? 'Recording — follow the click'
+  const recordingLabel = isSequence
+    ? `Note ${Math.max(0, metronome.currentBeat) + 1} of ${steps.length} — follow the ${metronomeSoundOn ? 'click' : 'beat'}`
     : isRhythm
       ? `Beat ${Math.max(0, metronome.currentBeat) + 1} of ${rhythmParams!.beatCount} — ${metronomeBpm} BPM`
       : fixedSeconds != null
@@ -723,7 +988,7 @@ function TakePhase({
         : heardPlaying
           ? 'Recording'
           : 'Listening…';
-  const recordingHint = isScale
+  const recordingHint = isSequence
     ? 'Play the note shown on each click.'
     : isRhythm
       ? 'Play one note right on every click.'
@@ -737,18 +1002,41 @@ function TakePhase({
           ? 'Stop playing when you\'re done and the take ends itself.'
           : 'Start playing whenever you\'re ready.';
 
-  if (preparing) {
+  // A click-paced take counts in on the metronome's own clock (the mic is
+  // already open by then), so its "get ready" is driven by leadInRemaining
+  // rather than by the screen's separate countdown.
+  const countingIn = metronome.inLeadIn;
+  // A click-paced take opens the mic before it counts in, so there is a beat
+  // of dead time first. Showing the countdown's "Go!" there would tell the
+  // player to start playing while nothing is listening yet.
+  const openingMic = preparing && usesMetronome;
+  if (preparing || countingIn) {
+    const remaining = countingIn ? metronome.leadInRemaining : countdown;
     return (
       <View style={s.takeWrap}>
         <View style={s.takeBody}>
           <Text style={s.takeKicker}>Get ready</Text>
           <Text style={s.takeTitle}>{block.title}</Text>
-          {isScale && scaleSequence[0] && <Text style={s.takeTarget}>First note: {scaleSequence[0]}</Text>}
+          {isSequence && steps[0] && (
+            <Text style={s.takeTarget}>
+              First note: {steps[0].note}{steps[0].annotation ? ` · ${steps[0].annotation}` : ''}
+            </Text>
+          )}
           {isRhythm && <Text style={s.takeTarget}>Tempo: {metronomeBpm} BPM</Text>}
           <Animated.View entering={FadeIn} style={s.takeCircle}>
-            <Text style={s.beatNote}>{countdown > 0 ? countdown : 'Go!'}</Text>
+            {openingMic ? (
+              <ActivityIndicator color="#fff" size="large" />
+            ) : (
+              <Text style={s.beatNote}>{remaining > 0 ? remaining : 'Go!'}</Text>
+            )}
           </Animated.View>
-          <Text style={s.takeHint}>Get your bow and hand in position — recording starts automatically.</Text>
+          <Text style={s.takeHint}>
+            {openingMic
+              ? 'Opening the mic — the count-in starts in a moment.'
+              : countingIn
+                ? 'Counting you in — play on the next click after this.'
+                : 'Get your bow and hand in position — recording starts automatically.'}
+          </Text>
         </View>
       </View>
     );
@@ -769,11 +1057,35 @@ function TakePhase({
         <Text style={s.takeTitle}>{block.title}</Text>
         <Text style={s.takeTarget}>{targetLine(block)}</Text>
 
-        {currentNote ? (
-          <Animated.View entering={FadeIn} style={s.takeCircle}>
-            <Text style={s.beatNote}>{currentNote}</Text>
-            <Text style={s.beatCount}>Beat {metronome.currentBeat + 1} of {scaleSequence.length}</Text>
-            {nextNote && <Text style={s.nextNote}>Next note: {nextNote}</Text>}
+        {currentStep ? (
+          /* A circle is a poor container for four stacked lines — it squeezes
+             every one of them to fit its narrowest point. Only the note lives
+             inside it; the instruction and the counters sit below, where they
+             have the full width of the screen. */
+          <Animated.View entering={FadeIn} style={s.noteStack}>
+            <View style={[s.takeCircle, live.voiced && { borderColor: noteColor(live.cents ?? 0) }]}>
+              <Text style={s.beatNote}>{currentStep.note}</Text>
+              {/* How far off you are, right now, while the note is still
+                  sounding — which is the only moment you can still fix it. */}
+              {showLive && live.voiced && live.cents != null && (
+                <Text style={[s.liveCents, { color: noteColor(live.cents) }]}>
+                  {live.cents > 0 ? '+' : ''}{Math.round(live.cents)}¢
+                </Text>
+              )}
+            </View>
+            {/* The annotation is what turns a note name into an instruction —
+                "cross to A", "shift to 3rd". Without it a generated sequence is
+                just a list of pitches and the player has to infer the point. */}
+            {showLive && <CentsGauge cents={live.cents ?? 0} active={live.voiced} />}
+            {currentStep.annotation && (
+              <Text style={s.beatAnnotation}>{currentStep.annotation}</Text>
+            )}
+            <Text style={s.beatCount}>Note {metronome.currentBeat + 1} of {steps.length}</Text>
+            {nextStep && (
+              <Text style={s.nextNote}>
+                Next: {nextStep.note}{nextStep.annotation ? ` · ${nextStep.annotation}` : ''}
+              </Text>
+            )}
           </Animated.View>
         ) : isRhythm && recording && metronome.currentBeat >= 0 ? (
           <Animated.View key={metronome.currentBeat} entering={FadeIn.duration(120)} style={s.takeCircle}>
@@ -805,7 +1117,7 @@ function TakePhase({
           </Animated.View>
         )}
 
-        {showLive && recording && (
+        {showLive && recording && !isSequence && (
           <>
             <CentsGauge cents={live.cents ?? 0} active={live.voiced} />
             {targetReps != null && (
@@ -873,6 +1185,62 @@ function JudgingPhase({
 }
 
 // ─── Result: self-report fallback (no evaluator) or a real pass/fail verdict ─
+/**
+ * The take's score, its breakdown, and how it compares with previous attempts
+ * at the same drill.
+ *
+ * A score rather than a verdict is the point: "82, up from 71 two weeks ago"
+ * tells a player something "failed, failed, passed" never could.
+ */
+function ScoreCard({ score, history }: { score: SequenceScore; history: ScoreHistory | null }) {
+  const band = scoreBand(score.score);
+  const color = colors.score[band];
+  const priorBest = history && history.scores.length > 1
+    ? Math.max(...history.scores.slice(0, -1))
+    : null;
+  const isBest = priorBest != null && score.score > priorBest;
+
+  return (
+    <View style={s.scoreCard}>
+      <View style={s.scoreTop}>
+        <Text style={[s.scoreValue, { color }]}>{score.score}</Text>
+        <View style={s.scoreOf}>
+          <Text style={s.scoreOfText}>out of 100</Text>
+          <Text style={s.scoreBar}>{score.passMark} to pass</Text>
+        </View>
+      </View>
+
+      <View style={s.scoreParts}>
+        <ScorePart label="Pitch" value={score.intonation} />
+        {score.timing != null && <ScorePart label="Timing" value={score.timing} />}
+        <ScorePart label="Notes" value={score.completeness} />
+      </View>
+
+      {isBest ? (
+        <Text style={s.scoreTrend}>Your best yet on this drill — up from {priorBest}.</Text>
+      ) : history && history.improvement != null && history.scores.length > 1 ? (
+        <Text style={s.scoreTrend}>
+          {history.improvement > 0
+            ? `Up ${history.improvement} since you first tried this (best ${history.best}).`
+            : `First try scored ${history.scores[0]}; best so far ${history.best}.`}
+        </Text>
+      ) : null}
+    </View>
+  );
+}
+
+function ScorePart({ label, value }: { label: string; value: number }) {
+  return (
+    <View style={s.scorePart}>
+      <View style={s.scorePartTrack}>
+        <View style={[s.scorePartFill, { width: `${Math.max(2, value)}%` }]} />
+      </View>
+      <Text style={s.scorePartLabel}>{label}</Text>
+      <Text style={s.scorePartValue}>{value}</Text>
+    </View>
+  );
+}
+
 function ResultPhase({
   block,
   insets,
@@ -880,6 +1248,9 @@ function ResultPhase({
   take,
   nextTempo,
   tempoDirection,
+  slowerTempo,
+  onSlower,
+  scoreHistory,
   onPass,
   onRetry,
 }: {
@@ -892,6 +1263,11 @@ function ResultPhase({
   nextTempo?: number | null;
   /** Whether nextTempo actually moved, or held at the drill's floor/ceiling. */
   tempoDirection?: 'up' | 'down' | 'same' | null;
+  /** Tempo a "try it slower" retake would run at; null when not adjustable. */
+  slowerTempo?: number | null;
+  onSlower?: () => void;
+  /** Previous scores for this same drill, for the improvement line. */
+  scoreHistory?: ScoreHistory | null;
   onPass: () => void;
   onRetry: () => void;
 }) {
@@ -917,7 +1293,7 @@ function ResultPhase({
     );
   }
 
-  const gaugeCents = lastCentsDeviation(evaluation);
+  const gaugeCents = highlightCents(evaluation);
   // Rhythm swaps the generic evaluator sentence for a one-line tempo call and
   // the note-name/cents chips for a plain-language early/late/missed list —
   // both are meaningless for a click-track drill.
@@ -936,6 +1312,7 @@ function ResultPhase({
             <Ionicons name="checkmark" size={40} color="#166534" />
           </View>
           <Text style={s.takeTitle}>Nice work</Text>
+          {evaluation.score && <ScoreCard score={evaluation.score} history={scoreHistory ?? null} />}
           <Text style={s.takeHint}>{feedbackLine}</Text>
           {gaugeCents != null && <CentsGauge cents={gaugeCents} active />}
           {breakdown}
@@ -975,21 +1352,48 @@ function ResultPhase({
           <Ionicons name="close" size={40} color="#991b1b" />
         </View>
         <Text style={s.takeTitle}>Not yet</Text>
+        {evaluation?.score && <ScoreCard score={evaluation.score} history={scoreHistory ?? null} />}
         <Text style={s.takeHint}>{feedbackLine ?? 'Try again.'}</Text>
         {gaugeCents != null && <CentsGauge cents={gaugeCents} active />}
         {breakdown}
       </View>
-      <View style={[s.bottomBar, { paddingBottom: bottomInset }]}>
+      <View style={[s.bottomBar, s.resultBar, { paddingBottom: bottomInset }]}>
         <DepthButton label="Try again" icon="refresh" onPress={onRetry} />
+        {/* The moment a slower tempo is actually wanted. Offering it only in
+            the intro means the player has to fail, back out, and come back. */}
+        {slowerTempo != null && onSlower && (
+          <DepthButton
+            label={`Try it slower — ${slowerTempo} BPM`}
+            icon="play-back"
+            variant="neutral"
+            onPress={onSlower}
+          />
+        )}
       </View>
     </View>
   );
 }
 
-function lastCentsDeviation(evaluation: PracticeEvaluation | null): number | null {
+/**
+ * The note the gauge should point at: the one the feedback sentence is about.
+ *
+ * This used to return the LAST attempt while the feedback described the FIRST
+ * miss, so the text could say "sharp by 1180¢" beside a needle reading 20¢
+ * flat — two different notes, presented as if they were one.
+ *
+ * Returns null when the deviation is beyond what a ±50¢ gauge can honestly
+ * show. A wrong note or an octave detection error is not a needle position, and
+ * pinning the needle to the end of the scale would assert a precision that
+ * isn't there; the sentence explains it instead.
+ */
+function highlightCents(evaluation: PracticeEvaluation | null): number | null {
   const results = evaluation?.attemptResults;
   if (!results || results.length === 0) return null;
-  return results[results.length - 1].centsDeviation ?? null;
+  const focus = results.find((r) => !r.passed && r.centsDeviation != null)
+    ?? results[results.length - 1];
+  const cents = focus.centsDeviation;
+  if (cents == null || Math.abs(cents) > GAUGE_RANGE_CENTS) return null;
+  return cents;
 }
 
 // One sentence, always — the whole point of the adaptive click track is that
@@ -1104,15 +1508,6 @@ function AttemptChips({
   );
 }
 
-function OverviewRow({ label, value }: { label: string; value: string }) {
-  return (
-    <View style={s.overviewRow}>
-      <Text style={s.overviewLabel}>{label}</Text>
-      <Text style={s.overviewValue}>{value}</Text>
-    </View>
-  );
-}
-
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: colors.brand[900] },
   safe: { flex: 1 },
@@ -1176,7 +1571,7 @@ const s = StyleSheet.create({
   lessonTitle: { color: '#fff', fontSize: 30, fontWeight: '900' },
   lessonTarget: { color: 'rgba(255,255,255,0.84)', fontSize: 14, lineHeight: 20, fontWeight: '700', marginTop: spacing.xs },
   lessonNote: { color: 'rgba(255,255,255,0.68)', fontSize: 13, lineHeight: 19 },
-  stage: { minHeight: 232, alignItems: 'center', justifyContent: 'center' },
+  stage: { alignItems: 'center', justifyContent: 'center', paddingVertical: spacing.sm },
   stepPanel: { backgroundColor: '#fff', borderRadius: radius.xl, padding: spacing.lg, gap: spacing.md },
   stepTop: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   stepIcon: {
@@ -1202,7 +1597,13 @@ const s = StyleSheet.create({
   bottomBar: { paddingHorizontal: spacing.lg, paddingTop: spacing.sm, backgroundColor: colors.brand[900] },
   // Take / Result
   takeWrap: { flex: 1 },
-  takeBody: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: spacing.lg, gap: spacing.sm },
+  takeBody: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: spacing.lg,
+    gap: spacing.md,
+  },
   takeKicker: {
     color: 'rgba(255,255,255,0.58)',
     fontSize: 12,
@@ -1210,23 +1611,112 @@ const s = StyleSheet.create({
     textTransform: 'uppercase',
     letterSpacing: 0.5,
   },
-  takeTitle: { color: '#fff', fontSize: 26, fontWeight: '900', textAlign: 'center' },
-  takeTarget: { color: 'rgba(255,255,255,0.84)', fontSize: 15, fontWeight: '700', textAlign: 'center' },
+  takeTitle: { color: '#fff', fontSize: 28, fontWeight: '900', textAlign: 'center', lineHeight: 34 },
+  takeTarget: { color: 'rgba(255,255,255,0.84)', fontSize: 16, fontWeight: '700', textAlign: 'center', lineHeight: 22 },
   takeCircle: {
-    width: 168,
-    height: 168,
-    borderRadius: 84,
-    marginVertical: spacing.lg,
+    width: NOTE_CIRCLE,
+    height: NOTE_CIRCLE,
+    borderRadius: NOTE_CIRCLE / 2,
+    marginVertical: spacing.sm,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: 'rgba(255,255,255,0.12)',
     borderWidth: 2,
     borderColor: 'rgba(255,255,255,0.22)',
   },
-  takeHint: { color: 'rgba(255,255,255,0.7)', fontSize: 14, lineHeight: 20, textAlign: 'center' },
-  beatNote: { color: '#fff', fontSize: 40, fontWeight: '900' },
-  beatCount: { color: 'rgba(255,255,255,0.7)', fontSize: 12, fontWeight: '700', marginTop: 4 },
-  nextNote: { color: 'rgba(255,255,255,0.6)', fontSize: 13, fontWeight: '600', marginTop: 8 },
+  /** Circle plus the lines beneath it, which get the full screen width. */
+  noteStack: { alignItems: 'center', alignSelf: 'stretch', gap: spacing.sm },
+  takeHint: { color: 'rgba(255,255,255,0.72)', fontSize: 16, lineHeight: 23, textAlign: 'center' },
+  beatNote: { color: '#fff', fontSize: Math.round(NOTE_CIRCLE * 0.32), fontWeight: '900' },
+  previewRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+    backgroundColor: colors.brand[50],
+    borderRadius: radius.xl,
+    padding: spacing.md,
+    borderWidth: 1.5,
+    borderColor: colors.brand[100],
+  },
+  previewRowPressed: { backgroundColor: colors.brand[100] },
+  previewIcon: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#fff',
+  },
+  previewCopy: { flex: 1, gap: 2 },
+  previewLabel: { fontSize: 15, fontWeight: '900', color: colors.brand[800] },
+  previewHint: { fontSize: 12, lineHeight: 17, color: colors.text.secondary },
+  tempoRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    backgroundColor: colors.surface,
+    borderRadius: radius.xl,
+    padding: spacing.md,
+    borderWidth: 1.5,
+    borderColor: '#eef2f7',
+  },
+  tempoCopy: { flex: 1, gap: 1 },
+  tempoLabel: { fontSize: 14, fontWeight: '900', color: colors.text.primary },
+  tempoHint: { fontSize: 12, lineHeight: 16, color: colors.text.muted },
+  tempoBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.brand[50],
+  },
+  tempoBtnPressed: { backgroundColor: colors.brand[100] },
+  tempoValue: { alignItems: 'center', minWidth: 46 },
+  tempoNumber: { fontSize: 19, fontWeight: '900', color: colors.text.primary },
+  tempoUnit: { fontSize: 10, fontWeight: '800', color: colors.text.muted, letterSpacing: 0.4 },
+  scoreCard: {
+    alignSelf: 'stretch',
+    backgroundColor: 'rgba(255,255,255,0.12)',
+    borderRadius: radius.xl,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.2)',
+    padding: spacing.md,
+    gap: spacing.sm,
+  },
+  scoreTop: { flexDirection: 'row', alignItems: 'baseline', gap: spacing.sm },
+  scoreValue: { fontSize: 56, fontWeight: '900', lineHeight: 62 },
+  scoreOf: { flex: 1 },
+  scoreOfText: { color: 'rgba(255,255,255,0.85)', fontSize: 15, fontWeight: '700' },
+  scoreBar: { color: 'rgba(255,255,255,0.6)', fontSize: 13, fontWeight: '600' },
+  scoreParts: { gap: spacing.xs },
+  scorePart: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  scorePartTrack: {
+    flex: 1,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: 'rgba(255,255,255,0.18)',
+    overflow: 'hidden',
+  },
+  scorePartFill: { height: '100%', borderRadius: 4, backgroundColor: '#fff' },
+  scorePartLabel: { color: 'rgba(255,255,255,0.8)', fontSize: 13, fontWeight: '700', width: 56 },
+  scorePartValue: { color: '#fff', fontSize: 14, fontWeight: '800', width: 30, textAlign: 'right' },
+  scoreTrend: { color: 'rgba(255,255,255,0.82)', fontSize: 14, fontWeight: '700', lineHeight: 20 },
+  beatAnnotation: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: '800',
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    borderRadius: radius.full,
+    backgroundColor: 'rgba(255,255,255,0.22)',
+    overflow: 'hidden',
+    textAlign: 'center',
+    lineHeight: 24,
+  },
+  liveCents: { fontSize: 20, fontWeight: '900', marginTop: 2 },
+  beatCount: { color: 'rgba(255,255,255,0.72)', fontSize: 15, fontWeight: '700' },
+  nextNote: { color: 'rgba(255,255,255,0.62)', fontSize: 15, fontWeight: '600', textAlign: 'center' },
   liveReps: { color: 'rgba(255,255,255,0.75)', fontSize: 14, fontWeight: '800', marginTop: spacing.xs },
   recRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   recDot: { width: 12, height: 12, borderRadius: 6, backgroundColor: '#ef4444' },

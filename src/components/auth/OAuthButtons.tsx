@@ -3,6 +3,9 @@ import { View, Text, Pressable, StyleSheet, Alert, ActivityIndicator } from 'rea
 import { FontAwesome6 } from '@expo/vector-icons';
 import { signInWithProvider, OAuthProvider } from '../../services/auth';
 import { haptic } from '../../lib/haptics';
+import { track, trackLogin } from '../../services/analytics';
+import { AnalyticsEvent } from '../../constants/analyticsEvents';
+import { errorReason } from '../../lib/analyticsUserProps';
 import { colors, spacing, radius } from '../../constants/theme';
 
 interface OAuthButtonsProps {
@@ -13,9 +16,13 @@ interface OAuthButtonsProps {
   light?: boolean;
 }
 
+// Apple first, deliberately. It is the only path that produces an account
+// without an email round-trip, which matters because confirmation mail is the
+// least reliable part of the signup stack — and Apple's own guidelines require
+// Sign in with Apple to be at least as prominent as any other provider.
 const PROVIDERS: { id: OAuthProvider; label: string; icon: string }[] = [
-  { id: 'google', label: 'Continue with Google', icon: 'google' },
   { id: 'apple', label: 'Continue with Apple', icon: 'apple' },
+  { id: 'google', label: 'Continue with Google', icon: 'google' },
 ];
 
 // Shared Google/Apple sign-in buttons for login, register, and the onboarding
@@ -29,9 +36,18 @@ export function OAuthButtons({ onSuccess, light = false }: OAuthButtonsProps) {
     try {
       const data = await signInWithProvider(provider);
       if (data?.session && data.user) {
+        trackLogin(provider);
         onSuccess(data.user.id);
+      } else {
+        // signInWithProvider resolves null when the user closes the web session.
+        track(AnalyticsEvent.AUTH_FAILED, { stage: 'oauth', method: provider, reason: 'cancelled' });
       }
     } catch (err: any) {
+      track(AnalyticsEvent.AUTH_FAILED, {
+        stage: 'oauth',
+        method: provider,
+        reason: errorReason(err),
+      });
       Alert.alert('Sign-in failed', err?.message ?? 'Something went wrong.');
     } finally {
       setLoadingProvider(null);

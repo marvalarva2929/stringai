@@ -91,8 +91,6 @@ export async function fetchProfile(userId: string): Promise<UserProfile> {
     instrument: data.instrument,
     skillLevel: data.skill_level,
     weeklyGoalMinutes: data.weekly_goal_minutes ?? undefined,
-    freeAnalysesUsed: data.free_analyses_used,
-    subscriptionTier: data.subscription_tier,
     createdAt: data.created_at,
   };
 }

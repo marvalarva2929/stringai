@@ -159,11 +159,14 @@ export const STEP_COPY = {
     reminderTitle: 'Daily practice reminder',
     reminderSubtitle: "We'll send one gentle nudge at a time you choose.",
   },
+  // Shown after the purchase now, not during onboarding — so this is addressed
+  // to someone who has already paid. The job is no longer to sell anything, it
+  // is to explain why the subscription they just bought needs somewhere to live.
   account: {
-    title: 'Save your progress',
-    subtitle: 'Create an account to back up your sessions and access them anywhere.',
-    closing: "Next: record a quick take so StringAI can calibrate your first session.",
-    skip: 'Skip for now',
+    title: "You're in — one last thing",
+    subtitle:
+      'Create an account so your subscription, recordings and progress follow you to any device.',
+    closing: 'Signing in with Apple is one tap and skips the confirmation email.',
     cta: 'Create Account',
   },
 };

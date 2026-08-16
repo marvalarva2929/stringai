@@ -2,6 +2,7 @@ import type { SessionSignals } from '../types/signals';
 import type { NoteEvent, Phrase } from './noteFusion';
 import type { NoteGroup } from './noteGrouping';
 import type { VibratoAnalysis } from '../types/analysis';
+import type { PhraseDynamics } from './dynamicsShape';
 
 // ─────────────────────────────────────────────────────────────
 // L7 — Phrase feature engine
@@ -41,6 +42,25 @@ export interface PhraseFeatures {
   /** Notes and slur groups overlapping this phrase, for L10 drill-down. */
   note_count: number;
   slur_count: number;
+  /**
+   * Dynamic shaping for this phrase, from lib/dynamicsShape.ts. Present once
+   * the pipeline has run it; absent for phrase features built without it.
+   *
+   * Carried here so one object per phrase holds everything the coach needs,
+   * keyed by the id the results UI already seeks with — previously the shape
+   * data lived on a different, incompatible segmentation and could not be
+   * joined to a seekable phrase at all.
+   */
+  dynamics?: {
+    shape: PhraseDynamics['shape'];
+    /** 0-1 position of the loudest moment. */
+    peak_pos: number;
+    /** Absolute time of that peak, so feedback can be seeked to. */
+    peak_t: number;
+    slope_norm: number;
+    /** Level and pitch trending together — a shaped line, not a fault. */
+    melodic_contour: boolean;
+  };
 }
 
 // Energy-shape thirds comparison margin (plan.md: 20%)
@@ -107,7 +127,10 @@ export function buildPhraseFeatures(
   noteEvents: NoteEvent[],
   noteGroups: NoteGroup[],
   vibratoAnalysis?: VibratoAnalysis,
+  /** Index-aligned per-phrase dynamics from computeDynamicsShape. */
+  phraseDynamics?: PhraseDynamics[],
 ): PhraseFeatures[] {
+  const dynamicsById = new Map((phraseDynamics ?? []).map((d) => [d.phraseId, d]));
   return phrases.map((phrase, id) => {
     const { start, end } = phrase;
 
@@ -168,6 +191,17 @@ export function buildPhraseFeatures(
       timbre_variation: Math.round(timbre_variation * 10) / 10,
       note_count: phraseNotes.length,
       slur_count,
+      dynamics: (() => {
+        const d = dynamicsById.get(id);
+        if (!d) return undefined;
+        return {
+          shape: d.shape,
+          peak_pos: Math.round(d.peakPos * 100) / 100,
+          peak_t: Math.round(d.peakSec * 10) / 10,
+          slope_norm: Math.round(d.slopeNorm * 100) / 100,
+          melodic_contour: d.melodicContour,
+        };
+      })(),
     };
   });
 }

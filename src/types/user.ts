@@ -15,11 +15,6 @@ export interface CurrentPiece {
   startedAt: string;
 }
 
-/** @deprecated Use `Tier` from src/lib/entitlements.ts. Backed by the legacy
- *  profiles.subscription_tier column, which migration 004 stopped writing and a
- *  follow-up migration drops. Nothing gates on it. */
-export type SubscriptionTier = 'free' | 'monthly' | 'annual';
-
 export interface UserProfile {
   id: string;
   email: string;
@@ -30,9 +25,5 @@ export interface UserProfile {
   weeklyGoalMinutes?: number;
   /** The piece pinned as "currently practicing", if any. */
   currentPiece?: CurrentPiece;
-  /** @deprecated Superseded by the daily cap in useEntitlementStore. */
-  freeAnalysesUsed: number;
-  /** @deprecated See SubscriptionTier. Read useEntitlementStore instead. */
-  subscriptionTier: SubscriptionTier;
   createdAt: string;
 }

@@ -102,7 +102,7 @@ export const METRIC_META: Record<MetricKey, MetricMeta> = {
     tips: {
       excellent: 'Bow is well-aligned, close to perpendicular with the strings.',
       good: 'Mostly good alignment. A slight diagonal is natural, but aim to keep the bow closer to square.',
-      needs_attention: 'Bow is angling significantly. This reduces contact surface and tone quality. Watch yourself in a mirror while practising slow bows.',
+      needs_attention: 'Bow is angling significantly. This reduces contact surface and tone quality. Watch yourself in a mirror while practicing slow bows.',
       critical: 'Significant bow angle issues. Practice long bows in front of a mirror, keeping the bow visually parallel to the bridge at all times.',
     },
     drill: 'Stand sideways to a mirror. Draw a slow whole bow on open D, watching the mirror. The bow should always look perpendicular to the strings. A common fix: keep the right elbow leading slightly at the frog, and let the wrist guide gently at the tip. Do 10 bows watching the mirror, then 10 with eyes closed trying to feel the correct angle.',

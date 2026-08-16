@@ -1,21 +1,22 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { View, Text, Pressable, StyleSheet, ScrollView } from 'react-native';
 import Animated, { FadeIn, FadeOut } from 'react-native-reanimated';
 import { router } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuthStore } from '../../src/store/useAuthStore';
+import { useActivationStore } from '../../src/store/useActivationStore';
 import { useOnboardingStore } from '../../src/store/useOnboardingStore';
 import { useReminderStore } from '../../src/store/useReminderStore';
 import { WelcomeStep } from '../../src/components/onboarding/WelcomeStep';
 import { OptionCards } from '../../src/components/onboarding/OptionCards';
 import { PreferencesStep } from '../../src/components/onboarding/PreferencesStep';
 import { PermissionsStep } from '../../src/components/onboarding/PermissionsStep';
-import { ProStep } from '../../src/components/onboarding/ProStep';
-import { AccountStep } from '../../src/components/onboarding/AccountStep';
 import { BigButton } from '../../src/components/ui/BigButton';
 import { haptic } from '../../src/lib/haptics';
 import { colors, spacing } from '../../src/constants/theme';
-import { updateProfileFields } from '../../src/services/auth';
+import { track } from '../../src/services/analytics';
+import { AnalyticsEvent } from '../../src/constants/analyticsEvents';
+import { qaCheckpoint } from '../../src/services/crashReporting';
 import { GOAL_TIERS } from '../../src/lib/weeklyGoal';
 import {
   STEP_COPY,
@@ -27,8 +28,13 @@ import {
 } from '../../src/constants/onboardingContent';
 
 // Step machine: an ordered list of step ids rendered via switch. Every step
-// after the welcome intro carries a choice or an action (cards, a form, a
-// permission/reminder toggle, a subscribe offer) — no text-only filler.
+// after the welcome intro carries a choice or an action (cards, a
+// permission/reminder toggle) — no text-only filler.
+//
+// Account creation used to be the terminal step. It now runs after the
+// purchase instead (see AccountGate) — a signup form in front of the value
+// moment is the most expensive place in the funnel to put one, and the
+// confirmation email it depends on is the least reliable part of the stack.
 const STEPS = [
   'welcome',
   'goals',
@@ -38,8 +44,6 @@ const STEPS = [
   'accessories',
   'preferences',
   'permissions',
-  'pro',
-  'account',
 ] as const;
 type StepId = (typeof STEPS)[number];
 
@@ -72,12 +76,50 @@ export default function Onboarding() {
     (step !== 'time' || dailyTimeId !== null) &&
     (step !== 'experience' || experienceId !== null);
 
-  const goNext = () => setStepIndex((i) => Math.min(i + 1, STEPS.length - 1));
+  // What the user picked on the step they are leaving. Kept short and
+  // low-cardinality — it is the answer, not a full dump of the store.
+  const selectionFor = (id: StepId): string | undefined => {
+    switch (id) {
+      case 'goals': return learningGoals.join(',') || undefined;
+      case 'time': return dailyTimeId ?? undefined;
+      case 'experience': return experienceId ?? undefined;
+      case 'violin-size': return violinSize ?? undefined;
+      case 'accessories': return accessories.join(',') || undefined;
+      default: return undefined;
+    }
+  };
 
-  // accountUserId is passed in directly (rather than read from state) because
-  // AccountStep's callback fires in the same tick as completion — a state
-  // setter here wouldn't have flushed yet.
-  const complete = async (accountUserId?: string) => {
+  const startedAt = useRef(Date.now());
+  const stepEnteredAt = useRef(Date.now());
+
+  useEffect(() => {
+    track(AnalyticsEvent.ONBOARDING_START);
+  }, []);
+
+  // Per-step impressions. Paired with onboarding_step_complete below, these give
+  // the view→complete drop-off for each of the ten steps and how long each took.
+  useEffect(() => {
+    stepEnteredAt.current = Date.now();
+    track(AnalyticsEvent.ONBOARDING_STEP_VIEW, { step_id: step, step_index: stepIndex });
+  }, [step, stepIndex]);
+
+  // Every forward transition funnels through here — the footer CTA and the
+  // welcome CTA — so one emit covers every step. The last step's transition is
+  // into completion rather than another step, and carries onboarding_complete
+  // alongside it.
+  const goNext = () => {
+    track(AnalyticsEvent.ONBOARDING_STEP_COMPLETE, {
+      step_id: step,
+      step_index: stepIndex,
+      ms_on_step: Date.now() - stepEnteredAt.current,
+      selection: selectionFor(step),
+    });
+    setStepIndex((i) => Math.min(i + 1, STEPS.length - 1));
+  };
+
+  // Everything collected here stays local. There is no account yet to write it
+  // to — syncOnboardingAnswersToProfile flushes it once one exists.
+  const complete = async () => {
     haptic.light();
     const experience = EXPERIENCE_LEVELS.find((e) => e.id === experienceId);
     const dailyTime = DAILY_TIME_OPTIONS.find((t) => t.id === dailyTimeId);
@@ -92,20 +134,35 @@ export default function Onboarding() {
       } catch {}
     }
 
-    if (accountUserId) {
-      updateProfileFields(accountUserId, {
-        skill_level: experience?.skillLevel ?? 'beginner',
-        ...(tier ? { weekly_goal_minutes: tier.minutes } : {}),
-      }).catch(() => {});
-    }
+    // The top of every downstream funnel — a Key Event in GA4, and the
+    // denominator for activation and conversion rates.
+    track(AnalyticsEvent.ONBOARDING_COMPLETE, {
+      goals_count: learningGoals.length,
+      daily_time: dailyTimeId ?? undefined,
+      experience: experienceId ?? undefined,
+      violin_size: violinSize ?? undefined,
+      accessories_count: accessories.length,
+      reminder_enabled: reminderEnabled,
+      ms_total: Date.now() - startedAt.current,
+    });
+    qaCheckpoint('onboarding_complete'); // TEMPORARY — QA walkthrough checkpoint
 
     setOnboardingComplete();
+    // Land on the real home screen, with activation armed — the walkthrough
+    // points at the actual buttons there rather than describing them first.
+    useActivationStore.getState().begin();
     router.replace('/(tabs)/home');
   };
+
+  const isLastStep = stepIndex === STEPS.length - 1;
 
   const advance = () => {
     haptic.light();
     goNext();
+    // `permissions` is terminal now that the account step has moved out, so the
+    // shared footer CTA has to finish the flow rather than walk off the end of
+    // the array.
+    if (isLastStep) void complete();
   };
 
   // Dev-only escape hatch. Doesn't persist completion, so onboarding still
@@ -180,22 +237,12 @@ export default function Onboarding() {
           />
         );
 
-      case 'pro':
-        return <ProStep onSkip={goNext} />;
-
-      case 'account':
-        return (
-          <AccountStep
-            onCreated={(userId) => complete(userId)}
-            onSkip={() => complete()}
-          />
-        );
     }
   };
 
-  // These steps drive their own navigation (their own CTA + skip), so the
-  // shared footer CTA is hidden for them.
-  const showFooterCta = step !== 'account' && step !== 'pro' && step !== 'welcome';
+  // The welcome hero drives its own navigation, so the shared footer CTA is
+  // hidden for it.
+  const showFooterCta = step !== 'welcome';
 
   return (
     <View style={styles.container}>
@@ -223,7 +270,11 @@ export default function Onboarding() {
           <Text style={styles.stepCounter}>{stepIndex + 1} of {STEPS.length}</Text>
 
           {showFooterCta && (
-            <BigButton label="Continue" onPress={advance} disabled={!canAdvance} />
+            <BigButton
+              label={isLastStep ? "Let's play" : 'Continue'}
+              onPress={advance}
+              disabled={!canAdvance}
+            />
           )}
         </View>
       )}

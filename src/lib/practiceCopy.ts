@@ -65,6 +65,25 @@ export function toneCue(block: PracticeBlock): string {
       return 'a clean, open sound';
     case 'rhythm':
       return 'steady time on the beat';
+    case 'arpeggio_cycle':
+      return 'each chord tone ringing against the open strings';
+    case 'figure_loop':
+    case 'etude_fragment':
+      return 'the same shape sounding the same way every time';
+    case 'finger_pattern':
+      return 'notes of exactly equal length';
+    case 'shifting_ladder':
+      return 'a landing that is already in tune, with no slide to fix it';
+    case 'crossing_wave':
+      return 'a silent change between strings — no bump';
+    case 'bow_distribution':
+      return 'a full sound all the way to the end of the stroke';
+    case 'articulation':
+      return 'every note starting the same way as the last';
+    case 'trill_chain':
+      return 'evenly spaced alternations you could count';
+    case 'acceleration':
+      return 'a pulse that never moves under the notes';
     default:
       return 'a clear, repeatable sound';
   }
@@ -95,6 +114,29 @@ export function blockAccent(type: PracticeBlockType): string {
       return '#db2777';
     case 'phrase_repair':
       return '#4f46e5';
+    // Generated drills. Hue carries meaning: left-hand work stays in the blues,
+    // bow-arm work in the ambers, timing in the teals — so a glance down the
+    // path reads as what kind of work today is, not just as a list.
+    case 'arpeggio_cycle':
+      return '#1d4ed8';
+    case 'figure_loop':
+      return '#4338ca';
+    case 'finger_pattern':
+      return '#0891b2';
+    case 'shifting_ladder':
+      return '#7e22ce';
+    case 'crossing_wave':
+      return '#b45309';
+    case 'bow_distribution':
+      return '#c2410c';
+    case 'articulation':
+      return '#a16207';
+    case 'trill_chain':
+      return '#9333ea';
+    case 'acceleration':
+      return '#0f766e';
+    case 'etude_fragment':
+      return '#3730a3';
     default:
       return '#475569';
   }
@@ -104,13 +146,20 @@ export function blockAccent(type: PracticeBlockType): string {
 export function blockIcon(type: PracticeBlockType): IoniconName {
   switch (type) {
     case 'vibrato':
+    case 'trill_chain':
       return 'pulse';
     case 'bow_control':
+    case 'bow_distribution':
+    case 'crossing_wave':
       return 'body';
     case 'rhythm':
+    case 'acceleration':
       return 'timer';
     case 'tone':
+    case 'articulation':
       return 'volume-high';
+    case 'figure_loop':
+      return 'repeat';
     default:
       return 'musical-note';
   }

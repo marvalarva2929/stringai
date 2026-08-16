@@ -11,7 +11,7 @@ import {
   issuesRecent,
   type IssueSource,
 } from '../src/lib/practiceIssues';
-import type { PracticeEvidence } from '../src/lib/practiceEvidence';
+import { EVIDENCE_VERSION, type PracticeEvidence } from '../src/lib/practiceEvidence';
 import type { AnalysisResult, MetricScore } from '../src/types/analysis';
 import type { MetricHistoryEntry } from '../src/store/useAnalysisStore';
 
@@ -44,17 +44,31 @@ console.log('collectIssueSources');
     recordedAt: '2026-07-10T00:00:00Z', overallScore: 60,
     metrics: [richScore], audioMetrics: [richScore], videoMetrics: [],
     sessionEvidence: [ev('pitch_note:G4', 120)],
+    // Stamped current: frozen evidence is trusted as-is. Without the stamp it
+    // would be treated as predating the current analysis and recomputed, which
+    // is what stops an old session serving findings now known to be wrong.
+    evidenceVersion: EVIDENCE_VERSION,
   } as AnalysisResult;
 
   const history: MetricHistoryEntry[] = [
-    { sessionId: 'rich-1', recordedAt: '2026-07-10T00:00:00Z', scores: [richScore], evidence: [ev('should-not-win', 999)] },
-    { sessionId: 'hist-2', recordedAt: '2026-07-09T00:00:00Z', scores: [richScore], evidence: [ev('pattern:bow_zone_camping', 98)], pieceId: 'p1' },
+    { sessionId: 'rich-1', recordedAt: '2026-07-10T00:00:00Z', scores: [richScore], evidence: [ev('should-not-win', 999)], evidenceVersion: EVIDENCE_VERSION },
+    { sessionId: 'hist-2', recordedAt: '2026-07-09T00:00:00Z', scores: [richScore], evidence: [ev('pattern:bow_zone_camping', 98)], pieceId: 'p1', evidenceVersion: EVIDENCE_VERSION },
     { sessionId: 'hist-old', recordedAt: '2026-07-01T00:00:00Z', scores: [richScore] }, // no evidence → skipped
   ];
 
   const sources = collectIssueSources({ recentSessions: [rich], metricHistory: history });
   check('one source per session id', sources.length === 2, String(sources.length));
   check('rich session wins over history entry for same id', sources[0].evidence[0].id === 'pitch_note:G4');
+
+  // An unstamped rich session predates versioning, so its frozen findings are
+  // recomputed rather than trusted — the fix for stale crossing labels.
+  const unstamped = collectIssueSources({
+    recentSessions: [{ ...rich, evidenceVersion: undefined } as AnalysisResult],
+    metricHistory: [],
+  });
+  check('unstamped rich evidence is recomputed, not served',
+    !unstamped[0]?.evidence.some((e) => e.id === 'pitch_note:G4'),
+    JSON.stringify(unstamped[0]?.evidence.map((e) => e.id)));
   check('history-only session included', sources.some((s) => s.sessionId === 'hist-2'));
   check('evidence-less entry skipped', !sources.some((s) => s.sessionId === 'hist-old'));
   check('newest source first', sources[0].sessionId === 'rich-1');
