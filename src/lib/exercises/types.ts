@@ -40,9 +40,17 @@ export interface ExerciseContext {
 
 export type ExerciseGenerator = (ctx: ExerciseContext) => PracticeBlock | null;
 
-/** Cents tolerance by coach intensity — the same ladder the old blocks used. */
+/**
+ * Cents tolerance by coach intensity.
+ *
+ * The earlier ladder (8/10/12) demanded better-than-professional accuracy: the
+ * just-noticeable difference for pitch is roughly 5–10 cents, and real violin
+ * playing — vibrato included — swings ±20–30. A gate a player cannot clear no
+ * matter how well they play teaches them the app is broken, not that they are
+ * out of tune. 25 cents is a quarter of a semitone: audibly off, but reachable.
+ */
 export function centsFor(intensity: CoachIntensity): number {
-  return intensity === 'advanced' ? 8 : intensity === 'balanced' ? 10 : 12;
+  return intensity === 'advanced' ? 15 : intensity === 'balanced' ? 20 : 25;
 }
 
 /** Click tempo by coach intensity, for drills that don't set their own. */
@@ -157,9 +165,10 @@ export function buildSequenceBlock(args: BuildSequenceBlockArgs): PracticeBlock 
       status: 'ready',
     },
     successCriteria: {
-      // The bar is a score, not a clean sweep — say so, so the player knows a
-      // couple of imperfect notes won't sink the take.
-      summary: `${args.successSummary} Score ${passMarkFor(ctx.intensity)}+ out of 100 to pass.`,
+      // State the gate the take is actually judged by. This used to quote a
+      // score bar, which meant a player could beat the number shown here and
+      // still be told they had not passed.
+      summary: `${args.successSummary} Every note within ${cents}\u00A2 to pass.`,
       repetitions: 1,
       centsThreshold: cents,
     },

@@ -201,6 +201,103 @@ export function testFingerAccuracyGap(notes: NoteEvent[]): StatisticalFinding {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Test: instrument_out_of_tune
+//
+// Detects: the violin itself being tuned sharp or flat, rather than the player
+//          fingering badly.
+// Method:  open strings first — a note played on an open string cannot be
+//          fingered wrong, so a systematic offset there is the instrument, full
+//          stop. With too few open notes, falls back to asking whether the bias
+//          is UNIFORM across every finger×string group: one bad finger is a
+//          technique problem, all of them equally off is a tuning peg.
+// Fires:   when |offset| ≥ 15 cents with the evidence above.
+//
+// This has to run, and has to be reported ahead of the others, because a
+// mistuned instrument makes every other intonation test lie: with the A string
+// 25 cents flat, every group's mean is −25 and pitch_tendency happily blames a
+// finger. It is also the single most actionable finding in the app — nothing
+// about the player's technique needs to change, they just need to tune.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Below this a global offset is ordinary imprecision, not a mistuned string. */
+const TUNING_OFFSET_CENTS = 15;
+/** Group means must sit within this of the global offset to count as uniform. */
+const TUNING_UNIFORMITY_CENTS = 12;
+/** Enough open-string notes to trust them on their own. */
+const MIN_OPEN_NOTES = 4;
+
+export function testInstrumentTuning(notes: NoteEvent[]): StatisticalFinding {
+  if (notes.length < MIN_GROUP_SIZE) return notFired('instrument_out_of_tune');
+
+  const open = notes.filter((n) => n.inferredFinger === 0);
+  const globalOffset = mean(notes.map((n) => n.centsDeviation));
+
+  let offset: number;
+  let basis: string;
+  let n: number;
+
+  if (open.length >= MIN_OPEN_NOTES) {
+    offset = mean(open.map((o) => o.centsDeviation));
+    basis = `${open.length} open-string note${open.length === 1 ? '' : 's'}`;
+    n = open.length;
+  } else {
+    // No open strings to lean on: only call it tuning when the bias is the same
+    // everywhere. A single finger being off is emphatically not this.
+    const byGroup = new Map<string, NoteEvent[]>();
+    for (const note of notes) {
+      const key = `${note.inferredFinger}-${note.string}`;
+      byGroup.set(key, [...(byGroup.get(key) ?? []), note]);
+    }
+    const groupMeans = [...byGroup.values()]
+      .filter((g) => g.length >= 3)
+      .map((g) => mean(g.map((x) => x.centsDeviation)));
+    if (groupMeans.length < 2) return notFired('instrument_out_of_tune');
+    const uniform = groupMeans.every((m) => Math.abs(m - globalOffset) <= TUNING_UNIFORMITY_CENTS);
+    if (!uniform) return notFired('instrument_out_of_tune');
+    offset = globalOffset;
+    basis = `every finger and string, evenly`;
+    n = notes.length;
+  }
+
+  const effectSize = Math.abs(offset) / 50;
+  // Sized on the whole take, not on `n`. The offset may be read from as few as
+  // four open strings, but that is not weak evidence — an open string cannot be
+  // fingered wrong, so a handful of them agreeing settles it. Charging the
+  // usual n/40 sample penalty would keep the most certain finding in the app
+  // permanently below the reporting threshold.
+  const confidence = confidenceFromEffect(notes.length, effectSize);
+  const fired = Math.abs(offset) >= TUNING_OFFSET_CENTS && confidence >= 0.4;
+  if (!fired) return { ...notFired('instrument_out_of_tune'), confidence };
+
+  const direction = offset > 0 ? 'sharp' : 'flat';
+  return {
+    testId: 'instrument_out_of_tune',
+    fired: true,
+    severity: Math.abs(offset) >= 30 ? 'significant' : Math.abs(offset) >= 20 ? 'moderate' : 'minor',
+    confidence,
+    summary: `Everything read about ${Math.round(Math.abs(offset))}¢ ${direction} — ${basis}. That is the instrument, not your fingers. Tune before the next take.`,
+    evidence: {
+      groupA: { label: basis, value: Math.round(offset), n },
+      groupB: { label: 'in tune', value: 0, n: 0 },
+      effectSize,
+    },
+    timestamps: notes.slice(0, 3).map((note) => ({
+      startSeconds: note.startSeconds,
+      endSeconds: note.endSeconds,
+    })),
+  };
+}
+
+/**
+ * The instrument's own offset, to be subtracted before judging any finger.
+ * Returns 0 unless the tuning test actually fires.
+ */
+export function tuningOffsetCents(notes: NoteEvent[]): number {
+  const finding = testInstrumentTuning(notes);
+  return finding.fired ? finding.evidence.groupA.value : 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Test: pitch_tendency
 //
 // Detects: systematic sharp or flat bias per finger × string combination.
@@ -212,6 +309,12 @@ export function testFingerAccuracyGap(notes: NoteEvent[]): StatisticalFinding {
 
 export function testPitchTendency(notes: NoteEvent[]): StatisticalFinding {
   if (notes.length < MIN_GROUP_SIZE) return notFired('pitch_tendency');
+
+  // Judge each finger against the rest of the instrument, not against A=440.
+  // A violin tuned 25 cents flat puts every group's mean at -25, which used to
+  // fire this test and blame whichever finger happened to be worst — a
+  // technique diagnosis for a tuning problem. See testInstrumentTuning.
+  const tuning = tuningOffsetCents(notes);
 
   const byGroup = new Map<string, NoteEvent[]>();
   for (const n of notes) {
@@ -229,7 +332,7 @@ export function testPitchTendency(notes: NoteEvent[]): StatisticalFinding {
     stats.push({
       finger: Number(fingerStr),
       string: str,
-      meanDev: mean(ns.map((n) => n.centsDeviation)),
+      meanDev: mean(ns.map((n) => n.centsDeviation)) - tuning,
       n: ns.length,
       notes: ns,
     });
@@ -519,6 +622,10 @@ export function runPatternDetection(
   noteEvents: NoteEvent[],
 ): StatisticalFinding[] {
   const tests = [
+    // First in the list because it is first in usefulness: when the instrument
+    // is out of tune, nothing else about the player's intonation is worth
+    // saying yet.
+    testInstrumentTuning(noteEvents),
     testIntonationFatigue(noteEvents),
     testFingerAccuracyGap(noteEvents),
     testPitchTendency(noteEvents),

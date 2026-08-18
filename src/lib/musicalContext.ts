@@ -1,5 +1,7 @@
 import type { NoteEvent, Phrase } from './noteFusion';
 import { midiToNoteName, noteNameToMidi } from './pitchNaming';
+import { planFingering } from './exercises/fingeringPlan';
+import type { PositionName } from './exercises/fingerboard';
 
 // ─────────────────────────────────────────────────────────────
 // L7.5 — Musical context
@@ -554,16 +556,38 @@ function detectCrossingRuns(ctx: FigureContext): MusicalFigure[] {
   return figures;
 }
 
+/** planFingering speaks 'seventh'; NoteEvent's vocabulary tops out at 'higher'. */
+function toPositionGroup(position: PositionName): NoteEvent['positionGroup'] {
+  return position === 'seventh' ? 'higher' : position;
+}
+
+/**
+ * Shifts, from a fingering plan rather than from comparing adjacent notes.
+ *
+ * Comparing each note's position band to the previous one's asks "were these
+ * two notes in different positions?", which is not the same question as "did
+ * the hand move?" and answers it wrongly in both directions:
+ *
+ *   • It invents shifts. Two notes either side of a band boundary look like a
+ *     shift even when one hand position covers both.
+ *   • It misses real ones, because a per-note band is assigned independently
+ *     and has no idea where the hand actually was.
+ *
+ * planFingering assigns a fingering across the whole passage — staying put when
+ * it can, crossing strings rather than shifting where that is the natural
+ * choice — and marks the notes where the hand genuinely has to move. Those
+ * marks are the shifts. It is the same model the shifting-ladder exercise uses,
+ * so what the app detects and what it then asks you to practise agree.
+ */
 function detectShifts(ctx: FigureContext): MusicalFigure[] {
   const { notes, midis } = ctx;
+  if (midis.length < 2) return [];
+
+  const plan = planFingering(midis);
   const figures: MusicalFigure[] = [];
-  for (let i = 1; i < notes.length; i++) {
-    const from = notes[i - 1];
-    const to = notes[i];
-    // A position change on the *same* string is a shift. Across strings it is
-    // a crossing wearing a shift's clothes, and belongs to the other detector.
-    if (from.string !== to.string) continue;
-    if (from.positionGroup === to.positionGroup) continue;
+
+  plan.notes.forEach((planned, i) => {
+    if (!planned.isShift || i === 0) return;
     // Include the neighbours so the drill has the approach and the landing,
     // which is what actually goes wrong in a shift.
     const startIndex = Math.max(0, i - 1);
@@ -572,15 +596,16 @@ function detectShifts(ctx: FigureContext): MusicalFigure[] {
     figures.push(
       buildFigure(ctx, 'shift', indices, {
         shift: {
-          string: to.string,
-          fromPosition: from.positionGroup,
-          toPosition: to.positionGroup,
+          string: planned.string,
+          fromPosition: toPositionGroup(planned.fromPosition ?? 'first'),
+          toPosition: toPositionGroup(planned.position),
           semitones: midis[i] - midis[i - 1],
-          finger: to.inferredFinger,
+          finger: planned.finger,
         },
       }),
     );
-  }
+  });
+
   return figures;
 }
 

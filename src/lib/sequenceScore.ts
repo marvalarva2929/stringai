@@ -7,14 +7,21 @@
 // is not how playing works and it is not how anyone judges it.
 //
 // So a take gets a score out of 100 from three things a teacher would actually
-// weigh, and passes by clearing a bar rather than by being flawless:
+// weigh. The score is a gradient, not the gate:
 //
 //   intonation   how close each note was, on a curve — not a gate
 //   timing       whether it sat with the click
 //   completeness whether the notes asked for were the notes played
 //
-// The score is also the thing worth tracking: "82 → 91 on this drill over two
-// weeks" is progress a player can see, where "failed, failed, passed" is not.
+// The score is the thing worth tracking: "82 → 91 on this drill over two weeks"
+// is progress a player can see, where "failed, failed, passed" is not.
+//
+// PASSING is separate and absolute: every note inside the cents tolerance. A
+// score bar was tried and was the wrong gate for a tuning drill — one note in
+// fifteen barely moves an average, so takes with audibly out-of-tune notes kept
+// passing. What makes an absolute gate fair is that misses are named
+// individually, so they can be drilled one at a time. Never present the score as
+// the thing being cleared: a take can beat the old bar and still not pass.
 // ─────────────────────────────────────────────────────────────
 
 export interface ScoredNote {
@@ -38,12 +45,21 @@ export interface SequenceScore {
   completeness: number;
   notes: ScoredNote[];
   cleanCount: number;
+  /** How many notes the drill asked for — the denominator for cleanCount. */
+  expectedCount: number;
   /** Notes that were a different note entirely, not merely out of tune. */
   wrongNoteCount: number;
   /** Notes the detector never heard. */
   missingCount: number;
   passed: boolean;
-  /** The bar this take had to clear. */
+  /**
+   * Score bar this take would have had to clear under the old rule.
+   *
+   * Retained for stored history and trend copy only. It no longer decides
+   * anything: passing means every note landed inside the cents tolerance (see
+   * `passed`). Do not surface it as "N to pass" — a take can score 80 against a
+   * bar of 65 and still, correctly, not pass.
+   */
   passMark: number;
   /**
    * True when the take is disqualified regardless of score: wrong notes,
@@ -193,9 +209,21 @@ export function scoreSequence(
     completeness: Math.round(completeness),
     notes,
     cleanCount: notes.filter((n) => n.clean).length,
+    expectedCount,
     wrongNoteCount,
     missingCount,
-    passed: Math.round(score) >= opts.passMark && disqualifiedReason == null,
+    // Every note has to be inside the cents tolerance. A score-based bar let a
+    // take pass with two or three notes audibly out, because one bad note in
+    // fifteen barely moves an average — which is how a tuning drill ends up
+    // certifying playing that is still out of tune. The score is kept as the
+    // gradient (it says how close the take was); the pass is absolute.
+    //
+    // This is only reasonable because a miss is cheap to fix: the notes that
+    // failed are reported individually so they can be drilled one at a time,
+    // rather than sending the player back to repeat the whole scale.
+    passed: notes.length > 0
+      && notes.filter((n) => n.clean).length === expectedCount
+      && disqualifiedReason == null,
     passMark: opts.passMark,
     disqualified: disqualifiedReason != null,
     disqualifiedReason,

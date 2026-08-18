@@ -29,7 +29,7 @@ import { fetchAppInstanceId, setAnalyticsUser, track } from '../src/services/ana
 import { AnalyticsEvent } from '../src/constants/analyticsEvents';
 import { daysAwayBucket } from '../src/lib/analyticsUserProps';
 import { daysBetween } from '../src/lib/analyticsTiming';
-import { initCrashReporting, setCrashUser, qaCheckpoint } from '../src/services/crashReporting';
+import { initCrashReporting, setCrashUser } from '../src/services/crashReporting';
 import { useAnalyticsIdentity } from '../src/hooks/useAnalyticsIdentity';
 import { useScreenTracking } from '../src/hooks/useScreenTracking';
 import { UserProfile } from '../src/types/user';
@@ -162,7 +162,6 @@ export default function RootLayout() {
     // Chains Crashlytics onto unhandled promise rejections, which the SDK's own
     // global handler does not cover.
     initCrashReporting();
-    qaCheckpoint('app_launch'); // TEMPORARY — QA walkthrough checkpoint
     trackReturnGap();
 
     // Tracking only — the reminder has no deep link, so opening it just brings

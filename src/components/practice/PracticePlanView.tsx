@@ -20,7 +20,6 @@ import { SpotlightOverlay } from '../activation/SpotlightOverlay';
 import { PRACTICE_COACHMARKS } from '../../constants/activationScript';
 import { AnalyticsEvent } from '../../constants/analyticsEvents';
 import { track } from '../../services/analytics';
-import { qaCheckpoint } from '../../services/crashReporting';
 import { colors, spacing, radius } from '../../constants/theme';
 
 /**
@@ -102,7 +101,6 @@ export function PracticePlanView({
         block_type: target.type,
         index: plan.blocks.findIndex((b) => b.id === target.id),
       });
-      qaCheckpoint('practice_block_start'); // TEMPORARY — QA walkthrough checkpoint
       openBlock(target.id);
     }
   };

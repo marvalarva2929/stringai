@@ -17,7 +17,6 @@ import { useAuthStore } from '../../src/store/useAuthStore';
 import { useUserStore } from '../../src/store/useUserStore';
 import { useAnalysisStore } from '../../src/store/useAnalysisStore';
 import { TunerModal } from '../../src/components/tuner/TunerModal';
-import { ScoreGauge } from '../../src/components/ui/ScoreGauge';
 import { WeeklyGoalCard } from '../../src/components/home/WeeklyGoalCard';
 import { minutesPracticedThisWeek } from '../../src/lib/weeklyGoal';
 import { computeStreak } from '../../src/lib/streak';
@@ -29,9 +28,7 @@ import { useCoachmarks } from '../../src/components/activation/useCoachmarks';
 import { SpotlightOverlay } from '../../src/components/activation/SpotlightOverlay';
 import { HOME_COACHMARKS } from '../../src/constants/activationScript';
 import { haptic } from '../../src/lib/haptics';
-import { qaCheckpoint } from '../../src/services/crashReporting';
 import { colors, spacing, radius } from '../../src/constants/theme';
-import { severityFromScore } from '../../src/types/analysis';
 
 const PLAN_DEPTH = 6;
 const SCREEN_H = Dimensions.get('window').height;
@@ -59,30 +56,11 @@ export default function HomeScreen() {
   const dailyPlan = useDailyPracticePlan();
   const currentPiece = profile?.currentPiece;
 
-  useEffect(() => {
-    qaCheckpoint('home_view'); // TEMPORARY — QA walkthrough checkpoint
-  }, []);
-
   const goalMinutes = profile?.weeklyGoalMinutes ?? weeklyGoalMinutes;
   const minutesThisWeek = useMemo(
     () => minutesPracticedThisWeek(sessionHistory),
     [sessionHistory],
   );
-
-  // One card per piece — the most recent session of each.
-  const recentSessions = useMemo(() => {
-    const latestByPiece = new Map<string | null, typeof sessionHistory[number]>();
-    for (const session of sessionHistory) {
-      const key = session.piece?.id ?? null;
-      const existing = latestByPiece.get(key);
-      if (!existing || session.recordedAt.localeCompare(existing.recordedAt) > 0) {
-        latestByPiece.set(key, session);
-      }
-    }
-    return [...latestByPiece.values()]
-      .sort((a, b) => b.recordedAt.localeCompare(a.recordedAt))
-      .slice(0, 10);
-  }, [sessionHistory]);
 
   // Always present — a brand-new user sees zeroes rather than an empty row.
   const stats = useMemo(() => {
@@ -113,8 +91,10 @@ export default function HomeScreen() {
   const statsSpotlight = useSpotlightTarget('home.stats');
   const recordSpotlight = useSpotlightTarget('home.record');
   const coach = useCoachmarks(HOME_COACHMARKS, activationStep === 'home', () => {
-    // The last step is the record button, so take them there rather than
-    // leaving them to find it again on their own.
+    // The last step is the Practice button, so take them there rather than
+    // leaving them to find it again on their own. Deliberately straight to the
+    // capture screen and not through /practice/pick: a first-run user has no
+    // pieces yet, so the picker would be an empty list with one button on it.
     useActivationStore.getState().advanceTo('capture');
     router.push('/(tabs)/analyze');
   });
@@ -249,20 +229,20 @@ export default function HomeScreen() {
           </Animated.View>
         </Pressable>
 
-        {/* ── Record session button ────────────────────── */}
+        {/* ── Practice button ──────────────────────────── */}
+        {/* One label, whether or not there is history: choosing what to play is
+            the picker's job, not this button's. */}
         <Pressable
           onPressIn={() => { recordOffset.value = PLAN_DEPTH; haptic.medium(); }}
           onPressOut={() => { recordOffset.value = 0; }}
-          onPress={() => router.push('/(tabs)/analyze')}
+          onPress={() => router.push('/practice/pick')}
           style={s.recordButtonOuter}
           {...recordSpotlight}
         >
           <View style={s.recordButtonBase} />
           <Animated.View style={[s.recordButtonSurface, recordSurfaceStyle]}>
             <FontAwesome6 name="microphone" size={16} color="#fff" />
-            <Text style={s.recordButtonText}>
-              {sessionHistory.length === 0 ? 'Record First Session' : 'Record New Session'}
-            </Text>
+            <Text style={s.recordButtonText}>Practice</Text>
           </Animated.View>
         </Pressable>
 
@@ -273,40 +253,6 @@ export default function HomeScreen() {
           onPress={() => router.push('/goal')}
         />
 
-        {/* ── Continue recent sessions ─────────────────── */}
-        {recentSessions.length === 0 ? (
-          <Text style={s.emptyRecent}>Your recent pieces will appear here</Text>
-        ) : (
-          <>
-            <Text style={s.orLabel}>Continue recent sessions</Text>
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={s.sessionRow}
-            >
-              {recentSessions.map((session) => (
-                <Pressable
-                  key={session.id}
-                  style={({ pressed }) => [s.sessionCard, pressed && s.sessionCardPressed]}
-                  onPress={() => { haptic.light(); router.push(`/session/${session.id}`); }}
-                >
-                  <ScoreGauge
-                    score={Math.round(session.overallScore)}
-                    severity={severityFromScore(session.overallScore)}
-                    size="sm"
-                    showLabel={false}
-                  />
-                  <Text style={s.sessionDate}>
-                    {new Date(session.recordedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
-                  </Text>
-                  <Text style={s.sessionSub} numberOfLines={1}>
-                    {session.piece?.title ?? 'General Practice'}
-                  </Text>
-                </Pressable>
-              ))}
-            </ScrollView>
-          </>
-        )}
       </ScrollView>
 
       <SpotlightOverlay
@@ -552,50 +498,7 @@ const s = StyleSheet.create({
   recordButtonText: { fontSize: 15, fontWeight: '800', color: '#fff' },
 
   // Or label
-  orLabel: {
-    fontSize: 13,
-    color: colors.text.muted,
-    fontWeight: '500',
-    textAlign: 'center',
-    marginVertical: -spacing.sm,
-  },
 
   // Placeholder shown until the first session is recorded
-  emptyRecent: {
-    fontSize: 13,
-    color: colors.text.muted,
-    fontWeight: '500',
-    textAlign: 'center',
-  },
 
-  // Recent session cards (square, horizontally scrollable, popout style)
-  sessionRow: {
-    gap: spacing.sm,
-    paddingRight: spacing.lg,
-  },
-  sessionCard: {
-    width: 108,
-    height: 108,
-    backgroundColor: '#fff',
-    borderRadius: 16,
-    borderWidth: 1.5,
-    borderColor: '#e5e7eb',
-    borderBottomWidth: 4,
-    borderBottomColor: '#d1d5db',
-    padding: spacing.sm,
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  sessionCardPressed: { backgroundColor: '#f9fafb' },
-  sessionDate: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: colors.text.muted,
-  },
-  sessionSub: {
-    fontSize: 11,
-    fontWeight: '600',
-    color: colors.text.secondary,
-    textAlign: 'center',
-  },
 });

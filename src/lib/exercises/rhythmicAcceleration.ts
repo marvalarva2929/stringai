@@ -1,4 +1,5 @@
 import type { PracticeBlock } from '../practiceBlocks';
+import { clampSequenceBpm } from '../sequenceSteps';
 import { buildSequenceBlock, type ExerciseContext } from './types';
 import { stepsFromMidi } from './types';
 import { OPEN_MIDI, stringForMidi, type ViolinString } from './fingerboard';
@@ -24,8 +25,9 @@ import { resolveKey, scaleNotes } from './theory';
 /** Base pulse the subdivisions sit inside. Deliberately slow. */
 const BASE_PULSE_BPM = 52;
 
-/** Don't ask for a click faster than the metronome and the ear can resolve. */
-const MAX_CLICK_BPM = 190;
+// The ceiling is the runner's, not a number of our own: the take's click is
+// clamped by clampSequenceBpm, so any faster figure quoted in the instructions
+// below would describe a drill the player never actually hears.
 
 function rungFor(intensity: ExerciseContext['intensity']): number {
   if (intensity === 'guided') return 2;
@@ -46,7 +48,10 @@ export function generateRhythmicAcceleration(ctx: ExerciseContext): PracticeBloc
   if (source.length < 4) return null;
 
   const notesPerBeat = rungFor(ctx.intensity);
-  const clickBpm = Math.min(MAX_CLICK_BPM, BASE_PULSE_BPM * notesPerBeat);
+  const clickBpm = clampSequenceBpm(BASE_PULSE_BPM * notesPerBeat);
+  // The pulse the player will actually feel, after the clamp — quoting the
+  // nominal BASE_PULSE_BPM here would not match the click they hear.
+  const pulseBpm = Math.round(clickBpm / notesPerBeat);
 
   const preferString = (target.string ?? target.strings?.[0]) as ViolinString | undefined;
   const steps = stepsFromMidi(source, {
@@ -65,20 +70,19 @@ export function generateRhythmicAcceleration(ctx: ExerciseContext): PracticeBloc
     slug: 'acceleration',
     type: 'acceleration',
     title: `${notesPerBeat} notes per beat`,
-    subtitle: `Pulse stays at ${BASE_PULSE_BPM}`,
+    subtitle: `Pulse stays at ${pulseBpm}`,
     reason: ctx.evidence.reason,
-    bridge: `The notes are the same ones that fell apart at speed.${played} What changes here is that the pulse stays put at ${BASE_PULSE_BPM} and you fit ${notesPerBeat} notes inside each beat. You are not playing faster — the beat is holding still while the notes get closer, which is the coordination the passage actually needs.`,
+    bridge: `The notes are the same ones that fell apart at speed.${played} What changes here is that the pulse stays put at ${pulseBpm} and you fit ${notesPerBeat} notes inside each beat. You are not playing faster — the beat is holding still while the notes get closer, which is the coordination the passage actually needs.`,
     steps,
     bpm: clickBpm,
     estimatedMinutes: 6,
     instructions: [
-      `Set the pulse in your head at ${BASE_PULSE_BPM} — slow, like a walking step. Every ${notesPerBeat} notes is one of those steps.`,
-      `On the take the click marks each note (${clickBpm} BPM), and every ${notesPerBeat}th one is a beat. Count the beats, not the notes.`,
-      'If it starts to rush, the pulse has gone — stop, find the walking step again, and restart. Rushing is the failure this drill exists to catch.',
+      `${notesPerBeat} notes per beat, pulse at ${pulseBpm}.`,
+      'The click marks every note. Count the beats, not the notes.',
     ],
     successSummary: `Play all ${steps.length} notes at ${notesPerBeat} per beat without the pulse slipping, keeping all but a note or two in tune.`,
     fallbackCriteria: `If note detection is uncertain, play the figure left-hand pizzicato at ${notesPerBeat} notes per beat — the coordination is still trainable without the bow.`,
-    coachPromptContext: `Coach a Galamian-style rhythmic acceleration at ${notesPerBeat} notes per beat over a ${BASE_PULSE_BPM} pulse. Focus on evenness and holding the pulse, not on speed. Evidence: ${ctx.evidence.evidenceSummary}`,
+    coachPromptContext: `Coach a Galamian-style rhythmic acceleration at ${notesPerBeat} notes per beat over a ${pulseBpm} pulse. Focus on evenness and holding the pulse, not on speed. Evidence: ${ctx.evidence.evidenceSummary}`,
     target: {
       metricKey: 'rhythmAccuracy',
       string: preferString ?? stringForMidi(anchor),

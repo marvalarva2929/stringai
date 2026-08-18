@@ -1,11 +1,11 @@
 {
   "app_name": "String AI",
-  "_note": "Every slide must carry advice that is useful on its own. The app is named exactly twice per deck: once in slot 2 (inside a tip, as one tool among others) and once in slot 6. Slots 3-5 never mention it. Do not add mentions.",
+  "_note": "Every slide must carry advice that is useful on its own. The app is named exactly twice per deck: once in slot 2 (inside a tip, as one tool among others) and once in slot 6. Slots 3-5 never mention it. Do not add mentions. No em dashes anywhere. Voice is a real person texting a friend, not a listicle: avoid the 'claim. here's why' template, let sentences run on a little, keep the enthusiasm and imperfect grammar.",
   "slots": {
     "1": {
       "role": "hook",
       "style": "hero",
-      "asset": "violin, case, bedroom, music stand — atmospheric, no app UI",
+      "asset": "violin, case, bedroom, music stand, atmospheric, no app UI",
       "variants": {
         "A": [
           "things that fixed my intonation faster than anything else 🎻",
@@ -40,7 +40,7 @@
     "2": {
       "role": "tip + the one casual app mention",
       "style": "caption",
-      "asset": "sheet music, notebook, open case, tuner on a stand — no app UI",
+      "asset": "sheet music, notebook, open case, tuner on a stand, no app UI",
       "variants": {
         "A": [
           "intonation is SO important you guys, and it's really easy to not notice",
@@ -48,15 +48,15 @@
         ],
         "B": [
           "your open strings are a free tuner and nobody uses them 🥹",
-          "3rd finger in first position is an octave above the string below — check it every time. i also run {app} while i practice so it flags the ones i miss"
+          "3rd finger in first position is an octave above the string below, check it every single time!! i also run {app} while i practice so it flags whatever i miss"
         ],
         "C": [
           "turn the vibrato OFF when you're checking intonation",
-          "vibrato hides a flat note from you AND from a tuner. i practice the passage plain first, then check it with {app} before adding it back"
+          "vibrato hides a flat note from you AND from a tuner lol. i practice the passage plain first then check it with {app} before adding it back in"
         ],
         "D": [
           "record yourself. you will be humbled 😭",
-          "your ears genuinely lie to you while you're playing. voice memos work fine — i use {app} because it marks the bits that went wrong so i don't have to relisten"
+          "your ears genuinely lie to you while you're playing!! voice memos work fine honestly, i use {app} because it marks the bits that went wrong so i don't have to sit there relistening to everything"
         ],
         "E": [
           "play QUIETER when something isn't in tune",
@@ -68,104 +68,104 @@
         ],
         "G": [
           "private teachers are SO expensive and i need you to know that's okay!!",
-          "you can get really far on your own i promise 🥹 free stuff first — a tuner, a drone track, and recording yourself. i also use this app called {app} because it tells me exactly which notes i got wrong"
+          "you can get really far on your own i promise 🥹 free stuff first: a tuner, a drone track, and recording yourself. i also use this app called {app} because it tells me exactly which notes i got wrong"
         ],
         "H": [
           "there were no violin teachers near me and i almost didn't start 😭",
-          "so glad i did anyway!! it's just youtube, a metronome and {app} for me — it listens while i play and catches the notes i can't hear are off. genuinely so doable on your own 💕"
+          "so glad i did anyway!! it's just youtube, a metronome and {app} for me, it listens while i play and catches the notes i can't hear are off. genuinely so doable on your own 💕"
         ]
       }
     },
     "3": {
-      "role": "ear and intonation — no app mention",
+      "role": "ear and intonation, no app mention",
       "style": "caption",
       "asset": "fingerboard, strings, tuner, hand in position",
       "variants": {
         "A": [
           "hear the note in your head BEFORE you put the finger down ✨",
-          "sounds fake but it works. if you don't know what you're aiming for you're just guessing and hoping"
+          "not even joking this one genuinely changed my playing more than anything else on this list. sing it in your head first, THEN go find it with your finger"
         ],
         "B": [
           "a perfect 5th rings when it's in tune 🎻",
-          "if you hear a little wobble in the sound, that's the two notes fighting each other. adjust until the wobble disappears"
+          "if you hear kind of a wobble in the sound that's literally just the two notes fighting each other, keep adjusting till it smooths out"
         ],
         "C": [
           "practise with a drone!! it's so humbling but so good",
-          "hold a note against it and let it settle. you'll start hearing the problem before the tuner does"
+          "just hold a note against it and let it settle, you'll start hearing the problem before the tuner even tells you"
         ],
         "D": [
           "take the finger tapes off 🥹",
-          "you're using your eyes for something your ears are supposed to do. it feels awful for two weeks and then your ear takes over"
+          "i know, i know. but you're using your eyes for something your ears should be doing. feels awful for like two weeks and then your ear just takes over i promise"
         ],
         "E": [
           "play slow enough that you can actually hear each note land",
-          "if it's too fast to hear, it's too fast to fix. speed is the last thing you add, not the first"
+          "if it's too fast for you to hear it's too fast to fix tbh. speed is always the last thing you add, never the first"
         ],
         "F": [
           "sing the phrase before you play it",
-          "you'll be shocked how much cleaner it comes out. your fingers follow your ear, not the other way round"
+          "you'll be shocked how much cleaner it comes out honestly. your fingers are just following your ear this whole time, not the other way around"
         ]
       }
     },
     "4": {
-      "role": "bow, vibrato, posture — no app mention",
+      "role": "bow, vibrato, posture, no app mention",
       "style": "caption",
       "asset": "bow hold, right arm mid-stroke, shoulder and chin frame",
       "variants": {
         "A": [
           "a straight bow isn't a straight arm 🤯",
-          "your hand actually travels in a slight curve — out towards the tip, back in towards the frog. that's what keeps the bow parallel to the bridge"
+          "your hand actually travels in a slight curve, out towards the tip and back in towards the frog. that's the whole secret to keeping the bow parallel to the bridge"
         ],
         "B": [
           "loudness comes from bow SPEED, not pressure",
-          "pressing harder just chokes the string. move faster and a little closer to the bridge instead"
+          "pressing harder just chokes the string honestly, try moving faster and a little closer to the bridge instead"
         ],
         "C": [
           "your contact point changes the whole sound 🎻",
-          "near the bridge = loud and bright, near the fingerboard = soft and airy. pick one on purpose instead of drifting"
+          "near the bridge is loud and bright, near the fingerboard is soft and airy. just pick one on purpose instead of drifting around"
         ],
         "D": [
           "if your thumb is squeezing, your vibrato is dead ✨",
-          "it's the number one thing killing it. you should be able to wiggle your thumb loose mid-note — if you can't, you're gripping"
+          "it's the number one thing killing it honestly. you should be able to wiggle your thumb loose mid note, if you can't you're gripping too hard"
         ],
         "E": [
           "slow wide vibrato first, speed comes later 🥹",
-          "metronome at 60, two swings per beat. it narrows on its own as it speeds up, so don't chase fast"
+          "metronome at 60, two swings per beat. it narrows on its own as it speeds up so don't go chasing fast right away"
         ],
         "F": [
           "long tones on one open string. that's the whole warmup.",
-          "whole bow, as slow as you can hold it steady. deeply boring, fixes more than any étude"
+          "whole bow, as slow as you can possibly hold it steady. so boring honestly but it fixes more than any étude ever will"
         ]
       }
     },
     "5": {
-      "role": "practice structure — no app mention",
+      "role": "practice structure, no app mention",
       "style": "caption",
       "asset": "music stand, practice space, notebook, metronome",
       "variants": {
         "A": [
           "20 focused minutes beats 2 aimless hours ✨",
-          "decide the one thing you're fixing before you open the case. wandering practice just rehearses your mistakes"
+          "when you practice focus on one spot at a time! wandering around without a plan just means you're rehearsing your mistakes over and over"
         ],
         "B": [
           "practise the hard bar, not the whole piece 🥹",
-          "four bars, fifty times, slowly. that's a real session — running it top to bottom is just performing at yourself"
+          "four bars, fifty times, slowly, that's a real session. running it top to bottom over and over is honestly just performing at yourself lol"
         ],
         "C": [
           "slow, then medium, then fast. don't skip the middle one.",
-          "if it falls apart at tempo you skipped a step. going back down feels like losing and it really isn't"
+          "if it falls apart at tempo you skipped a step somewhere. going back down feels like losing but it genuinely isn't"
         ],
         "D": [
           "a little every day beats one long weekend session 🎻",
-          "your hands learn overnight, genuinely. fifteen minutes daily will outrun two hours on a sunday"
+          "your hands genuinely learn stuff overnight while you sleep. fifteen minutes daily will straight up outrun two hours on a sunday"
         ],
         "E": [
           "don't jump difficulty levels!! 😭",
-          "picking something way too hard feels ambitious and mostly teaches you tension. the piece one step up is the one that makes you better"
+          "picking something way too hard feels ambitious but honestly it mostly just teaches you tension. the piece that's one step up is the one that actually makes you better"
         ],
         "F": [
           "stop the second you feel your hand tense up",
-          "tension is the fastest way to build a habit you'll spend a year undoing. shake it out, breathe, start again"
+          "tension is honestly the fastest way to build a habit you'll spend a whole year undoing. just shake it out, breathe, and start again"
         ]
       }
     },
@@ -176,7 +176,7 @@
       "variants": {
         "A": [
           "that's everything i've got 🥹 go practice",
-          "(the app i keep mentioning is {app} if you want it — link in bio)"
+          "(the app i keep mentioning is {app} if you want it, link is in my bio)"
         ],
         "B": [
           "hope one of these helps someone 💕",
@@ -188,7 +188,7 @@
         ],
         "D": [
           "genuinely just start. badly. today. ✨",
-          "({app} in bio — free to try for a week)"
+          "({app} is in my bio, free to try for a week)"
         ],
         "E": [
           "save this for your next practice session 🎻",
@@ -196,11 +196,11 @@
         ],
         "F": [
           "okay go be amazing 💕",
-          "{app} — link in bio, it's the thing i use for all of this"
+          "{app} is in my bio, it's the thing i use for all of this honestly"
         ],
         "G": [
           "you do NOT need an expensive teacher to start 🥹💕",
-          "{app} is in my bio — it's what i use to learn on my own"
+          "{app} is in my bio, it's what i use to learn on my own"
         ]
       }
     }

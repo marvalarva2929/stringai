@@ -1,0 +1,56 @@
+# EAS build archive exclusions.
+#
+# IMPORTANT: .easignore completely REPLACES .gitignore for EAS's archive step
+# — it does not add to it. Every pattern below that also exists in .gitignore
+# is copied here on purpose; if it's only in .gitignore, EAS won't see it.
+
+# --- from .gitignore, still needed here ---
+node_modules/
+.expo/
+dist/
+web-build/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+.env
+.DS_Store
+expo-env.d.ts
+test/fixtures/tone/*
+!test/fixtures/tone/README.md
+test/fixtures/intonation/*
+!test/fixtures/intonation/README.md
+*.xcappdata/
+graphify-out/
+
+# --- EAS-specific additions below ---
+
+# CocoaPods and Xcode build output — reinstalled/regenerated server-side.
+ios/Pods/
+ios/build/
+
+# git history — never needed for a build archive.
+.git/
+
+# ML training pipeline (RunPod) — a separate system from the mobile app,
+# several GB, never touched by `eas build`. Covers everything the old
+# .gitignore's granular ml/cloud/* and ml/data/* rules did, and more.
+ml/
+
+# Marketing content and the marketing site's source — not part of the app.
+marketing/
+site/
+
+# App Store submission collateral — uploaded to App Store Connect directly,
+# never bundled into the app itself.
+store-assets/
+
+# Reference docs.
+docs/
+
+# Local working copies of Apple/Firebase keys. The copies the build actually
+# needs (ios/GoogleService-Info.plist, the entitlements file) live directly
+# under ios/ and are not excluded by this.
+keys/

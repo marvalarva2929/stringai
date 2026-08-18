@@ -23,4 +23,4 @@ export const CALIBRATION_ENABLED = true;
  * (live recording, chat coaching, curated exercises, quota) is unlocked.
  */
 export const FORCE_ONBOARDING = __DEV__ && true;
-export const DEBUG_FORCE_PRO = __DEV__ && true;
+export const DEBUG_FORCE_PRO = __DEV__ && false;

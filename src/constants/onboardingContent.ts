@@ -12,6 +12,8 @@ export interface OptionDef {
   id: string;
   icon: IconSpec;
   title: string;
+  /** One short line under the title. Use sparingly — most options don't need it. */
+  hint?: string;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -58,13 +60,31 @@ export const DAILY_TIME_OPTIONS: DailyTimeOption[] = [
 export interface ExperienceOption extends OptionDef {
   skillLevel: SkillLevel;
   playerCategory: PlayerCategory;
+  /**
+   * Whether drills may leave first position.
+   *
+   * Folded into this question rather than asked separately: an intermediate
+   * player can be assumed to shift, and a beginner can be told plainly which
+   * option to pick if they can't. It feeds useTechniqueSkillStore, which is
+   * what stops the app generating a drill the player cannot finger.
+   */
+  canShift: boolean;
 }
 
 export const EXPERIENCE_LEVELS: ExperienceOption[] = [
-  { id: 'complete_beginner', icon: { lib: 'mci', name: 'sprout-outline' }, title: 'Complete Beginner', skillLevel: 'beginner', playerCategory: 'foundation' },
-  { id: 'beginner', icon: { lib: 'ion', name: 'book-outline' }, title: 'Beginner', skillLevel: 'beginner', playerCategory: 'foundation' },
-  { id: 'intermediate', icon: { lib: 'ion', name: 'locate-outline' }, title: 'Intermediate', skillLevel: 'intermediate', playerCategory: 'refinement' },
-  { id: 'advanced', icon: { lib: 'ion', name: 'ribbon-outline' }, title: 'Advanced', skillLevel: 'advanced', playerCategory: 'refinement' },
+  { id: 'never_played', icon: { lib: 'mci', name: 'egg-outline' }, title: 'Never played', skillLevel: 'beginner', playerCategory: 'foundation', canShift: false },
+  { id: 'complete_beginner', icon: { lib: 'mci', name: 'sprout-outline' }, title: 'Complete Beginner', skillLevel: 'beginner', playerCategory: 'foundation', canShift: false },
+  {
+    id: 'beginner',
+    icon: { lib: 'ion', name: 'book-outline' },
+    title: 'Beginner',
+    hint: "Pick this if you can't play in 3rd position",
+    skillLevel: 'beginner',
+    playerCategory: 'foundation',
+    canShift: false,
+  },
+  { id: 'intermediate', icon: { lib: 'ion', name: 'locate-outline' }, title: 'Intermediate', skillLevel: 'intermediate', playerCategory: 'refinement', canShift: true },
+  { id: 'advanced', icon: { lib: 'ion', name: 'ribbon-outline' }, title: 'Advanced', skillLevel: 'advanced', playerCategory: 'refinement', canShift: true },
 ];
 
 // ─────────────────────────────────────────────────────────────
@@ -140,6 +160,7 @@ export const STEP_COPY = {
   experience: {
     title: "What's your current violin experience?",
     subtitle: 'This helps us pitch feedback at the right level.',
+    footnote: "We'll use this to give you exercises that match your skill level.",
   },
   violinSize: {
     title: 'What size is your violin?',

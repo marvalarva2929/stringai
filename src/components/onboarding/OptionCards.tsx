@@ -74,6 +74,16 @@ function GridTile({
         <Text style={[styles.title, { color: contentColor }]} numberOfLines={2}>
           {option.title}
         </Text>
+        {/* Only where an option genuinely needs disambiguating — a hint on every
+            tile turns the grid back into a wall of text. */}
+        {option.hint && (
+          <Text
+            style={[styles.hint, { color: isSelected ? 'rgba(255,255,255,0.85)' : colors.text.muted }]}
+            numberOfLines={2}
+          >
+            {option.hint}
+          </Text>
+        )}
         {isSelected && (
           <View style={[styles.checkShape, multi ? styles.checkboxShape : styles.radioShape]}>
             <Text style={styles.checkmark}>✓</Text>
@@ -101,6 +111,7 @@ const styles = StyleSheet.create({
     borderRadius: radius.lg,
     padding: spacing.sm,
   },
+  hint: { fontSize: 10, lineHeight: 13, textAlign: 'center', marginTop: 2, paddingHorizontal: 2 },
   title: {
     fontSize: 14,
     fontWeight: '700',

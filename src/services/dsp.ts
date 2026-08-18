@@ -17,9 +17,18 @@ export function clamp(v: number, lo = 0, hi = 100): number {
 export interface PitchFrame {
   frequency: number | null;
   timestamp: number;
-  /** 1 − (minimum cumulative-mean-normalized difference). High = clean periodic
-   *  tone, low = aperiodic/noisy (scratch). Present for every frame, voiced or not. */
+  /** Clarity at the winning lag: 1 − cmndf[bestTau]. High = clean periodic tone,
+   *  low = aperiodic/noisy (scratch). Present for every frame, voiced or not, so
+   *  a rejected frame still carries why it was rejected. Same quantity as
+   *  `clarity` in modules/mic-pitch/ios/YinDetector.swift:127. */
   periodicity?: number;
+  /** True when the pitch came from a real dip below YIN's absolute threshold,
+   *  false when it came from the global-minimum fallback (see yinWindow).
+   *  A fallback pitch is good enough to grade a note against — that is the whole
+   *  point of having one — but it is NOT evidence that the frame is periodic, so
+   *  anything measuring tone quality rather than pitch should require `locked`.
+   *  Undefined on unvoiced frames. */
+  locked?: boolean;
 }
 
 /**
@@ -33,7 +42,7 @@ export function yinWindow(
   offset: number,
   windowSize: number,
   sampleRate: number,
-): { frequency: number | null; periodicity: number } {
+): { frequency: number | null; periodicity: number; locked: boolean } {
   const half = windowSize >> 1;
   const diff = new Float32Array(half);
 
@@ -51,15 +60,10 @@ export function yinWindow(
   const cmndf = new Float32Array(half);
   cmndf[0] = 1;
   let runSum = 0;
-  let cmndfMin = 1; // track global minimum for periodicity confidence
   for (let tau = 1; tau < half; tau++) {
     runSum += diff[tau];
     cmndf[tau] = runSum > 0 ? (diff[tau] * tau) / runSum : 1;
-    if (tau >= 2 && cmndf[tau] < cmndfMin) cmndfMin = cmndf[tau];
   }
-
-  // Periodicity: 1 → perfectly periodic, 0 → noise. cmndfMin near 0 = strong pitch.
-  const periodicity = clamp(1 - cmndfMin, 0, 1);
 
   // Search only where a violin can actually sound. Open G is 196Hz, so the
   // floor leaves room for a badly flat G while refusing lags that could only be
@@ -67,7 +71,10 @@ export function yinWindow(
   // from tau=2 (22kHz) let a spurious short lag win the "first dip" race.
   const tauMin = Math.max(2, Math.floor(sampleRate / MAX_VIOLIN_HZ));
   const tauMax = Math.min(half - 2, Math.ceil(sampleRate / MIN_VIOLIN_HZ));
+  if (tauMax <= tauMin + 2) return { frequency: null, periodicity: 0, locked: false };
 
+  // Take the *first* dip below the absolute threshold, not the global minimum —
+  // on a harmonic-rich bowed string the global min is frequently an octave low.
   const threshold = 0.15;
   let bestTau = -1;
   for (let tau = tauMin; tau <= tauMax; tau++) {
@@ -77,27 +84,72 @@ export function yinWindow(
       break;
     }
   }
-  if (bestTau < 0) return { frequency: null, periodicity };
+  const locked = bestTau >= 0;
 
-  const prev = cmndf[bestTau - 1];
-  const curr = cmndf[bestTau];
-  const next = cmndf[bestTau + 1];
-  const denom = 2 * (2 * curr - prev - next);
-  const refined = denom !== 0 ? bestTau + (prev - next) / denom : bestTau;
+  // No dip below the threshold does not mean "no note" — it means this window is
+  // less cleanly periodic than YIN's ideal. Fall back to the global minimum over
+  // the violin's lag range and let the clarity gate decide, exactly as the native
+  // detector does (modules/mic-pitch/ios/YinDetector.swift:117-123). Bailing out
+  // with null here is what made this detector blind to everything the tuner
+  // voiced between 0.55 and 0.85 clarity — i.e. most real playing.
+  if (bestTau < 0) {
+    let minVal = Infinity;
+    for (let t = tauMin; t <= tauMax; t++) {
+      if (cmndf[t] < minVal) {
+        minVal = cmndf[t];
+        bestTau = t;
+      }
+    }
+  }
+  if (bestTau <= 0) return { frequency: null, periodicity: 0, locked: false };
+
+  // Clarity at the winning lag — the same quantity the native detector gates on.
+  const periodicity = clamp(1 - cmndf[bestTau], 0, 1);
+
+  // Parabolic interpolation for sub-sample tau. At 44.1kHz an open E sits at
+  // tau≈67, where one whole sample of error is ~26 cents.
+  let refined = bestTau;
+  if (bestTau > tauMin && bestTau < tauMax) {
+    const prev = cmndf[bestTau - 1];
+    const curr = cmndf[bestTau];
+    const next = cmndf[bestTau + 1];
+    const denom = 2 * (2 * curr - prev - next);
+    if (Math.abs(denom) > 1e-9) {
+      const shift = (prev - next) / denom;
+      if (Math.abs(shift) <= 1) refined = bestTau + shift;
+    }
+  }
+
   const freq = sampleRate / refined;
-  if (freq < MIN_VIOLIN_HZ || freq > MAX_VIOLIN_HZ) return { frequency: null, periodicity };
-  return { frequency: freq, periodicity };
+  if (freq < MIN_VIOLIN_HZ || freq > MAX_VIOLIN_HZ) return { frequency: null, periodicity, locked };
+  // Clarity, not amplitude, is what separates a note from room tone: broadband
+  // noise scores far below this even when it is loud. Reporting the clarity on
+  // the way out keeps the scratch signal intact for unvoiced frames.
+  if (periodicity < CLARITY_GATE) return { frequency: null, periodicity, locked };
+  return { frequency: freq, periodicity, locked };
 }
 
 /** Below open G (196Hz) nothing on a violin can sound; the margin allows a flat G. */
 const MIN_VIOLIN_HZ = 180;
 /** Comfortably above the top of the E string in high positions. */
 const MAX_VIOLIN_HZ = 2100;
+/**
+ * Clarity floor for calling a window voiced. Must match `clarityGate` in
+ * modules/mic-pitch/ios/YinDetector.swift — when these two disagree, the
+ * on-screen tuner reports a note that the graded take says it never heard.
+ * test/detectorParity.test.ts asserts they stay equal.
+ */
+export const CLARITY_GATE = 0.55;
+
+/**
+ * Skips the cost of YIN on true silence — the clarity gate does the real
+ * rejecting. Must match `rmsGate` in YinDetector.swift for the same reason.
+ */
+export const RMS_NOISE_GATE = 0.003;
 
 export function detectPitches(samples: Float32Array, sampleRate: number): PitchFrame[] {
   const windowSize = 1024; // ~23ms at 44100 Hz — keeps O(N²) cost manageable
   const hopSize = Math.round(sampleRate * 0.025); // 25ms hop — finer time resolution for fast passages
-  const RMS_NOISE_GATE = 0.01; // skip YIN on windows below this energy (prevents noise-floor pitch detections)
   const frames: PitchFrame[] = [];
 
   for (let offset = 0; offset + windowSize < samples.length; offset += hopSize) {
@@ -105,8 +157,8 @@ export function detectPitches(samples: Float32Array, sampleRate: number): PitchF
     for (let i = 0; i < windowSize; i++) rmsSum += samples[offset + i] ** 2;
     const rms = Math.sqrt(rmsSum / windowSize);
     if (rms >= RMS_NOISE_GATE) {
-      const { frequency, periodicity } = yinWindow(samples, offset, windowSize, sampleRate);
-      frames.push({ frequency, periodicity, timestamp: offset / sampleRate });
+      const { frequency, periodicity, locked } = yinWindow(samples, offset, windowSize, sampleRate);
+      frames.push({ frequency, periodicity, locked, timestamp: offset / sampleRate });
     } else {
       frames.push({ frequency: null, periodicity: 0, timestamp: offset / sampleRate });
     }

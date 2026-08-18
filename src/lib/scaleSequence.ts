@@ -30,11 +30,28 @@ function parseScaleName(scaleName: string): { root: string; quality: ScaleQualit
  * octave the player was actually told to focus on, instead of always
  * defaulting to the open-string register.
  */
+/**
+ * Highest scale root that keeps a one-octave scale inside first position: from
+ * B4 the octave lands on B5, the 4th finger on the E string. Anything higher
+ * needs a shift.
+ */
+const SCALE_ROOT_CEILING_MIDI = 71; // B4
+/** Open G — nothing on the instrument sounds below it. */
+const SCALE_ROOT_FLOOR_MIDI = 55; // G3
+
 export function scaleNoteSequence(scaleName: string, anchorMidiNote?: number): string[] {
   const parsed = parseScaleName(scaleName);
   if (!parsed) return [];
   let rootMidi = PITCH_CLASS_MIDI[parsed.root];
   if (rootMidi == null) return [];
+  // PITCH_CLASS_MIDI exists to name the open strings for the tuner (G3/D4/A4/E5),
+  // and reusing it as a scale root put four keys an octave too high to play: a
+  // C, C#, E or F scale climbed to C6/E6/F6, around sixth position on the E
+  // string. Drills default to first position (see canShift in exercises/types.ts),
+  // so a root above B4 has to come down an octave. G/D/A/B are already low
+  // enough and keep their open-string register.
+  while (rootMidi > SCALE_ROOT_CEILING_MIDI) rootMidi -= 12;
+  while (rootMidi < SCALE_ROOT_FLOOR_MIDI) rootMidi += 12;
   if (anchorMidiNote != null) {
     const rootPitchClass = ((rootMidi % 12) + 12) % 12;
     const anchorPitchClass = ((anchorMidiNote % 12) + 12) % 12;

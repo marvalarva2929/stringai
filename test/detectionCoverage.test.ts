@@ -243,5 +243,99 @@ console.log('\ndetection flows into session evidence');
 }
 
 console.log('');
+// ─────────────────────────────────────────────────────────────────────────────
+// A mistuned instrument is not a technique fault — and it used to read as one.
+//
+// pitch_tendency ranks finger×string groups by mean signed deviation. With the
+// violin tuned flat, every group's mean is equally flat, so the test fired and
+// blamed whichever finger happened to be worst. Nothing about the player's
+// technique needed to change; they needed to tune.
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('\nmistuned instrument: the peg, not the finger');
+{
+  const notes: NoteEvent[] = [];
+  // Everything 25 cents flat, open strings included — the giveaway, since an
+  // open string cannot be fingered wrong.
+  for (let i = 0; i < 6; i++) notes.push(note({ t: i * 3, finger: 0, string: 'A', cents: -25 + coin() * 3 }));
+  for (let i = 0; i < 10; i++) notes.push(note({ t: 20 + i * 3, finger: 1, string: 'A', cents: -25 + coin() * 4 }));
+  for (let i = 0; i < 10; i++) notes.push(note({ t: 55 + i * 3, finger: 2, string: 'D', cents: -24 + coin() * 4 }));
+  for (let i = 0; i < 10; i++) notes.push(note({ t: 90 + i * 3, finger: 3, string: 'D', cents: -26 + coin() * 4 }));
+
+  const got = firedSet(makeSignals({}), notes);
+  check('instrument_out_of_tune fires', got.has('instrument_out_of_tune'), [...got].join(','));
+  check(
+    'and pitch_tendency does NOT blame a finger for it',
+    !got.has('pitch_tendency'),
+    [...got].join(','),
+  );
+  const f = runPatternDetection(makeSignals({}), notes).find((x) => x.testId === 'instrument_out_of_tune')!;
+  check('says flat, and says to tune', /flat/.test(f.summary) && /[Tt]une/.test(f.summary), f.summary);
+}
+
+console.log('\nmistuned AND one bad finger: report both, blame each correctly');
+{
+  const notes: NoteEvent[] = [];
+  // Interleaved in time so a genuine finger fault cannot masquerade as fatigue.
+  let t = 0;
+  for (let i = 0; i < 12; i++) {
+    // Instrument 20 flat everywhere, open strings included...
+    if (i % 2 === 0) notes.push(note({ t: t += 3, finger: 0, string: 'A', cents: -20 + coin() * 3 }));
+    notes.push(note({ t: t += 3, finger: 1, string: 'A', cents: -20 + coin() * 4 }));
+    notes.push(note({ t: t += 3, finger: 2, string: 'D', cents: -21 + coin() * 4 }));
+    // ...and finger 4 a further 30 flat on top of it.
+    notes.push(note({ t: t += 3, finger: 4, string: 'D', cents: -50 + coin() * 4 }));
+  }
+
+  const got = firedSet(makeSignals({}), notes);
+  check('instrument_out_of_tune still fires', got.has('instrument_out_of_tune'), [...got].join(','));
+  check('and the genuinely bad finger still surfaces', got.has('pitch_tendency'), [...got].join(','));
+  const f = runPatternDetection(makeSignals({}), notes).find((x) => x.testId === 'pitch_tendency')!;
+  check('naming finger 4, not one of the merely-flat ones', f.summary.includes('finger 4'), f.summary);
+}
+
+console.log('\nin-tune instrument stays quiet');
+{
+  const notes: NoteEvent[] = [];
+  for (let i = 0; i < 6; i++) notes.push(note({ t: i * 3, finger: 0, string: 'A', cents: coin() * 4 }));
+  for (let i = 0; i < 12; i++) notes.push(note({ t: 20 + i * 3, finger: 1, string: 'A', cents: coin() * 6 }));
+  for (let i = 0; i < 12; i++) notes.push(note({ t: 60 + i * 3, finger: 2, string: 'D', cents: coin() * 6 }));
+  const got = firedSet(makeSignals({}), notes);
+  check('no tuning finding on a tuned violin', !got.has('instrument_out_of_tune'), [...got].join(','));
+}
+
+console.log('\na tuning finding is reported but never becomes a drill');
+{
+  function score2(key: MetricKey, sc: number): MetricScore {
+    return { key, score: sc, flaggedTimestamps: [], severity: sc >= 75 ? 'good' : 'critical',
+      events: [], occurrenceRate: 0, observationSummary: `${key}`, measurementQuality: 'high' };
+  }
+  const notes: NoteEvent[] = [];
+  for (let i = 0; i < 6; i++) notes.push(note({ t: i * 3, finger: 0, string: 'A', cents: -25 + coin() * 3 }));
+  for (let i = 0; i < 12; i++) notes.push(note({ t: 20 + i * 3, finger: 1, string: 'A', cents: -25 + coin() * 4 }));
+  for (let i = 0; i < 12; i++) notes.push(note({ t: 60 + i * 3, finger: 2, string: 'D', cents: -24 + coin() * 4 }));
+
+  const findings = runPatternDetection(makeSignals({}), notes);
+  check(
+    'the finding is in the session report',
+    findings.some((f) => f.testId === 'instrument_out_of_tune'),
+    findings.map((f) => f.testId).join(','),
+  );
+
+  const session: AnalysisResult = {
+    sessionId: 'x', userId: 'u', instrument: 'violin', durationSeconds: 140,
+    recordedAt: '2026-07-10T00:00:00Z', overallScore: 62,
+    metrics: [score2('pitchAccuracy', 60)], audioMetrics: [score2('pitchAccuracy', 60)], videoMetrics: [],
+    patternFindings: findings,
+  } as AnalysisResult;
+  const ids = buildSessionEvidence(session).map((e) => e.id);
+  // Practising intonation against a mistuned instrument is practising against a
+  // moving target — the fix is a tuning peg, not an exercise.
+  check(
+    'but it does not become practice evidence',
+    !ids.includes('pattern:instrument_out_of_tune'),
+    ids.join(','),
+  );
+}
+
 if (failures > 0) { console.error(`${failures} check(s) failed`); process.exit(1); }
 console.log('All detection coverage checks passed');

@@ -3,13 +3,27 @@ import { View, Text, StyleSheet } from 'react-native';
 import Animated, { useAnimatedStyle, type SharedValue } from 'react-native-reanimated';
 import { colors, spacing } from '../../constants/theme';
 
-const GREEN_CENTS = 8;
-const AMBER_CENTS = 20;
+/**
+ * Green band when no tolerance is supplied — the tuner's standard, where the
+ * player is deliberately chasing dead centre rather than clearing a drill's bar.
+ */
+const DEFAULT_GREEN_CENTS = 8;
+/** How far past the green band amber runs before a reading counts as a miss. */
+const AMBER_MARGIN_CENTS = 12;
 
-export function noteColor(cents: number): string {
+/**
+ * Colour for a cents reading.
+ *
+ * `toleranceCents` should be the drill's actual pass tolerance (exercises/types
+ * centsFor: 15/20/25). Without it the gauge showed green only inside 8¢ while
+ * the grader was passing notes at 20¢ — so a note the app had just accepted
+ * still looked wrong on screen. Anything judging a take should pass its bar in.
+ */
+export function noteColor(cents: number, toleranceCents?: number): string {
+  const green = toleranceCents ?? DEFAULT_GREEN_CENTS;
   const abs = Math.abs(cents);
-  if (abs <= GREEN_CENTS) return colors.score.excellent;
-  if (abs <= AMBER_CENTS) return '#f59e0b';
+  if (abs <= green) return colors.score.excellent;
+  if (abs <= green + AMBER_MARGIN_CENTS) return '#f59e0b';
   return colors.score.critical;
 }
 
@@ -22,13 +36,21 @@ interface CentsGaugeProps {
    * re-rendering React on every one.
    */
   centsSv?: SharedValue<number>;
+  /**
+   * The drill's pass tolerance. Widens the green band and the needle colour to
+   * match, so the gauge shows the bar the take is actually judged against
+   * rather than a fixed 8¢ the grader stopped using.
+   */
+  toleranceCents?: number;
 }
 
 /** Horizontal cents-off-pitch gauge, ±50¢ range. Extracted from the tuner so exercise screens can reuse it. */
-export function CentsGauge({ cents, active, centsSv }: CentsGaugeProps) {
+export function CentsGauge({ cents, active, centsSv, toleranceCents }: CentsGaugeProps) {
   const clamped = Math.max(-50, Math.min(50, cents));
   const needlePercent = ((clamped + 50) / 100) * 100;
-  const color = noteColor(clamped);
+  const color = noteColor(clamped, toleranceCents);
+  // The gauge spans ±50¢, so a tolerance of N¢ is N% in from each edge of centre.
+  const greenInset = `${50 - Math.max(0, Math.min(50, toleranceCents ?? DEFAULT_GREEN_CENTS))}%`;
 
   return (
     <View style={s.wrap}>
@@ -42,10 +64,10 @@ export function CentsGauge({ cents, active, centsSv }: CentsGaugeProps) {
       </View>
 
       <View style={s.track}>
-        <View style={s.greenZone} />
+        <View style={[s.greenZone, { left: greenInset as any, right: greenInset as any }]} />
         {active && (
           centsSv
-            ? <AnimatedNeedle centsSv={centsSv} />
+            ? <AnimatedNeedle centsSv={centsSv} greenCents={toleranceCents ?? DEFAULT_GREEN_CENTS} />
             : <View style={[s.needle, { left: `${needlePercent}%` as any, backgroundColor: color }]} />
         )}
       </View>
@@ -55,7 +77,10 @@ export function CentsGauge({ cents, active, centsSv }: CentsGaugeProps) {
   );
 }
 
-function AnimatedNeedle({ centsSv }: { centsSv: SharedValue<number> }) {
+// Colour thresholds are passed in as plain numbers rather than read from the
+// component scope: this runs as a worklet on the UI thread.
+function AnimatedNeedle({ centsSv, greenCents }: { centsSv: SharedValue<number>; greenCents: number }) {
+  const amberCents = greenCents + AMBER_MARGIN_CENTS;
   const style = useAnimatedStyle(() => {
     const c = Math.max(-50, Math.min(50, centsSv.value));
     const abs = Math.abs(c);
@@ -63,8 +88,8 @@ function AnimatedNeedle({ centsSv }: { centsSv: SharedValue<number> }) {
       // Track is 100% wide and the ±50¢ range maps onto it linearly, so left% === c + 50.
       left: `${c + 50}%`,
       backgroundColor:
-        abs <= GREEN_CENTS ? colors.score.excellent
-          : abs <= AMBER_CENTS ? '#f59e0b'
+        abs <= greenCents ? colors.score.excellent
+          : abs <= amberCents ? '#f59e0b'
             : colors.score.critical,
     };
   });
@@ -90,8 +115,6 @@ const s = StyleSheet.create({
   },
   greenZone: {
     position: 'absolute',
-    left: '42%',
-    right: '42%',
     top: 0,
     bottom: 0,
     backgroundColor: '#dcfce7',

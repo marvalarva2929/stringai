@@ -100,9 +100,8 @@ export function generateCrossingWave(ctx: ExerciseContext): PracticeBlock | null
     bpm: tempoFor(ctx.intensity),
     estimatedMinutes: advanced ? 6 : 5,
     instructions: [
-      `Set the bow on ${low} and find the arm level for ${high} without playing — just move between the two levels a few times and feel where the elbow sits for each.`,
-      'On the take, one note per click. Change level from the shoulder before the bow arrives, not as it arrives.',
-      'The crossing should be silent. If you hear a bump, the arm is arriving late — slow down rather than pressing lighter.',
+      `One note per click, crossing between ${low} and ${high}.`,
+      'Change arm level from the shoulder before the bow arrives.',
     ],
     successSummary: `Rock between ${low} and ${high} for all ${steps.length} notes, keeping every note in tune and every crossing clean.`,
     fallbackCriteria: `If note detection is uncertain, play open ${low} and ${high} alternating slowly and listen for the click at the change — that sound is the whole target.`,

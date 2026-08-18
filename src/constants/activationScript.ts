@@ -52,7 +52,7 @@ export const HOME_COACHMARKS: SpotlightStep[] = [
   {
     id: 'home.record',
     targetId: 'home.record',
-    title: 'Record a session',
+    title: 'Practice',
     body: "This is where the real feedback comes from. Play something you know and I'll tell you exactly what to fix. Let's do one now.",
     placement: 'above',
     radius: 18,
@@ -74,7 +74,7 @@ export const PIECE_COACHMARKS: SpotlightStep[] = [
     id: 'piece.search',
     targetId: 'piece.search',
     title: 'Say what you are playing',
-    body: 'Name the piece before you record and I can track it over time — how it sounded last week, what it still needs. Search here, or type anything.',
+    body: 'Name the piece before you record and I can track it over time — how it sounded last week, what it still needs.',
     placement: 'below',
     radius: 14,
     cta: 'Next',

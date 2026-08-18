@@ -63,11 +63,17 @@ console.log('one imperfect note does not sink a take');
   check('and passes', result.passed === true, `${result.score}`);
   check('all eight count as clean', result.cleanCount === 8, String(result.cleanCount));
 
-  // One genuinely bad note in an otherwise good scale should cost, not kill.
+  // One genuinely bad note in an otherwise good scale still scores well — the
+  // score is a gradient — but it does not pass. Passing a tuning drill means
+  // every note was in tune; a single note 45¢ out is audibly not.
   const oneBad = [...Array(7).fill(0).map(() => note(3)), note(45)];
   const partial = scoreSequence(oneBad, 8, OPTS);
-  check('one bad note still passes a good scale', partial.passed === true, String(partial.score));
-  check('but it costs something', partial.score < result.score, `${partial.score} vs ${result.score}`);
+  check('one bad note does not pass, however good the rest was', partial.passed === false, String(partial.score));
+  check('but the score still reflects the good notes', partial.score >= 80, String(partial.score));
+  check('and it costs something', partial.score < result.score, `${partial.score} vs ${result.score}`);
+  check('the offending note is identifiable for a follow-up drill',
+    partial.notes.filter((n) => !n.clean).length === 1,
+    String(partial.notes.filter((n) => !n.clean).length));
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -130,11 +136,14 @@ console.log('the bar scales with the coach');
 
   // Sits between the two bars: comfortably fine for a beginner, not for someone
   // being held to an advanced standard.
-  const decent = Array(8).fill(0).map(() => note(25));
-  const guided = scoreSequence(decent, 8, { centsThreshold: 12, passMark: passMarkFor('guided') });
-  const advanced = scoreSequence(decent, 8, { centsThreshold: 8, passMark: passMarkFor('advanced') });
+  // Now that passing means "every note inside tolerance", the coach level shows
+  // up as the tolerance itself (centsFor: 15/20/25), not as a score bar. Playing
+  // consistently 18¢ off is fine for a beginner and not for an advanced player.
+  const decent = Array(8).fill(0).map(() => note(18));
+  const guided = scoreSequence(decent, 8, { centsThreshold: 25, passMark: passMarkFor('guided') });
+  const advanced = scoreSequence(decent, 8, { centsThreshold: 15, passMark: passMarkFor('advanced') });
   check('the same playing can pass guided and not advanced',
-    guided.passed && !advanced.passed, `${guided.score}/${guided.passMark} vs ${advanced.score}/${advanced.passMark}`);
+    guided.passed && !advanced.passed, `guided=${guided.passed} advanced=${advanced.passed}`);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -149,10 +158,13 @@ console.log('a high score does not excuse a wrong note');
   check('but the take is disqualified', result.passed === false);
   check('and says why', result.disqualifiedReason === 'wrong_notes', result.disqualifiedReason);
 
-  // A longer drill gets a little room — one fumble in twenty is a good twenty.
+  // A longer drill still gets room on the *disqualification* rule (one fumble in
+  // twenty is not "wrong notes"), but it does not pass — the note is not clean.
   const longOneWrong = [...Array(19).fill(0).map(() => note(2)), note(100)];
-  check('a long sequence tolerates a single fumble',
-    scoreSequence(longOneWrong, 20, OPTS).passed === true);
+  const long = scoreSequence(longOneWrong, 20, OPTS);
+  check('a long sequence is not disqualified by a single fumble',
+    long.disqualifiedReason === undefined, String(long.disqualifiedReason));
+  check('but one unclean note still blocks the pass', long.passed === false, String(long.score));
 
   const undetected = [...Array(7).fill(0).map(() => note(2)), note(null)];
   check('an undetected note also disqualifies',

@@ -110,7 +110,7 @@ function sequenceStaple(args: {
       status: 'ready',
     },
     successCriteria: {
-      summary: `${args.successSummary} Score ${passMarkFor(args.intensity)}+ out of 100 to pass.`,
+      summary: `${args.successSummary} Every note within ${centsFor(args.intensity)}\u00A2 to pass.`,
       repetitions: 1,
       centsThreshold: cents,
     },

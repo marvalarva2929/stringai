@@ -2,6 +2,7 @@ import {
   OPEN_MIDI,
   POSITION_BASE,
   POSITION_ORDER,
+  GENERATABLE_POSITIONS,
   fingerFor,
   fingerLabel,
   positionLabel,
@@ -98,7 +99,9 @@ function reachable(midi: number, str: ViolinString, position: PositionName): boo
 
 /** Positions that can play this note on this string, lowest first. */
 function positionsFor(midi: number, str: ViolinString): PositionName[] {
-  return POSITION_ORDER.filter((position) => reachable(midi, str, position));
+  // GENERATABLE_POSITIONS, not POSITION_ORDER: nothing may be planned above the
+  // highest position the player has actually been asked about.
+  return GENERATABLE_POSITIONS.filter((position) => reachable(midi, str, position));
 }
 
 function describe(note: PlannedNote): string {

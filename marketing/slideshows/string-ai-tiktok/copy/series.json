@@ -1,0 +1,36 @@
+{
+  "app_name": "String AI",
+  "_note": "Fixed 20-part series: 'tips on how to self learn the violin!!' Each part is ONE real, tutor-level tip elaborated across all 6 slides (not six unrelated topics). {app} is named exactly twice per deck: once in slide 2 (inside the tip, as one tool among others) and once in slide 6 (sign-off). Slides 3-5 never mention it. No em dashes. Voice is a real person texting a friend: enthusiastic, imperfect grammar, emoji, never the 'claim. here's why' template. See marketing/slideshows/string-ai-tiktok/SKILL.md and the approved plan for the guardrails on what String AI actually does -- do not invent features.",
+  "parts": [
+    {
+      "part": 1,
+      "topic": "open strings as a free built-in tuner",
+      "slides": [
+        {
+          "headline": "self teach violin tips!! \ud83c\udfbb",
+          "sub": "today: open strings are a free tuner \u2728"
+        },
+        {
+          "headline": "open strings ARE a tuner \ud83e\udd79",
+          "sub": "G D A E are all perfect 5ths apart, so when you stop a note the open string next to it should ring, not clash. if it sounds muddy something's off honestly. i double check mine with {app} too, it tells me exactly which notes came out flat or sharp"
+        },
+        {
+          "headline": "3rd finger = an octave check \ud83c\udfbb",
+          "sub": "in first position, 3rd finger on D should match open A an octave up. check it against that constantly, it's just sitting right there"
+        },
+        {
+          "headline": "open string, then finger, then listen",
+          "sub": "not together! back to back. your ear picks up SO much more comparing two sounds than it does guessing at one all on its own"
+        },
+        {
+          "headline": "sounds like a chord? not there yet",
+          "sub": "a perfect interval should basically ring as one sound. any wobble or beating means keep adjusting, don't move on"
+        },
+        {
+          "headline": "go check your strings \ud83c\udfbb",
+          "sub": "({app} does this same check for you automatically after you record, if you want a second opinion, link in bio)"
+        }
+      ]
+    }
+  ]
+}

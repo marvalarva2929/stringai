@@ -482,8 +482,20 @@ function addRhythmEvidence(byId: Map<string, PracticeEvidence>, session: Analysi
   });
 }
 
+/**
+ * Findings that are advice, not drills.
+ *
+ * An out-of-tune instrument is the most actionable thing the app can tell a
+ * player, and the least appropriate thing to build an exercise from: nothing
+ * about their technique needs to change, so a "pitch accuracy" drill generated
+ * off the back of it would have them practising against a moving target. It is
+ * reported in the session, and it stays out of the practice plan.
+ */
+const NON_DRILLABLE_FINDINGS = new Set(['instrument_out_of_tune']);
+
 function addPatternEvidence(byId: Map<string, PracticeEvidence>, session: AnalysisResult): void {
   for (const finding of session.patternFindings ?? []) {
+    if (NON_DRILLABLE_FINDINGS.has(finding.testId)) continue;
     const metricKey = metricForFinding(finding.testId);
     const kind = kindForFinding(finding.testId);
     const isBow = kind === 'bow_pattern';
@@ -620,6 +632,7 @@ function kindForFinding(testId: string): PracticeEvidenceKind {
 
 function titleForFinding(testId: string): string {
   const titles: Record<string, string> = {
+    instrument_out_of_tune: 'Instrument tuning',
     intonation_fatigue: 'End-of-session intonation',
     finger_accuracy_gap: 'Finger accuracy gap',
     pitch_tendency: 'Pitch tendency',

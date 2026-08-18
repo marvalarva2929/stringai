@@ -65,6 +65,24 @@ public class MicPitchModule: Module {
       promise.resolve(nil)
     }
 
+    // Puts the shared session into the same measurement mode the pitch engine
+    // uses, without starting the engine. The graded exercise take is recorded by
+    // expo-av, which cannot express `mode:`, so it was being captured with iOS
+    // AGC and noise-suppression active — the exact processing that `startEngine`
+    // turns off below because it makes detected pitch drift under a sustained
+    // tone. The tuner and the grader were therefore judging different signals.
+    AsyncFunction("configureMeasurementSession") { (promise: Promise) in
+      do {
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .allowBluetooth])
+        try session.setPreferredSampleRate(48000)
+        try session.setActive(true, options: .notifyOthersOnDeactivation)
+        promise.resolve(nil)
+      } catch {
+        promise.reject("MIC_SESSION_FAILED", error.localizedDescription)
+      }
+    }
+
     OnDestroy {
       self.stopEngine()
     }

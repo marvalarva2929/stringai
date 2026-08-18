@@ -49,6 +49,50 @@ function check(name: string, cond: boolean, detail = '') {
   check('unrecognized scale name returns empty', seq.length === 0);
 }
 
+// Every generated scale has to be playable without shifting: drills default to
+// first position (canShift in lib/exercises/types.ts). PITCH_CLASS_MIDI is the
+// open-string table for the tuner, and rooting scales on it directly used to
+// send C, C#, E and F an octave too high — E minor climbed to E6, past sixth
+// position on the E string.
+{
+  // B5 = 4th finger on the E string in first position. Nothing may exceed it.
+  const HIGHEST_FIRST_POSITION_MIDI = 83;
+  const LOWEST_MIDI = 55; // open G
+  const NAME_TO_MIDI: Record<string, number> = {
+    C: 0, 'C#': 1, D: 2, 'D#': 3, E: 4, F: 5, 'F#': 6, G: 7, 'G#': 8, A: 9, 'A#': 10, B: 11,
+  };
+  const midiOf = (name: string): number => {
+    const m = /^([A-G]#?)(-?\d+)$/.exec(name);
+    if (!m) return NaN;
+    return NAME_TO_MIDI[m[1]] + (Number(m[2]) + 1) * 12;
+  };
+
+  let worstName = '';
+  let worstMidi = 0;
+  let lowestMidi = 999;
+  const roots = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+  for (const root of roots) {
+    for (const quality of ['major', 'minor']) {
+      for (const note of scaleNoteSequence(`${root} ${quality}`)) {
+        const midi = midiOf(note);
+        if (!Number.isFinite(midi)) continue;
+        if (midi > worstMidi) { worstMidi = midi; worstName = note; }
+        if (midi < lowestMidi) lowestMidi = midi;
+      }
+    }
+  }
+  check(
+    'every major/minor scale stays within first position',
+    worstMidi <= HIGHEST_FIRST_POSITION_MIDI,
+    `highest note across all 24 scales was ${worstName} (MIDI ${worstMidi}), ceiling ${HIGHEST_FIRST_POSITION_MIDI}`,
+  );
+  check(
+    'no scale note falls below the open G string',
+    lowestMidi >= LOWEST_MIDI,
+    `lowest MIDI was ${lowestMidi}, floor ${LOWEST_MIDI}`,
+  );
+}
+
 if (failures > 0) {
   console.error(`\n${failures} check(s) failed`);
   process.exit(1);

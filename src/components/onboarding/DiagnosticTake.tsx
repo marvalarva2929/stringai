@@ -151,7 +151,7 @@ export function DiagnosticTake({ onAnalyze, onUseDemo }: DiagnosticTakeProps) {
 
     try {
       finishingRef.current = false;
-      recordingRef.current = await startTakeRecording();
+      recordingRef.current = (await startTakeRecording()).recording;
       startedAtRef.current = Date.now();
       setStage('recording');
       track(AnalyticsEvent.RECORDING_STARTED, { source: 'diagnostic' });

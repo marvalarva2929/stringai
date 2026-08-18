@@ -19,7 +19,8 @@ export type IoniconName =
 export interface RunnerStep {
   eyebrow: string;
   title: string;
-  body: string;
+  /** The block's instructions, rendered as a list rather than paginated. */
+  bodyLines: string[];
   callout: string;
   icon: IoniconName;
 }
@@ -176,33 +177,26 @@ function coachCopyFor(coach: CoachIntensity): string {
  * runner (replacing the previous 3 hard-coded templates). The final step frames
  * the live check using the block's own success/fallback criteria.
  */
+/**
+ * The one screen shown between the intro and the take.
+ *
+ * This used to paginate — one screen per instruction, each needing its own tap,
+ * so a three-line exercise cost three taps to read three sentences that fit
+ * together on one screen. The instructions are worth keeping; making the player
+ * click through them one at a time was not. A single array entry is returned so
+ * the runner's step paging keeps working unchanged.
+ */
 export function buildRunnerSteps(block: PracticeBlock, coach: CoachIntensity): RunnerStep[] {
   const instructions = block.instructions.length > 0 ? block.instructions : [block.reason];
-  const coachCopy = coachCopyFor(coach);
-  const total = instructions.length;
 
-  return instructions.map((instruction, i) => {
-    const isLast = i === total - 1;
-    const isFirst = i === 0;
-    return {
-      eyebrow: `Step ${i + 1} of ${total}`,
-      title: isFirst ? 'Set the target' : isLast ? 'Ready your take' : `Rep ${i}`,
-      body: instruction,
-      callout: isLast
-        ? block.liveMode.status === 'unavailable'
-          ? block.fallbackCriteria
-          : `Listen for ${toneCue(block)}, then record. Pass condition: ${block.successCriteria.summary}`
-        : `${coachCopy} Target: ${targetLine(block)}.`,
-      icon: isLast ? (block.liveMode.requiresCamera ? 'camera' : 'mic') : isFirst ? 'flag' : 'repeat',
-    };
-  });
+  return [{
+    eyebrow: coachCopyFor(coach),
+    title: 'How to play it',
+    bodyLines: instructions,
+    callout: block.liveMode.status === 'unavailable'
+      ? block.fallbackCriteria
+      : `Listen for ${toneCue(block)}, then record.`,
+    icon: block.liveMode.requiresCamera ? 'camera' : 'mic',
+  }];
 }
 
-/** Short coaching line shown in the coach bubble for the current step. */
-export function coachHint(block: PracticeBlock, stepIndex: number, coach: CoachIntensity): string {
-  const total = block.instructions.length || 1;
-  if (stepIndex === 0) return 'Know the target note, string, and pass condition before the first bow stroke.';
-  if (stepIndex >= total - 1) return block.coachPromptContext;
-  if (coach === 'guided') return 'Keep the reps slow and repeat the same exact target until it is automatic.';
-  return 'Do not add difficulty until the target is boringly repeatable.';
-}

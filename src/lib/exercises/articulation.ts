@@ -63,9 +63,8 @@ export function generateArticulation(ctx: ExerciseContext): PracticeBlock | null
     estimatedMinutes: 5,
     coachIntensity: ctx.intensity,
     instructions: [
-      `Today's stroke is ${label}. ${STROKE_INSTRUCTION[stroke]}`,
-      `Try four on open ${str} before recording and listen to the *start* of each note — that's where the stroke lives.`,
-      `On the take, play ${reps} strokes on open ${str}, all the same character. Consistency is what's being judged, not power.`,
+      `${label}: ${STROKE_INSTRUCTION[stroke]}`,
+      `${reps} strokes on open ${str}, all the same.`,
     ],
     target: {
       // The evidence's own metric, not a hardcoded one. buildPracticeBlocks

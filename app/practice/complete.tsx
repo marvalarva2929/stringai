@@ -98,7 +98,7 @@ export default function PracticeCompleteScreen() {
 
       <View style={s.bottomBar}>
         {scope.kind === 'session' ? (
-          <DepthButton label="Record again" icon="videocam" onPress={() => router.replace('/(tabs)/analyze')} />
+          <DepthButton label="Record again" icon="videocam" onPress={() => router.replace('/practice/pick')} />
         ) : (
           <DepthButton label="Done" icon="home" onPress={() => router.replace('/(tabs)/home')} />
         )}

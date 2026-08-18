@@ -107,9 +107,8 @@ export function generateEtudeFragment(ctx: ExerciseContext): PracticeBlock | nul
     bpm: tempoFor(ctx.intensity),
     estimatedMinutes: 7,
     instructions: [
-      `Read it through slowly first. It's ${steps.length} notes in ${key.name} — a line, not a pattern, so let it phrase.`,
-      'On the take, one note per click. Even tone and even length matter more than tempo here.',
-      `Listen for the thing ${spec.tradition} is famous for testing: ${spec.purpose}.`,
+      `${steps.length} notes in ${key.name}, one per click.`,
+      'Even tone and even length — let it phrase.',
     ],
     successSummary: `Play the fragment through in ${key.name}, keeping all but a note or two in tune.`,
     fallbackCriteria: 'If note detection is uncertain, play the fragment at half tempo and record just the first half.',

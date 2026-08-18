@@ -81,9 +81,8 @@ export function generateFingerPattern(ctx: ExerciseContext): PracticeBlock | nul
     bpm: tempoFor(ctx.intensity),
     estimatedMinutes: ctx.intensity === 'advanced' ? 7 : 5,
     instructions: [
-      `Set the hand in ${where} and leave it there for the whole drill. Nothing shifts and nothing crosses.`,
-      'On the take, one note per click. Fingers fall from the knuckle and lift only when the annotation says to — a finger left down when it should have lifted is the fault this drill is looking for.',
-      'Keep the fingers close to the string between notes. Height is where evenness goes to die.',
+      `One note per click. Hand stays in ${where} throughout.`,
+      'Fingers fall from the knuckle; lift only where marked.',
     ],
     successSummary: `Play all ${steps.length} notes of the pattern evenly, keeping all but a note or two in tune.`,
     fallbackCriteria: `If note detection is uncertain, tap the pattern silently on the ${str} string and listen to the fingers hitting the fingerboard — they should sound as even as a metronome.`,

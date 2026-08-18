@@ -37,6 +37,9 @@ const ATTEMPT_GAP_S = 0.15;
 // ~100ms of voiced audio minimum before a segment counts as a real attempt,
 // filtering out brief noise blips that briefly cross the YIN pitch threshold.
 const MIN_ATTEMPT_FRAMES = 4;
+// Long enough to cover the metronome click (CLICK_DURATION_S = 0.014) and its
+// decay, short enough not to swallow the start of the note answering it.
+const CLICK_BLANK_S = 0.04;
 
 // Splits detected pitch frames into voiced runs, one per note attempt/hold —
 // separated by a >150ms silence gap (the player stopping the bow).
@@ -237,13 +240,21 @@ function scaleAttemptsFromBeats(samples: Float32Array, sampleRate: number, beatT
   return beatTimestamps.map((beatT, i) => {
     const nextT = beatTimestamps[i + 1] ?? beatT + avgInterval;
     const interval = nextT - beatT;
-    // Skip the click's attack transient; stop short of the next click bleeding in.
-    const windowStart = beatT + interval * 0.15;
+    // Blank out the click, then judge the rest of the beat. This used to skip a
+    // proportion of the interval (15%), which at 60 BPM threw away the first
+    // 150ms of every note to dodge a 14ms click (lib/clickTone.ts) — and when
+    // that left nothing voiced, the note was reported as "not detected" even
+    // though the player had clearly played it. A fixed blank covers the click
+    // with room to spare and costs a fraction as much real audio.
+    const windowStart = beatT + Math.min(CLICK_BLANK_S, interval * 0.15);
     const windowEnd = beatT + interval * 0.9;
     const windowFrames = frames.filter((f) => f.frequency !== null && f.timestamp >= windowStart && f.timestamp < windowEnd);
     // Where the note actually started relative to its click, so the score can
-    // weigh timing. Taken from the first voiced frame in the wider beat window,
-    // since the trimmed analysis window above deliberately skips the attack.
+    // weigh timing. Deliberately starts *at* the beat: this path judges legato
+    // scales where the previous note is still sounding, so the first voiced
+    // frame before the beat belongs to that note, not to an onset. Correcting
+    // the late bias of the audio chain is the rhythm path's job, where onsets
+    // come from voiced runs bounded by real silence (rhythmAttemptsFromBeats).
     const onsetFrame = frames.find((f) => f.frequency !== null && f.timestamp >= beatT && f.timestamp < nextT);
     const offsetMs = onsetFrame ? (onsetFrame.timestamp - beatT) * 1000 : null;
     // Playback uses the full beat window (not the trimmed analysis window
@@ -258,26 +269,138 @@ function scaleAttemptsFromBeats(samples: Float32Array, sampleRate: number, beatT
   });
 }
 
+/** Amplitude-envelope resolution for onset picking. */
+const ONSET_HOP_S = 0.005;
+/** Two bow strokes closer together than this are one stroke. */
+const ONSET_MIN_IOI_S = 0.12;
+/** Local window for the adaptive threshold, in envelope frames (±150ms). */
+const ONSET_MEDIAN_WIN = 30;
+/** How far above the local median a rise has to be to count as an attack. */
+const ONSET_MULTIPLIER = 2.2;
+/** Absolute floor, as a fraction of the take's loudest rise — kills noise-floor jitter. */
+const ONSET_DELTA_FRAC = 0.08;
+/** A real note keeps sounding after its attack; a click does not. */
+const ONSET_SUSTAIN_S = 0.15;
+/**
+ * Median-filter width applied to the envelope before differencing, in frames
+ * (45ms). A median filter deletes any impulse shorter than half its window while
+ * leaving a sustained step edge exactly where it was — so the 14ms metronome
+ * click vanishes and the note's attack keeps its timing. A moving *average*
+ * would smear the attack later instead, which is the one direction this whole
+ * path must not drift.
+ */
+const ONSET_SMOOTH_FRAMES = 9;
+
+/**
+ * Note attacks, from the amplitude envelope.
+ *
+ * This used to take the start of each voiced pitch run, which silently required
+ * 150ms of *silence* between notes to see them as separate. Real playing does not
+ * do that: keep the bow on the string, or play anything close to legato, and
+ * every note in the take merges into one run — eight notes at 80 BPM became a
+ * single onset, and the drill reported no attack near any click. A bow change
+ * re-attacks the envelope even when the pitch never stops sounding, so that is
+ * what gets measured here.
+ *
+ * It is also more accurate. A voiced-run start is quantized to the 25ms pitch hop
+ * and lands only once YIN has ~23ms of established periodicity, so it trails the
+ * real attack — always late, never early. The envelope resolves to 5ms and rises
+ * with the bow.
+ *
+ * The metronome click is excluded by requiring the attack to be followed by
+ * sustained voiced audio: the click is a 14ms aperiodic tick that produces no
+ * voiced frame at all (see lib/clickTone.ts CLICK_Q), so nothing sustains behind
+ * it. A note played *on* the click merges with it, which is correct — that is the
+ * player's note.
+ */
+function onsetsFromEnvelope(
+  samples: Float32Array,
+  sampleRate: number,
+  frames: PitchFrame[],
+): { time: number; confidence: number; freqHz: number }[] {
+  const hop = Math.max(1, Math.floor(sampleRate * ONSET_HOP_S));
+  const env: number[] = [];
+  for (let i = 0; i + hop <= samples.length; i += hop) {
+    let sum = 0;
+    for (let k = i; k < i + hop; k++) sum += samples[k] * samples[k];
+    env.push(Math.sqrt(sum / hop));
+  }
+  if (env.length < 3) return [];
+
+  // Median-filter out the click before looking for attacks. Without this the
+  // click's own transient is the largest rise at every beat, wins the peak pick,
+  // and every note reports an offset of 0ms — the drill would be grading the
+  // metronome against itself.
+  const half = ONSET_SMOOTH_FRAMES >> 1;
+  const smooth: number[] = [];
+  for (let i = 0; i < env.length; i++) {
+    const lo = Math.max(0, i - half);
+    const hi = Math.min(env.length, i + half + 1);
+    const win = env.slice(lo, hi).sort((a, b) => a - b);
+    smooth.push(win[Math.floor(win.length / 2)]);
+  }
+
+  // Half-wave rectified first difference: energy going up, which is what an
+  // attack is. Falling energy is a release and must not register.
+  const rise: number[] = [0];
+  for (let i = 1; i < smooth.length; i++) rise.push(Math.max(0, smooth[i] - smooth[i - 1]));
+
+  const maxRise = Math.max(...rise);
+  if (maxRise <= 0) return [];
+  const floor = maxRise * ONSET_DELTA_FRAC;
+
+  const candidates: number[] = [];
+  for (let i = 1; i < rise.length - 1; i++) {
+    if (rise[i] < floor) continue;
+    if (rise[i] < rise[i - 1] || rise[i] < rise[i + 1]) continue; // local peak only
+
+    const lo = Math.max(0, i - ONSET_MEDIAN_WIN);
+    const hi = Math.min(rise.length, i + ONSET_MEDIAN_WIN);
+    const local = rise.slice(lo, hi).sort((a, b) => a - b);
+    const median = local[Math.floor(local.length / 2)];
+    if (rise[i] < median * ONSET_MULTIPLIER) continue;
+
+    candidates.push(i);
+  }
+
+  // Keep the strongest rise inside each minimum-inter-onset window.
+  const minGapFrames = Math.max(1, Math.round(ONSET_MIN_IOI_S / ONSET_HOP_S));
+  const picked: number[] = [];
+  for (const i of candidates) {
+    const prev = picked[picked.length - 1];
+    if (prev != null && i - prev < minGapFrames) {
+      if (rise[i] > rise[prev]) picked[picked.length - 1] = i;
+      continue;
+    }
+    picked.push(i);
+  }
+
+  // Confirm each attack is a note: voiced pitch has to persist behind it.
+  const out: { time: number; confidence: number; freqHz: number }[] = [];
+  for (const i of picked) {
+    const time = (i * hop) / sampleRate;
+    const sustained = frames.filter(
+      (f) => f.frequency !== null && f.timestamp >= time - ONSET_HOP_S && f.timestamp <= time + ONSET_SUSTAIN_S,
+    );
+    if (sustained.length < MIN_ATTEMPT_FRAMES) continue;
+    const freqs = sustained.map((f) => f.frequency!).sort((a, b) => a - b);
+    out.push({
+      time,
+      confidence: sustained.reduce((sum, f) => sum + (f.periodicity ?? 0), 0) / sustained.length,
+      freqHz: freqs[Math.floor(freqs.length / 2)],
+    });
+  }
+  return out;
+}
+
 // One judged attempt per click: finds the nearest note attack (if any) within
 // half a beat interval of that click, so a slightly early or late attack still
 // counts as an answer to that click rather than its neighbor's.
 function rhythmAttemptsFromBeats(samples: Float32Array, sampleRate: number, beatTimestamps: number[]): RhythmAttempt[] {
   // Unlike scaleAttemptsFromBeats, this can't skip the frames right at the beat —
-  // that is exactly where a well-timed note is supposed to land. It doesn't need to:
-  // onsets here come from voiced pitch runs, and the click is an aperiodic noise tick
-  // that never produces a voiced frame (see lib/clickTone.ts), so it is absent from
-  // this segmentation by construction rather than filtered out afterwards.
+  // that is exactly where a well-timed note is supposed to land.
   const frames = detectPitches(samples, sampleRate);
-  const onsets = segmentVoicedRuns(frames)
-    .filter((seg) => seg.length >= MIN_ATTEMPT_FRAMES)
-    .map((seg) => {
-      const freqs = seg.map((f) => f.frequency!).sort((a, b) => a - b);
-      return {
-        time: seg[0].timestamp,
-        confidence: seg.reduce((sum, f) => sum + (f.periodicity ?? 0), 0) / seg.length,
-        freqHz: freqs[Math.floor(freqs.length / 2)],
-      };
-    });
+  const onsets = onsetsFromEnvelope(samples, sampleRate, frames);
 
   const avgInterval = beatTimestamps.length > 1
     ? (beatTimestamps[beatTimestamps.length - 1] - beatTimestamps[0]) / (beatTimestamps.length - 1)

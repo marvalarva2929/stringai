@@ -11,7 +11,6 @@ import Animated, {
 } from 'react-native-reanimated';
 import * as Haptics from 'expo-haptics';
 import { colors } from '../../src/constants/theme';
-import { useAnalysisStore } from '../../src/store/useAnalysisStore';
 
 type TabDef = {
   name: string;
@@ -95,7 +94,6 @@ function TabButton({
 }
 
 function CenterButton() {
-  const { reset } = useAnalysisStore();
   const scale = useSharedValue(1);
   const animStyle = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }));
 
@@ -105,8 +103,9 @@ function CenterButton() {
       withTiming(1, { duration: 100 }),
     );
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    reset();
-    router.push('/(tabs)/analyze');
+    // Straight to "pick a piece". The naming form is one tap further in, behind
+    // "New piece", because the common case is a piece you already have.
+    router.push('/practice/pick');
   };
 
   return (

@@ -51,7 +51,12 @@ export function evaluateScale(
       // What was actually heard, so a wrong note can be named instead of being
       // reported as an absurd cents figure ("sharp by 1180¢" is not sharpness,
       // it's a different note — see missDescription).
-      heardNoteName: attempt.confidence >= minConfidence
+      //
+      // Deliberately NOT gated on minConfidence: a pitch we heard but couldn't
+      // judge confidently is still worth naming. Telling a player their note
+      // "wasn't detected" when the tuner plainly showed it is how the app loses
+      // their trust; medianFreqHz === 0 is the only true "heard nothing" case.
+      heardNoteName: attempt.medianFreqHz > 0
         ? nearestNoteName(attempt.medianFreqHz)
         : undefined,
       offsetMs: attempt.offsetMs ?? undefined,
@@ -100,7 +105,11 @@ function scoreFeedback(
     return `${headline} — heard ${playedCount} notes, expected ${expectedCount}. Give each note a clear stop before the next so every one gets counted.`;
   }
   if (scored.disqualifiedReason === 'missing_notes') {
-    return `${headline} — ${scored.missingCount} note${scored.missingCount === 1 ? " wasn't" : "s weren't"} picked up clearly enough to judge. A fuller bow gives the mic something to read.`;
+    // Prefer naming a specific note over a bare count — see missDescription.
+    const unjudged = results.find((r) => r.centsDeviation == null);
+    return unjudged
+      ? `${headline} — ${missDescription(unjudged)}`
+      : `${headline} — ${scored.missingCount} note${scored.missingCount === 1 ? '' : 's'} not held long enough to judge.`;
   }
   if (scored.disqualifiedReason === 'wrong_notes') {
     const wrong = results.find(
@@ -114,21 +123,29 @@ function scoreFeedback(
       : `${headline} — a wrong note rather than a near miss, so it doesn't pass.`;
   }
   if (scored.passed) {
-    return scored.cleanCount === results.length
-      ? `${headline} — every note landed clean. That's the standard.`
-      : `${headline} — ${scored.cleanCount} of ${results.length} notes dead on, the rest close. Passed.`;
+    return `${headline} — every note landed clean. That's the standard.`;
   }
 
-  // Below the bar: name the single biggest thing standing between the player
-  // and it, rather than listing everything that was imperfect.
   if (scored.timing != null && scored.timing < scored.intonation - 15) {
     return `${headline} — the notes are there (${scored.intonation}/100 for pitch) but they're drifting off the click. Try it slower and let the click lead.`;
   }
-  const worst = results
-    .filter((r) => r.centsDeviation != null)
-    .sort((a, b) => Math.abs(b.centsDeviation!) - Math.abs(a.centsDeviation!))[0];
-  const detail = worst ? ` Biggest gap: ${missDescription(worst)}` : '';
-  return `${headline} — ${scored.passMark} to pass.${detail}`;
+
+  // Passing needs every note inside tolerance, so the useful thing to say is
+  // which ones weren't — those are what gets drilled next, individually. Naming
+  // one or two is a next action; listing eight is just a scolding.
+  const offNotes = results.filter((r) => !r.passed && r.label);
+  if (offNotes.length === 1) {
+    return `${headline} — ${missDescription(offNotes[0])}`;
+  }
+  if (offNotes.length > 1) {
+    const worst = [...offNotes].sort(
+      (a, b) => Math.abs(b.centsDeviation ?? 9999) - Math.abs(a.centsDeviation ?? 9999),
+    );
+    const names = worst.slice(0, 3).map((r) => r.label).join(', ');
+    const rest = worst.length > 3 ? ` +${worst.length - 3} more` : '';
+    return `${headline} — ${worst.length} notes to clean up: ${names}${rest}.`;
+  }
+  return `${headline} — every note needs to be inside the tolerance to pass.`;
 }
 
 /** Within this of a whole octave, a "miss" is the detector hearing a harmonic. */
@@ -150,7 +167,12 @@ function isOctaveError(cents: number): boolean {
  */
 export function missDescription(result: AttemptResult): string {
   if (result.centsDeviation == null) {
-    return `${result.label} wasn't confidently detected — play it clearly, with a fuller bow.`;
+    // Two very different situations used to share one message. "Not detected" for
+    // a note the player heard themselves play reads as the app being broken, so
+    // say what came through whenever anything did.
+    return result.heardNoteName
+      ? `${result.label} read as ${result.heardNoteName}, but not steadily enough to judge — hold it a beat longer.`
+      : `${result.label} — nothing came through on that beat.`;
   }
   const cents = result.centsDeviation;
   if (isOctaveError(cents)) {

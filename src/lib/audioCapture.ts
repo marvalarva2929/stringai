@@ -1,5 +1,5 @@
 import { Audio } from 'expo-av';
-import { forceSpeakerOutput } from '../services/micPitch';
+import { configureMeasurementSession, forceSpeakerOutput } from '../services/micPitch';
 
 export type Recording = Audio.Recording;
 
@@ -22,8 +22,12 @@ export const WAV_OPTIONS: Audio.RecordingOptions = {
   ios: {
     extension: '.wav',
     outputFormat: Audio.IOSOutputFormat.LINEARPCM,
-    audioQuality: Audio.IOSAudioQuality.MEDIUM,
-    sampleRate: 44100,
+    // MAX, not MEDIUM: this clip is what the evaluators grade, and it should be
+    // as close to the signal the streaming tuner reads as expo-av can manage.
+    audioQuality: Audio.IOSAudioQuality.MAX,
+    // Matches the rate the native pitch engine requests (MicPitchModule
+    // setPreferredSampleRate), so the session isn't resampling underneath us.
+    sampleRate: 48000,
     numberOfChannels: 1,
     bitRate: 128000,
     linearPCMBitDepth: 16,
@@ -45,8 +49,29 @@ export async function requestMicPermission(): Promise<boolean> {
  * a few times a second, so a caller can end the take when the player stops
  * playing instead of making them wait out a fixed timer.
  */
-export async function startTakeRecording(onLevel?: (dbfs: number) => void): Promise<Audio.Recording> {
+export interface StartedTake {
+  recording: Audio.Recording;
+  /**
+   * Wall-clock ms at the moment capture began — as close to the first recorded
+   * sample as JS can observe.
+   *
+   * Callers that place events inside the file (beat times for a click track)
+   * must use this, not a `Date.now()` taken after this function resolves. There
+   * is real work after `startAsync` below, so a timestamp taken afterwards sits
+   * *later* than sample 0, which pushes every beat earlier in file coordinates
+   * and biases every measured note offset toward "late" — the same direction as
+   * every other unmeasured delay in the chain.
+   */
+  startedAtMs: number;
+}
+
+export async function startTakeRecording(onLevel?: (dbfs: number) => void): Promise<StartedTake> {
   await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+  // Must come *after* setAudioModeAsync, which sets the category itself and would
+  // otherwise clobber the measurement mode. This is what keeps iOS AGC and noise
+  // suppression off the graded clip, so the evaluators judge the same unprocessed
+  // signal the tuner displays.
+  await configureMeasurementSession();
   const recording = new Audio.Recording();
   await recording.prepareToRecordAsync(WAV_OPTIONS);
   if (onLevel) {
@@ -56,12 +81,14 @@ export async function startTakeRecording(onLevel?: (dbfs: number) => void): Prom
     });
   }
   await recording.startAsync();
+  const startedAtMs = Date.now();
   // `allowsRecordingIOS` above puts the session in playAndRecord, which
   // defaults output to the quiet earpiece — force it back to the speaker so
   // any concurrent playback (the metronome click during a scale/rhythm take)
-  // stays audible.
+  // stays audible. Deliberately after the timestamp above: this is more async
+  // work, and anything it costs would otherwise be charged to the player as lateness.
   await forceSpeakerOutput();
-  return recording;
+  return { recording, startedAtMs };
 }
 
 /** How often metering updates arrive while a take is recording. */

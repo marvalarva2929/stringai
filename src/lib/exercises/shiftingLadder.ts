@@ -3,6 +3,7 @@ import { buildSequenceBlock, tempoFor, type ExerciseContext } from './types';
 import {
   OPEN_MIDI,
   POSITION_ORDER,
+  clampPosition,
   fingerLabel,
   midiFor,
   positionLabel,
@@ -43,8 +44,12 @@ export function generateShiftingLadder(ctx: ExerciseContext): PracticeBlock | nu
   const str = (target.string ?? target.strings?.[0]) as ViolinString | undefined;
   if (!str || !(str in OPEN_MIDI)) return null;
 
-  const from = toPositionName(target.fromPosition);
-  const to = toPositionName(target.toPosition);
+  // Evidence may show the player up in fifth or seventh, but the drill is
+  // capped at the highest position the app has actually asked them about — see
+  // HIGHEST_GENERATED_POSITION. Without this, one "yes, I can shift to third"
+  // produced a 1st-to-5th ladder.
+  const from = clampPosition(toPositionName(target.fromPosition));
+  const to = clampPosition(toPositionName(target.toPosition));
   if (from === to) return null;
   // This drill IS the shift, so there is no first-position version of it. When
   // the player hasn't been taught to shift, decline and let the next candidate
@@ -105,9 +110,8 @@ export function generateShiftingLadder(ctx: ExerciseContext): PracticeBlock | nu
     bpm: Math.max(44, tempoFor(ctx.intensity) - 16),
     estimatedMinutes: 6,
     instructions: [
-      `Before recording: play the open ${str}, then find ${positionLabel(to)} with your ${fingerLabel(finger)} and check it against the open string. Do that three or four times until the distance feels known rather than guessed.`,
-      'On the take, one note per click. During the click before each shift, release the thumb and let the hand travel — arrive early and wait, rather than shifting on the beat.',
-      'Do not correct after the note sounds. A landing that slides into tune still counts as a missed shift; the aim is to arrive there.',
+      `One note per click, up to ${positionLabel(to)} and back down.`,
+      `Check each landing against the open ${str}.`,
     ],
     successSummary: `Climb and descend the ladder on the ${str} string, landing all but one rung in tune.`,
     fallbackCriteria: `If note detection is uncertain, shift between ${positionLabel(from)} and ${positionLabel(to)} silently — bow off the string — and check each landing against the open ${str} before adding sound.`,

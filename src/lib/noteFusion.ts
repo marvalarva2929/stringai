@@ -101,13 +101,29 @@ function inferFinger(freq: number, str: 'G' | 'D' | 'A' | 'E'): 0 | 1 | 2 | 3 | 
   return 4;
 }
 
-function positionGroupFromMidi(midi: number): 'first' | 'third' | 'fifth' | 'higher' {
-  // Violin: first position tops out around B4 (MIDI 71), third ~E5 (76), fifth ~A5 (81)
-  if (midi <= 71) return 'first';
-  if (midi <= 76) return 'third';
-  if (midi <= 81) return 'fifth';
+/**
+ * Hand position for a note, RELATIVE TO THE STRING it is played on.
+ *
+ * Position is defined by where the hand sits on one string, so bucketing by
+ * absolute pitch alone is not an approximation of it — it is a different
+ * quantity. B4 and C5 are 1st and 2nd finger in first position on the A string,
+ * but an absolute-pitch bucket puts B4 in "first" and C5 in "third" and every
+ * consecutive pair straddling MIDI 71 looks like a shift. That is what produced
+ * "your third-to-first shift was bad" for a player who never moved their hand.
+ *
+ * Bands are the lowest position whose four fingers reach the note: first
+ * position covers up to ~8 semitones above the open string, third to 11, fifth
+ * to 13.
+ */
+function positionGroupFromMidi(midi: number, str: 'G' | 'D' | 'A' | 'E'): 'first' | 'third' | 'fifth' | 'higher' {
+  const semis = Math.round(midi) - OPEN_STRING_MIDI[str];
+  if (semis <= 8) return 'first';
+  if (semis <= 11) return 'third';
+  if (semis <= 13) return 'fifth';
   return 'higher';
 }
+
+const OPEN_STRING_MIDI: Record<'G' | 'D' | 'A' | 'E', number> = { G: 55, D: 62, A: 69, E: 76 };
 
 // ─────────────────────────────────────────────────────────────
 // Pose helpers
@@ -595,7 +611,7 @@ export function fuseSignals(
     const noteName = midiToName(midiRounded);
     const str = inferString(pitchHz);
     const finger = inferFinger(pitchHz, str);
-    const posGrp = positionGroupFromMidi(midiRounded);
+    const posGrp = positionGroupFromMidi(midiRounded, str);
 
     // Tone quality: mean fundamental ratio in window
     const noteTones = toneFrames.filter(f => f.timestamp >= noteStart && f.timestamp < noteEnd);

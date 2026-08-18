@@ -6,6 +6,7 @@ import { exercisesForMetric } from '../constants/exercises';
 import { METRIC_META } from '../constants/metricMeta';
 import { generateExercises } from './exercises/registry';
 import { buildTechniqueStaple } from './exercises/techniqueStaple';
+import { centsFor } from './exercises/types';
 
 export type CoachIntensity = 'guided' | 'balanced' | 'advanced';
 
@@ -597,7 +598,7 @@ function pitchHoldBlock(evidence: RankedPracticeEvidence, intensity: CoachIntens
     },
     evaluator: {
       evaluatorId: 'hold',
-      centsThreshold: 15,
+      centsThreshold: centsFor(intensity),
       minDurationSeconds: seconds,
       minFractionInTolerance: 0.75,
       requiredSuccesses: 1,
@@ -671,13 +672,51 @@ function bowControlBlock(evidence: RankedPracticeEvidence, intensity: CoachInten
   };
 }
 
+/** Drills run under performance tempo — that is what makes them drills. */
+const DRILL_TEMPO_FRACTION = 0.6;
+/** Above this, a "tempo" is far more likely a subdivision than a pulse. */
+const MAX_PLAUSIBLE_TACTUS_BPM = 100;
+/** Nobody taps a pulse this slow; halving below it means we folded too far. */
+const MIN_PLAUSIBLE_TACTUS_BPM = 50;
+
+/**
+ * Turns a detected note rate into a plausible beat rate.
+ *
+ * `bpmEst` (services/audioEngine.ts scoreRhythmAccuracy) inverts the *modal
+ * inter-onset interval* — how fast notes were going — with no subdivision
+ * folding or tactus disambiguation. A passage of eighth notes at quarter = 80
+ * reports 160. Feeding that straight into a one-note-per-click drill asked the
+ * player to bow at twice the speed they had just played, and because the old
+ * clamp was `Math.min(160, …)`, any faster passage produced exactly 160 — which
+ * is why that suspiciously round number kept appearing.
+ *
+ * Halving while the value is implausibly fast recovers the pulse: 160 → 80,
+ * 336 → 84. It cannot recover a tactus the onset histogram never saw, but it
+ * reliably stops the drill from being twice as fast as the music.
+ */
+export function foldToTactus(bpmEst?: number | null): number | null {
+  if (bpmEst == null || !Number.isFinite(bpmEst) || bpmEst <= 0) return null;
+  let bpm = bpmEst;
+  let folded = false;
+  while (bpm > MAX_PLAUSIBLE_TACTUS_BPM) {
+    bpm /= 2;
+    folded = true;
+  }
+  // Overshoot guard: a value we halved into implausibly-slow territory was
+  // probably already the pulse. Only applies when we actually folded — a
+  // genuinely slow tempo like 44 is a real pulse and must be left alone.
+  if (folded && bpm < MIN_PLAUSIBLE_TACTUS_BPM) bpm *= 2;
+  return bpm;
+}
+
 function rhythmBlock(evidence: RankedPracticeEvidence, intensity: CoachIntensity): PracticeBlock {
-  // Seed the click track at the tempo the player actually struggled at when
-  // we have it (evidence.target.bpmEst, from their flagged session); otherwise
-  // fall back to an intensity-scaled generic starting tempo.
-  const detected = evidence.target.bpmEst;
+  // Seed the click track from the tempo the player actually struggled at when we
+  // have it, otherwise an intensity-scaled generic starting tempo.
+  const ceiling = intensity === 'advanced' ? 96 : intensity === 'balanced' ? 84 : 72;
+  const detected = foldToTactus(evidence.target.bpmEst);
   const startBpm = detected
-    ? Math.round(Math.min(160, Math.max(44, detected)))
+    // A drill is meant to sit under performance tempo, not at it.
+    ? Math.round(Math.min(ceiling, Math.max(44, detected * DRILL_TEMPO_FRACTION)))
     : intensity === 'advanced' ? 88 : intensity === 'balanced' ? 76 : 66;
   const minBpm = Math.max(40, startBpm - 30);
   const maxBpm = Math.min(176, startBpm + 40);
@@ -882,8 +921,8 @@ function maintenanceBlocks(intensity: CoachIntensity, weeklyGoalMinutes?: number
         'Keep the bow speed even so pitch and tone are judged from a stable sound.',
       ],
       target: { metricKey: 'pitchAccuracy', scaleName: 'G major' },
-      successCriteria: { summary: 'Complete the scale, keeping all but a note or two in tune.', repetitions: 1, centsThreshold: 12 },
-      evaluator: { evaluatorId: 'scale', scaleName: 'G major', centsThreshold: 12 },
+      successCriteria: { summary: 'Complete the scale, keeping all but a note or two in tune.', repetitions: 1, centsThreshold: centsFor(intensity) },
+      evaluator: { evaluatorId: 'scale', scaleName: 'G major', centsThreshold: centsFor(intensity) },
       coachPromptContext: 'Coach a maintenance scale for a player with no flagged issues; reinforce and gently extend.',
     },
   ];

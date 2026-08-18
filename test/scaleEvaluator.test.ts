@@ -56,28 +56,40 @@ function inTuneAttempts(sequence: string[], confidence = 0.8): ScaleAttempt[] {
   check('feedback flags the note-count mismatch', /heard 6 notes, expected 8/.test(result.feedback), result.feedback);
 }
 
-// ── one note slightly out of tune -> still passes (intonation, not a wrong note) ──
+// ── one note outside tolerance -> does not pass, and is named for a redo ─────
+// Passing a tuning drill means every note was in tune. The score stays generous
+// (it measures how close the take was); the pass does not. What makes that
+// reasonable is that the miss is named, so it can be drilled on its own instead
+// of costing a repeat of the whole scale.
 {
   const attempts = inTuneAttempts(G_MAJOR);
-  // 25 cents sharp: clearly still a B3, just not centered.
+  // 25 cents sharp: clearly still a B3, just not in tune.
   attempts[2] = { medianFreqHz: midiToFreq(noteNameToMidi('B3')!) * Math.pow(2, 25 / 1200), confidence: 0.8 };
   const result = evaluateScale(attempts, G_MAJOR, { centsThreshold: 12 });
-  check('a single slightly-flat/sharp note still passes the scale', result.passed === true, result.feedback);
-  check('feedback still credits the clean notes', /7 of 8 notes dead on/i.test(result.feedback), result.feedback);
+  check('a single out-of-tolerance note fails the scale', result.passed === false, result.feedback);
+  check('feedback names the note to redo', /B3/.test(result.feedback), result.feedback);
+  check('the score still reflects that the rest was good', (result.score?.score ?? 0) >= 90, result.feedback);
   check('and reports a score', /\d+\/100/.test(result.feedback), result.feedback);
 }
 
-// ── two slightly-off notes -> still a good scale, but it costs ─────────────
+// ── a note inside tolerance is clean, even if not dead centre ────────────────
 {
-  // Under the old fixed allowance this failed. That allowance is exactly what
-  // the holistic score replaced: two notes 25¢ sharp is a scale worth passing
-  // with something to polish, not a failure.
+  const attempts = inTuneAttempts(G_MAJOR);
+  // 9 cents sharp against a 12 cent tolerance — inside the bar, so it passes.
+  attempts[2] = { medianFreqHz: midiToFreq(noteNameToMidi('B3')!) * Math.pow(2, 9 / 1200), confidence: 0.8 };
+  const result = evaluateScale(attempts, G_MAJOR, { centsThreshold: 12 });
+  check('within tolerance still passes', result.passed === true, result.feedback);
+}
+
+// ── two off notes -> both named, and two cost more than one on the score ────
+{
   const attempts = inTuneAttempts(G_MAJOR);
   const sharp = (note: string) => midiToFreq(noteNameToMidi(note)!) * Math.pow(2, 25 / 1200);
   attempts[2] = { medianFreqHz: sharp('B3'), confidence: 0.8 };
   attempts[5] = { medianFreqHz: sharp('E4'), confidence: 0.8 };
   const result = evaluateScale(attempts, G_MAJOR, { centsThreshold: 12 });
-  check('two slightly-off notes still pass', result.passed === true, result.feedback);
+  check('two out-of-tolerance notes fail', result.passed === false, result.feedback);
+  check('and both are named for redoing', /B3/.test(result.feedback) && /E4/.test(result.feedback), result.feedback);
 
   const oneOff = inTuneAttempts(G_MAJOR);
   oneOff[2] = { medianFreqHz: sharp('B3'), confidence: 0.8 };

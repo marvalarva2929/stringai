@@ -161,18 +161,6 @@ export function forceTestCrash(): void {
   api.crash(api.getCrashlytics());
 }
 
-/**
- * TEMPORARY — QA walkthrough checkpoint. Fires a uniquely-labeled non-fatal
- * (via reportError, which already mirrors to GA4 as app_error) at a chosen
- * milestone screen, so a manual walkthrough can be cross-checked against
- * Crashlytics afterward. Remove all call sites and this function once the
- * Firebase Analytics/Crashlytics verification pass is done.
- */
-export function qaCheckpoint(label: string): void {
-  if (!isDev) return;
-  reportError(new Error(`QA checkpoint: ${label}`), 'qa_checkpoint', { checkpoint: label });
-}
-
 let rejectionTrackingInstalled = false;
 
 /**

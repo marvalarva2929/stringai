@@ -182,24 +182,37 @@ console.log('detectFigures');
   check('a neighbouring crossing is still detected',
     detectFigures(adjacent, phrasesFor(adjacent), null, []).some((f) => f.kind === 'crossing_run'));
 
-  // Shift — same string, position change.
-  const shiftNotes = notesFrom([69, 71, 76, 78], (midi, i) => ({
-    string: 'A' as const,
-    positionGroup: i >= 2 ? ('third' as const) : ('first' as const),
+  // Shift — genuinely needs the hand to move. High on the E string, where
+  // there is no higher string to cross onto.
+  const E = 76;
+  const shiftNotes = notesFrom([E, E + 2, E + 4, E + 5, E + 7, E + 9, E + 11], () => ({
+    string: 'E' as const,
   }));
   const shiftFigures = detectFigures(shiftNotes, phrasesFor(shiftNotes), null, []);
   const shift = shiftFigures.find((f) => f.kind === 'shift');
-  check('shift detected', shift != null, kinds(shiftFigures).join(','));
-  check('shift names both positions',
-    shift?.shift?.fromPosition === 'first' && shift?.shift?.toPosition === 'third');
+  check('a real shift is detected', shift != null, kinds(shiftFigures).join(','));
+  check('shift names where the hand went',
+    shift?.shift?.fromPosition === 'first' && shift?.shift?.toPosition !== 'first',
+    `${shift?.shift?.fromPosition} → ${shift?.shift?.toPosition}`);
 
-  // A position change across strings is a crossing, not a shift.
-  const crossPosition = notesFrom([69, 76], (midi, i) => ({
-    string: i === 0 ? ('A' as const) : ('E' as const),
-    positionGroup: i === 0 ? ('first' as const) : ('third' as const),
-  }));
-  check('cross-string position change is not a shift',
-    !detectFigures(crossPosition, phrasesFor(crossPosition), null, []).some((f) => f.kind === 'shift'));
+  // The reported false positive: B4 then C5 on the A string are 1st and 2nd
+  // finger in first position. Bucketing by absolute pitch put them either side
+  // of a band boundary and called it a shift.
+  const noShift = notesFrom([71, 72, 71, 72], () => ({ string: 'A' as const }));
+  check('adjacent fingers in one position are not a shift',
+    !detectFigures(noShift, phrasesFor(noShift), null, []).some((f) => f.kind === 'shift'),
+    JSON.stringify(detectFigures(noShift, phrasesFor(noShift), null, [])
+      .filter((f) => f.kind === 'shift').map((f) => f.shift)));
+
+  // And the descending form, which is what the player actually saw reported.
+  const noShiftDown = notesFrom([72, 71, 72, 71], () => ({ string: 'A' as const }));
+  check('and not in the other direction either',
+    !detectFigures(noShiftDown, phrasesFor(noShiftDown), null, []).some((f) => f.kind === 'shift'));
+
+  // Crossing to the next string is not a shift — the hand never moves.
+  const crossNotShift = notesFrom([69, 71, 74, 76], () => ({ string: 'A' as const }));
+  check('crossing strings is not reported as a shift',
+    !detectFigures(crossNotShift, phrasesFor(crossNotShift), null, []).some((f) => f.kind === 'shift'));
 
   // Sustained — one long note.
   const held = notesFrom([62, 69, 62], (midi, i) => ({ durationSeconds: i === 1 ? 2.5 : 0.4 }));

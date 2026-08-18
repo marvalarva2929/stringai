@@ -33,7 +33,6 @@ import { PRIVACY_POLICY_URL, TERMS_OF_SERVICE_URL } from '../../constants/links'
 import { AnalyticsEvent, type PaywallSource } from '../../constants/analyticsEvents';
 import { track, trackBeginCheckout, trackPurchase } from '../../services/analytics';
 import { errorReason } from '../../lib/analyticsUserProps';
-import { qaCheckpoint } from '../../services/crashReporting';
 import {
   paywallCopyFromMetadata,
   diagnosticFocusTitle,
@@ -292,7 +291,6 @@ export function PaywallView({
         return;
       }
       purchasedRef.current = true;
-      qaCheckpoint('paywall_purchase_success'); // TEMPORARY — QA walkthrough checkpoint
       applyCustomerInfo(info);
       // A fresh purchase is a new reason to ask for an account, even if a
       // past sign-out deferred the wall — see clearAccountDeferred.

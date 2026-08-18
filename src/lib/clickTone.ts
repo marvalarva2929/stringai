@@ -27,8 +27,9 @@
  *
  *   • Resonance is the thing to avoid, and Q is the dial. A high-Q bandpass on noise
  *     is very nearly a sine wave and puts the pitch back: at Q=12 the damage rises to
- *     41 bent frames on the corpus below, against 11 at the Q=2 shipped here. Raising
- *     CLICK_Q to make the tick more tuned/pitched trades directly against detectability.
+ *     41 bent frames on the corpus below, against 11 at Q=2 and 4 at the Q=0.4 shipped
+ *     here. Raising CLICK_Q to make the tick more tuned/pitched trades directly against
+ *     detectability — see CLICK_Q for the measured clarity-vs-Q curve.
  *
  * Measured against the fixture corpus with the click mixed in at the recording's own
  * peak level (a louder metronome than any real take), summed over 12 takes /
@@ -76,8 +77,29 @@ export const CLICK_SAMPLE_RATE = 22050;
 export const CLICK_DURATION_S = 0.014;
 /** Centre of the woodblock body. Mid-range so it reads as a metronome, not a hiss. */
 const CLICK_BODY_HZ = 1400;
-/** Bandpass sharpness. Higher = more tuned and more detectable; see the header. */
-const CLICK_Q = 2.0;
+/**
+ * Bandpass sharpness. Higher = more tuned and more detectable; see the header.
+ *
+ * Lowered from 2.0 when the detector stopped bailing out on windows that never
+ * dip below YIN's absolute threshold (services/dsp.ts now falls back to the
+ * global minimum, matching the native tuner, because bailing out was dropping
+ * most real playing). The click had been surviving only on that bail-out: it is
+ * not periodic enough to trip the threshold, but its resonant body does carry
+ * enough clarity to win a global-minimum search.
+ *
+ * Peak clarity of the click across beat phases, measured through detectPitches
+ * over a 4s track at 208 bpm — the gate is CLARITY_GATE = 0.55:
+ *
+ *   Q     0.707   0.6    0.5    0.45   0.4
+ *   peak  0.58    0.57   0.56   0.55   none voiced
+ *
+ * Broadband noise floors around 0.50 clarity no matter what, so the usable
+ * margin is narrow and Q has to come well down to clear it. 0.4 also happens to
+ * be the quietest setting on the corpus (4 phantom frames, 76 bent, against 36
+ * and 126 at Q=2.0), and a broader filter gives a sharper attack transient —
+ * easier to play to, not harder.
+ */
+const CLICK_Q = 0.4;
 /** Exponential amplitude decay, in nepers/second. */
 const CLICK_DECAY = 300;
 const CLICK_PEAK = 0.9;
@@ -102,10 +124,10 @@ export function renderClick(): Float32Array {
   const out = new Float32Array(n);
   const rand = mulberry32(CLICK_NOISE_SEED);
 
-  // White noise through a biquad bandpass (constant skirt gain), then an exponential
-  // decay: a struck-woodblock shape. The bandpass gives it a definite pitch centre to
-  // the ear without the sustained periodicity a detector needs — at Q=2 the impulse
-  // response has died away long before YIN's 1024-sample window could find a period.
+  // White noise through a biquad bandpass (constant peak gain), then an exponential
+  // decay: a struck-woodblock shape. The bandpass gives it a pitch centre to the ear
+  // without the periodicity a detector needs — at Q=0.4 the impulse response is broad
+  // enough that no window, at any beat phase, clears the voicing gate. See CLICK_Q.
   const w0 = 2 * Math.PI * CLICK_BODY_HZ / CLICK_SAMPLE_RATE;
   const alpha = Math.sin(w0) / (2 * CLICK_Q);
   const a0 = 1 + alpha;

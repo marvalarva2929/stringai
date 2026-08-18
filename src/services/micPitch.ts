@@ -17,6 +17,7 @@ interface MicPitchNativeModule {
   start: () => Promise<void>;
   stop: () => Promise<void>;
   forceSpeaker: () => Promise<void>;
+  configureMeasurementSession: () => Promise<void>;
   addListener: (event: 'onPitch', listener: (e: PitchReading) => void) => EventSubscription;
 }
 
@@ -77,5 +78,25 @@ export async function forceSpeakerOutput(): Promise<void> {
     await mod.forceSpeaker();
   } catch {
     // Best-effort — a quiet click beats a failed take.
+  }
+}
+
+/**
+ * Puts the shared audio session into the same measurement mode the streaming
+ * tuner uses, so a take recorded by expo-av is captured off the same unprocessed
+ * signal the tuner reads. Without this, iOS applies AGC and noise suppression to
+ * the graded clip only — see MicPitchModule.startEngine, which documents that
+ * this processing makes detected pitch drift under a sustained tone.
+ *
+ * Best-effort: a take recorded through iOS's processing chain is still gradeable,
+ * just less faithful, and that beats failing to record at all.
+ */
+export async function configureMeasurementSession(): Promise<void> {
+  const mod = getModule();
+  if (!mod) return;
+  try {
+    await mod.configureMeasurementSession();
+  } catch {
+    // Non-fatal, see above.
   }
 }

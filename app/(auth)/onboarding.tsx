@@ -16,7 +16,6 @@ import { haptic } from '../../src/lib/haptics';
 import { colors, spacing } from '../../src/constants/theme';
 import { track } from '../../src/services/analytics';
 import { AnalyticsEvent } from '../../src/constants/analyticsEvents';
-import { qaCheckpoint } from '../../src/services/crashReporting';
 import { GOAL_TIERS } from '../../src/lib/weeklyGoal';
 import {
   STEP_COPY,
@@ -26,6 +25,7 @@ import {
   VIOLIN_SIZES,
   ACCESSORIES,
 } from '../../src/constants/onboardingContent';
+import { useTechniqueSkillStore } from '../../src/store/useTechniqueSkillStore';
 
 // Step machine: an ordered list of step ids rendered via switch. Every step
 // after the welcome intro carries a choice or an action (cards, a
@@ -52,6 +52,9 @@ export default function Onboarding() {
   const step: StepId = STEPS[stepIndex];
 
   const { setOnboardingComplete, setPlayerCategory, setWeeklyGoal } = useAuthStore();
+  // Set from the experience answer, so the first practice plan is already in
+  // positions the player can actually finger. See useTechniqueSkillStore.
+  const setThirdPosition = useTechniqueSkillStore((st) => st.setThirdPosition);
   const {
     learningGoals,
     toggleLearningGoal,
@@ -145,7 +148,6 @@ export default function Onboarding() {
       reminder_enabled: reminderEnabled,
       ms_total: Date.now() - startedAt.current,
     });
-    qaCheckpoint('onboarding_complete'); // TEMPORARY — QA walkthrough checkpoint
 
     setOnboardingComplete();
     // Land on the real home screen, with activation armed — the walkthrough
@@ -196,11 +198,21 @@ export default function Onboarding() {
 
       case 'experience':
         return (
-          <StepShell title={STEP_COPY.experience.title} subtitle={STEP_COPY.experience.subtitle}>
+          <StepShell
+            title={STEP_COPY.experience.title}
+            subtitle={STEP_COPY.experience.subtitle}
+            footnote={STEP_COPY.experience.footnote}
+          >
             <OptionCards
               options={EXPERIENCE_LEVELS}
               selectedIds={experienceId ? [experienceId] : []}
-              onToggle={setExperienceId}
+              onToggle={(id) => {
+                setExperienceId(id);
+                // Whether drills may leave first position rides on this answer
+                // rather than a question of its own — see EXPERIENCE_LEVELS.
+                const level = EXPERIENCE_LEVELS.find((l) => l.id === id);
+                if (level) setThirdPosition(level.canShift ? 'yes' : 'no');
+              }}
             />
           </StepShell>
         );
@@ -286,10 +298,13 @@ export default function Onboarding() {
 function StepShell({
   title,
   subtitle,
+  footnote,
   children,
 }: {
   title: string;
   subtitle: string;
+  /** Small line under the options explaining what the answer is used for. */
+  footnote?: string;
   children: React.ReactNode;
 }) {
   const insets = useSafeAreaInsets();
@@ -302,6 +317,7 @@ function StepShell({
       <Text style={styles.stepTitle}>{title}</Text>
       <Text style={styles.stepSubtitle}>{subtitle}</Text>
       {children}
+      {footnote && <Text style={styles.stepFootnote}>{footnote}</Text>}
     </ScrollView>
   );
 }
@@ -343,6 +359,14 @@ const styles = StyleSheet.create({
     color: colors.text.primary,
     textAlign: 'center',
     marginBottom: 4,
+  },
+  stepFootnote: {
+    fontSize: 13,
+    color: colors.text.muted,
+    textAlign: 'center',
+    marginTop: spacing.lg,
+    paddingHorizontal: spacing.md,
+    lineHeight: 18,
   },
   stepSubtitle: {
     fontSize: 14,

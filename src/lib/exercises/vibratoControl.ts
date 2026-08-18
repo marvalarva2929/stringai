@@ -82,9 +82,9 @@ export function generateVibratoControl(ctx: ExerciseContext): PracticeBlock | nu
     estimatedMinutes: 6,
     coachIntensity: ctx.intensity,
     instructions: [
-      `Set ${fingerLabel(usableFinger)} on ${noteName} (${str} string) and check the pitch straight, with no vibrato at all. Vibrato around a note that's already flat just makes a flat note wobble.`,
+      `Check ${noteName} (${str} string) straight first, no vibrato.`,
       copy.how,
-      `On the take, hold ${noteName} for two bows of about ${seconds}s each. The recording stops on its own — keep the oscillation going right through.`,
+      `Then hold it for two bows of about ${seconds}s each.`,
     ],
     target: {
       metricKey: 'vibrato',

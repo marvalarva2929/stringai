@@ -71,9 +71,8 @@ export function generateBowDistribution(ctx: ExerciseContext): PracticeBlock | n
     estimatedMinutes: 5,
     coachIntensity: ctx.intensity,
     instructions: [
-      `Find the zone first without playing: put the bow on open ${str} at ${ZONE_LABEL[zone]} and just rest there. That's where every stroke in this drill starts and ends.`,
+      `${reps} slow strokes on open ${str}, using only ${ZONE_LABEL[zone]}.`,
       ZONE_ADVICE[zone],
-      `On the take, play ${reps} slow strokes using only that third of the bow. It will feel cramped — that's the habit resisting, not a mistake.`,
     ],
     target: {
       metricKey: 'bowDistribution',

@@ -16,6 +16,21 @@ import { fingeringFor } from './fingering';
 export const DEFAULT_SEQUENCE_BPM = 60;
 
 /**
+ * Bounds every paced drill's click actually runs at.
+ *
+ * These live here rather than in the runner screen because generators write
+ * tempo into their own instruction copy. When the two disagreed, a drill printed
+ * "the click marks each note (190 BPM)" while the click played at 132 — so the
+ * arithmetic the exercise explained to the player was simply wrong.
+ */
+export const MIN_SEQUENCE_BPM = 34;
+export const MAX_SEQUENCE_BPM = 132;
+
+export function clampSequenceBpm(bpm: number): number {
+  return Math.max(MIN_SEQUENCE_BPM, Math.min(MAX_SEQUENCE_BPM, Math.round(bpm)));
+}
+
+/**
  * The paced note sequence a take expects, or [] when the drill isn't paced.
  * `scale` is kept as the derived-from-a-name special case so plans persisted
  * before generated sequences existed still run.

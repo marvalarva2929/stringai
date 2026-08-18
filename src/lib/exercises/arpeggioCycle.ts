@@ -73,9 +73,8 @@ export function generateArpeggioCycle(ctx: ExerciseContext): PracticeBlock | nul
     bpm: tempoFor(ctx.intensity),
     estimatedMinutes: octaves > 1 ? 7 : 5,
     instructions: [
-      `${spec.label} is ${spec.role}. Play it once slowly on your own and listen for how the chord sits inside ${key.name}.`,
-      'On the take, the metronome gives you one click per note. Stop the bow cleanly between notes so each one gets judged on its own.',
-      'Aim for the note to ring against the open strings — a chord tone in tune makes the instrument resonate.',
+      `${spec.label}, one note per click.`,
+      'Stop the bow cleanly between notes.',
     ],
     successSummary: `Play the ${spec.label} arpeggio in time, keeping all but a note or two in tune.`,
     fallbackCriteria: `If note detection is uncertain, play ${spec.label} slowly against a drone on ${key.name.split(' ')[0]} and hold each chord tone for two full bows.`,

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import {
   ScrollView,
   View,
@@ -27,7 +27,6 @@ import { track } from '../../src/services/analytics';
 import { AnalyticsEvent } from '../../src/constants/analyticsEvents';
 import { errorReason } from '../../src/lib/analyticsUserProps';
 import { useTechniqueSkillStore } from '../../src/store/useTechniqueSkillStore';
-import { qaCheckpoint } from '../../src/services/crashReporting';
 import { haptic } from '../../src/lib/haptics';
 import { FeedbackSheet } from '../../src/components/ui/FeedbackSheet';
 
@@ -62,10 +61,6 @@ export default function SettingsScreen() {
   const { isAuthenticated, signOut: clearAuth } = useAuthStore();
   const { entitlement, applyCustomerInfo } = useEntitlementStore();
   const { enabled: remindersEnabled, hour: reminderHour, minute: reminderMinute } = useReminderStore();
-
-  useEffect(() => {
-    qaCheckpoint('settings_view'); // TEMPORARY — QA walkthrough checkpoint
-  }, []);
 
   const reminderValue = remindersEnabled
     ? new Date(2000, 0, 1, reminderHour, reminderMinute).toLocaleTimeString(undefined, {

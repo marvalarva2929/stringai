@@ -53,9 +53,8 @@ export function generateTrillChain(ctx: ExerciseContext): PracticeBlock | null {
     estimatedMinutes: 5,
     coachIntensity: ctx.intensity,
     instructions: [
-      `${fingerPhrase}. Play them slowly as separate notes first, so the ${intervalName} is in your ear before it gets fast.`,
-      `On the take, trill exactly ${alternations} times, evenly. Count them out loud if it helps — the count is the point, not the speed.`,
-      'The trilling finger lifts clear of the string each time. A finger that only half releases makes the two notes blur into one, which is the fault this drill catches.',
+      `${fingerPhrase}.`,
+      `Trill exactly ${alternations} times, evenly. Count, don't rush.`,
     ],
     target: {
       metricKey: 'pitchAccuracy',

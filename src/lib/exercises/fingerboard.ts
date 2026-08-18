@@ -24,16 +24,56 @@ export type PositionName = 'first' | 'third' | 'fifth' | 'seventh';
 
 /**
  * Semitones above the open string at which each position's 1st finger sits.
- * G string: 1st→A3 (+2), 3rd→C4 (+5), 5th→D4 (+7), 7th→F4 (+10).
+ *
+ * Positions are counted in diatonic steps up the string, so the 1st finger
+ * climbs one scale degree per position:
+ *
+ *   position   1    2    3    4    5     6      7
+ *   semitones  +2  +3/4  +5   +7   +9  +10/11  +12
+ *
+ * G string: 1st→A3 (+2), 3rd→C4 (+5), 5th→E4 (+9), 7th→G4 (+12).
+ * A string: 1st→B4 (+2), 3rd→D5 (+5), 5th→F#5 (+9), 7th→A5 (+12).
+ *
+ * `fifth` and `seventh` were previously +7 and +10, which are 4th and 6th
+ * position — so a drill labelled "5th position" on the A string was asking for
+ * E5, the 4th-position note, and telling the player the wrong hand position to
+ * put it in. Only the labels were wrong; `first` and `third` were always right.
  */
 export const POSITION_BASE: Record<PositionName, number> = {
   first: 2,
   third: 5,
-  fifth: 7,
-  seventh: 10,
+  fifth: 9,
+  seventh: 12,
 };
 
 export const POSITION_ORDER: PositionName[] = ['first', 'third', 'fifth', 'seventh'];
+
+/**
+ * Highest position a generated drill may ask for.
+ *
+ * `canShift` is derived from exactly one question — "have you been taught to
+ * shift into THIRD position?" (useTechniqueSkillStore) — and a single yes to
+ * that must not authorise fifth or seventh. It did: on the A string a ladder
+ * built from evidence of fifth-position playing asked a player to go B4 → E5,
+ * a 1st-to-5th shift, on the strength of a third-position answer. A player who
+ * has just learned third will invent a fingering for that and practise it.
+ *
+ * Raise this only alongside a question that actually asks about the position.
+ */
+export const HIGHEST_GENERATED_POSITION: PositionName = 'third';
+
+/** Positions a generator may plan in, given what the app has actually asked. */
+export const GENERATABLE_POSITIONS: PositionName[] = POSITION_ORDER.slice(
+  0,
+  POSITION_ORDER.indexOf(HIGHEST_GENERATED_POSITION) + 1,
+);
+
+/** Pulls a position down to the highest one the player has been asked about. */
+export function clampPosition(position: PositionName): PositionName {
+  const limit = POSITION_ORDER.indexOf(HIGHEST_GENERATED_POSITION);
+  const index = POSITION_ORDER.indexOf(position);
+  return index > limit ? POSITION_ORDER[limit] : position;
+}
 
 /** Highest note this model will ask for on a string — 7th position, 4th finger. */
 const MAX_SEMITONES_ABOVE_OPEN = 16;

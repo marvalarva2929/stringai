@@ -22,7 +22,7 @@ import {
   completedBlockIdsFor,
   nextIncompleteBlock,
 } from '../../src/store/usePracticeProgressStore';
-import { buildRunnerSteps, targetLine, coachHint, toneCue } from '../../src/lib/practiceCopy';
+import { buildRunnerSteps, targetLine, toneCue } from '../../src/lib/practiceCopy';
 import { EvidencePanel } from '../../src/components/practice/EvidencePanel';
 import { ThirdPositionGate } from '../../src/components/practice/ThirdPositionGate';
 import { useTechniqueSkillStore } from '../../src/store/useTechniqueSkillStore';
@@ -31,7 +31,6 @@ import { usePracticeAttemptStore, scoreHistoryFor, type ScoreHistory } from '../
 import { useAnalysisStore } from '../../src/store/useAnalysisStore';
 import { DepthButton } from '../../src/components/practice/DepthButton';
 import { PracticeGraphic } from '../../src/components/practice/PracticeGraphic';
-import { SignalTiles } from '../../src/components/practice/SignalTiles';
 import { CoachBubble } from '../../src/components/practice/CoachBubble';
 import { haptic } from '../../src/lib/haptics';
 import { colors, spacing, radius } from '../../src/constants/theme';
@@ -50,7 +49,7 @@ import { useSequencePreview } from '../../src/hooks/useSequencePreview';
 import { useAttemptCompare } from '../../src/hooks/useAttemptCompare';
 import { useTakeLiveFeedback } from '../../src/hooks/useTakeLiveFeedback';
 import { isMicPitchAvailable, startMicPitch, stopMicPitch } from '../../src/services/micPitch';
-import { sequenceStepsFor, sequenceBpmFor, DEFAULT_SEQUENCE_BPM } from '../../src/lib/sequenceSteps';
+import { sequenceStepsFor, sequenceBpmFor, DEFAULT_SEQUENCE_BPM, clampSequenceBpm } from '../../src/lib/sequenceSteps';
 import { noteNameToMidi } from '../../src/lib/pitchNaming';
 import { CALIBRATION_ENABLED } from '../../src/constants/featureFlags';
 import { track } from '../../src/services/analytics';
@@ -58,6 +57,21 @@ import { AnalyticsEvent } from '../../src/constants/analyticsEvents';
 import { createStopwatch } from '../../src/lib/analyticsTiming';
 
 type Phase = 'intro' | 'reps' | 'take' | 'judging' | 'result';
+
+/**
+ * TODO(exercise-sfx): sound effects for the drill loop.
+ *
+ * The loop currently gives haptics and colour but is silent, and the moments
+ * that would carry a sound are already well defined: a note landing clean in
+ * the repair drill (app/practice/repair.tsx), a note cleared, a take passing,
+ * and the tempo ladder stepping up. Duolingo-ish, and this loop has the same
+ * shape — short, repeated, pass/fail.
+ *
+ * Worth doing as its own pass rather than incrementally: it needs one small set
+ * of samples voiced consistently, a mute setting that respects the silent
+ * switch, and care not to collide with the metronome click or the reference
+ * tone, both of which are already playing during a take.
+ */
 
 export default function PracticeLessonScreen() {
   const params = useLocalSearchParams<{ id?: string; sessionId?: string; pieceId?: string }>();
@@ -387,6 +401,27 @@ function PracticeLessonContent({
               onSlower={() => { nudgeTempo(-BPM_STEP); retake(); }}
               onPass={advanceToNext}
               onRetry={retake}
+              onRepair={(targets) =>
+                router.push({
+                  pathname: '/practice/repair',
+                  params: {
+                    notes: targets.map((t) => t.note).join(','),
+                    // Positional: blank where the miss was the first note played.
+                    from: targets.map((t) => t.from ?? '').join(','),
+                    // Only some evaluators grade pitch; the repair screen falls
+                    // back to its own default when this is absent.
+                    cents: String(
+                      block.evaluator && 'centsThreshold' in block.evaluator
+                        ? block.evaluator.centsThreshold
+                        : '',
+                    ),
+                    // Block ids contain a colon (slug:evidenceId), so the way
+                    // back is params on the [id] route — never a built path.
+                    blockId: block.id,
+                    ...scopeParams,
+                  },
+                })
+              }
             />
           )}
         </Animated.View>
@@ -447,12 +482,10 @@ function IntroPhase({
 
         <CoachBubble
           tone="dark"
-          message={`Listen for ${toneCue(block)}. I'll walk you through the reps, then grade the take.`}
+          message={`Listen for ${toneCue(block)}, then record — I'll grade every note.`}
         />
 
         <TuneNoteRow block={block} />
-
-        <SignalTiles signals={block.liveMode.signals} />
       </ScrollView>
 
       <View style={[s.bottomBar, s.resultBar, { paddingBottom: Math.max(insets.bottom, spacing.sm) }]}>
@@ -562,15 +595,19 @@ function RepsPhase({
   return (
     <>
       <ScrollView style={s.scroll} contentContainerStyle={s.content} showsVerticalScrollIndicator={false}>
+        {/* Everything here has to earn its place: this is the screen standing
+            between the player and playing, and it should not scroll. What was
+            removed and why — a 260px graphic that said nothing the title didn't,
+            a coach bubble of generic advice ("keep it slow"), a row of pills
+            naming the signals the block listens to (not actionable, not
+            interactive), and a callout that restated the instructions. */}
         <View style={s.lessonHeader}>
-          <Text style={s.lessonKicker}>{block.subtitle}</Text>
           <Text style={s.lessonTitle}>{block.title}</Text>
           <Text style={s.lessonTarget}>{targetLine(block)}</Text>
-          <Text style={s.lessonNote}>{block.successCriteria.summary}</Text>
         </View>
 
         <View style={s.stage}>
-          <PracticeGraphic type={block.type} size={260} pulseKey={stepIndex} />
+          <PracticeGraphic type={block.type} size={140} pulseKey={stepIndex} />
         </View>
 
         <Animated.View
@@ -579,28 +616,21 @@ function RepsPhase({
           exiting={FadeOutLeft.duration(120)}
           style={s.stepPanel}
         >
-          <View style={s.stepTop}>
-            <View style={s.stepIcon}>
-              <Ionicons name={step.icon as any} size={20} color={colors.brand[700]} />
+          {step.bodyLines.map((line, i) => (
+            <View key={i} style={s.stepLine}>
+              <Text style={s.stepBullet}>{i + 1}</Text>
+              <Text style={s.stepBody}>{line}</Text>
             </View>
-            <Text style={s.stepEyebrow}>{step.eyebrow}</Text>
-          </View>
-          <Text style={s.stepTitle}>{step.title}</Text>
-          <Text style={s.stepBody}>{step.body}</Text>
-          <View style={s.callout}>
-            <FontAwesome6 name="bullseye" size={15} color="#166534" />
-            <Text style={s.calloutText}>{step.callout}</Text>
-          </View>
+          ))}
         </Animated.View>
 
-        <CoachBubble tone="dark" message={coachHint(block, stepIndex, coach)} />
-        {/* Also here, not just on the intro: this is the last chance to hear the
-            exercise before the take starts. */}
+        <Text style={s.lessonNote}>{block.successCriteria.summary}</Text>
+
+        {/* Last chance to hear the exercise, and to tune, before the take. */}
         {previewSteps.length > 0 && (
           <PreviewRow steps={previewSteps} bpm={previewBpm} />
         )}
         <TuneNoteRow block={block} />
-        <SignalTiles signals={block.liveMode.signals} />
       </ScrollView>
 
       <View style={[s.bottomBar, { paddingBottom: Math.max(insets.bottom, spacing.sm) }]}>
@@ -622,11 +652,6 @@ const MIN_PREP_MS = 4000;
 
 /** How far one tap moves a sequence drill's tempo. */
 const BPM_STEP = 6;
-const MIN_SEQUENCE_BPM = 34;
-const MAX_SEQUENCE_BPM = 132;
-function clampSequenceBpm(bpm: number): number {
-  return Math.max(MIN_SEQUENCE_BPM, Math.min(MAX_SEQUENCE_BPM, Math.round(bpm)));
-}
 
 function beatMsFor(bpm: number): number {
   return Math.round(60000 / bpm);
@@ -828,7 +853,7 @@ function TakePhase({
       const granted = await requestMicPermission();
       if (!granted) { setPermissionDenied(true); return; }
       try {
-        recordingRef.current = await startTakeRecording((dbfs) => {
+        const started = await startTakeRecording((dbfs) => {
           if (dbfs < PLAYING_DBFS) return;
           lastSoundAtRef.current = Date.now();
           if (!heardPlayingRef.current) {
@@ -836,13 +861,19 @@ function TakePhase({
             setHeardPlaying(true);
           }
         });
+        recordingRef.current = started.recording;
+        // The recorder's own start instant, not "whenever this resolved" — beat
+        // times below are expressed relative to it, so any slack here would land
+        // on the player's timing score as lateness. See StartedTake.startedAtMs.
+        recordingStartedAtRef.current = started.startedAtMs;
       } catch {
         setPermissionDenied(true);
         return;
       }
+    } else {
+      recordingStartedAtRef.current = Date.now();
     }
 
-    recordingStartedAtRef.current = Date.now();
     beatTimestampsRef.current = [];
     setRecording(true);
     setElapsed(0);
@@ -920,20 +951,34 @@ function TakePhase({
     if (usesMetronome) metronome.stop();
     setRecording(false);
 
-    // Release the mic tap before touching the recorder: stopping it deactivates
-    // the shared audio session, which would interrupt an in-flight recording.
-    if (liveActive) {
+    // Releasing the mic tap deactivates the shared AVAudioSession
+    // (MicPitchModule.stopEngine ends with setActive(false)), so it has to happen
+    // *after* the recorder has been stopped and its file finalized. The previous
+    // order released the tap first — which is the very hazard the comment here
+    // used to warn about — and could truncate the tail of the WAV the evaluators
+    // then graded.
+    const releaseLiveTap = async () => {
+      if (!liveActive) return;
       setLiveActive(false);
       await stopMicPitch();
-    }
+    };
 
-    if (canRecordCamera) return; // TakeCameraCapture fires onCaptured on the active→false edge
+    if (canRecordCamera) {
+      // TakeCameraCapture fires onCaptured on the active→false edge
+      await releaseLiveTap();
+      return;
+    }
 
     if (canRecordAudio && recordingRef.current) {
       const rec = recordingRef.current;
       recordingRef.current = null;
+      let uri: string | null = null;
       try {
-        const uri = await stopTakeRecording(rec);
+        uri = await stopTakeRecording(rec);
+      } finally {
+        await releaseLiveTap();
+      }
+      try {
         const wav = uri ? await decodeWavFile(uri) : null;
         onCaptured(wav ? {
           samples: wav.samples,
@@ -946,6 +991,7 @@ function TakePhase({
       return;
     }
 
+    await releaseLiveTap();
     onCaptured(null);
   };
 
@@ -1206,7 +1252,9 @@ function ScoreCard({ score, history }: { score: SequenceScore; history: ScoreHis
         <Text style={[s.scoreValue, { color }]}>{score.score}</Text>
         <View style={s.scoreOf}>
           <Text style={s.scoreOfText}>out of 100</Text>
-          <Text style={s.scoreBar}>{score.passMark} to pass</Text>
+          {/* The score is the gradient; the gate is every note in tune. Showing
+              "65 to pass" beside a score of 80 that did not pass reads as a bug. */}
+          <Text style={s.scoreBar}>{score.cleanCount}/{score.expectedCount} in tune</Text>
         </View>
       </View>
 
@@ -1253,6 +1301,7 @@ function ResultPhase({
   scoreHistory,
   onPass,
   onRetry,
+  onRepair,
 }: {
   block: PracticeBlock;
   insets: ReturnType<typeof useSafeAreaInsets>;
@@ -1270,6 +1319,8 @@ function ResultPhase({
   scoreHistory?: ScoreHistory | null;
   onPass: () => void;
   onRetry: () => void;
+  /** Opens the per-note repair drill. Absent when the block isn't note-graded. */
+  onRepair?: (targets: RepairTarget[]) => void;
 }) {
   const bottomInset = Math.max(insets.bottom, spacing.sm);
   const isRhythm = block.evaluator?.evaluatorId === 'rhythm';
@@ -1294,6 +1345,7 @@ function ResultPhase({
   }
 
   const gaugeCents = highlightCents(evaluation);
+  const misses = onRepair ? repairableNotes(evaluation) : [];
   // Rhythm swaps the generic evaluator sentence for a one-line tempo call and
   // the note-name/cents chips for a plain-language early/late/missed list —
   // both are meaningless for a click-track drill.
@@ -1318,7 +1370,19 @@ function ResultPhase({
           {breakdown}
         </View>
         <View style={[s.bottomBar, { paddingBottom: bottomInset }]}>
-          <DepthButton label="Continue" icon="arrow-forward" onPress={onPass} />
+          {/* An adaptive tempo ladder that raises the tempo and then moves to a
+              different exercise never lets the player play the tempo it just
+              earned them — and the headline above has already said "let's pick
+              it up to N BPM", so leaving is the one thing that reads as a bug.
+              Climbing is the default; moving on stays one tap away. */}
+          {isRhythm && tempoDirection === 'up' && nextTempo != null ? (
+            <>
+              <DepthButton label={`Again at ${nextTempo} BPM`} icon="play" onPress={onRetry} />
+              <DepthButton label="Continue" icon="arrow-forward" variant="neutral" onPress={onPass} />
+            </>
+          ) : (
+            <DepthButton label="Continue" icon="arrow-forward" onPress={onPass} />
+          )}
         </View>
       </View>
     );
@@ -1358,7 +1422,22 @@ function ResultPhase({
         {breakdown}
       </View>
       <View style={[s.bottomBar, s.resultBar, { paddingBottom: bottomInset }]}>
-        <DepthButton label="Try again" icon="refresh" onPress={onRetry} />
+        {/* Repair comes first when we know exactly which notes missed. Passing
+            needs every note in tune, so "try again" alone would mean replaying
+            the notes that were already fine to get back to the two that weren't. */}
+        {misses.length > 0 && (
+          <DepthButton
+            label={misses.length === 1 ? `Fix ${misses[0].note}` : `Fix ${misses.length} notes`}
+            icon="build"
+            onPress={() => onRepair?.(misses)}
+          />
+        )}
+        <DepthButton
+          label="Try again"
+          icon="refresh"
+          variant={misses.length > 0 ? 'neutral' : 'primary'}
+          onPress={onRetry}
+        />
         {/* The moment a slower tempo is actually wanted. Offering it only in
             the intro means the player has to fail, back out, and come back. */}
         {slowerTempo != null && onSlower && (
@@ -1372,6 +1451,35 @@ function ResultPhase({
       </View>
     </View>
   );
+}
+
+/**
+ * Notes the take missed, in the order they were played.
+ *
+ * Only meaningful for per-note drills: a scale knows which degree was flat, a
+ * bow-camera block does not. Undetected notes are excluded — there is nothing to
+ * drill against when the mic never heard the note at all, and sending someone to
+ * repair a note the app failed to record would blame them for its own gap.
+ */
+interface RepairTarget {
+  note: string;
+  /**
+   * The note played immediately before it in the sequence, if any.
+   *
+   * Carried through so the repair drill can drill the *interval* and not just
+   * the note: in the passage the player never arrives at this pitch from
+   * silence, they arrive from here.
+   */
+  from: string | null;
+}
+
+function repairableNotes(evaluation: PracticeEvaluation | null): RepairTarget[] {
+  const notes = evaluation?.score?.notes;
+  if (!notes) return [];
+  return notes
+    .map((n, i) => ({ n, from: i > 0 ? notes[i - 1].label : null }))
+    .filter(({ n }) => !n.clean && n.centsDeviation != null && n.label)
+    .map(({ n, from }) => ({ note: n.label, from: from || null }));
 }
 
 /**
@@ -1583,8 +1691,21 @@ const s = StyleSheet.create({
     backgroundColor: colors.brand[50],
   },
   stepEyebrow: { color: colors.brand[700], fontSize: 12, fontWeight: '900', textTransform: 'uppercase', letterSpacing: 0.5 },
+  stepLine: { flexDirection: 'row', gap: spacing.sm, alignItems: 'flex-start' },
+  stepBullet: {
+    fontSize: 12,
+    fontWeight: '900',
+    color: colors.brand[700],
+    backgroundColor: colors.brand[50],
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    textAlign: 'center',
+    lineHeight: 20,
+    overflow: 'hidden',
+  },
   stepTitle: { color: colors.text.primary, fontSize: 24, fontWeight: '900' },
-  stepBody: { color: colors.text.secondary, fontSize: 15, lineHeight: 22 },
+  stepBody: { flex: 1, color: colors.text.secondary, fontSize: 15, lineHeight: 22 },
   callout: {
     flexDirection: 'row',
     alignItems: 'center',

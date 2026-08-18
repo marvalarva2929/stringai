@@ -5,6 +5,7 @@
  */
 
 import { runEvaluator } from '../src/lib/runEvaluator';
+import { renderClick, CLICK_SAMPLE_RATE } from '../src/lib/clickTone';
 import type { PitchLandingEvaluatorParams, VibratoEvaluatorParams, RhythmEvaluatorParams } from '../src/lib/practiceBlocks';
 
 let failures = 0;
@@ -39,6 +40,19 @@ function synthTone(freqHz: number, durS: number, sr = SR): Float32Array {
 
 function silence(durS: number, sr = SR): Float32Array {
   return new Float32Array(Math.floor(sr * durS));
+}
+
+function resample(src: Float32Array, from: number, to: number): Float32Array {
+  if (from === to) return src;
+  const n = Math.round((src.length * to) / from);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = (i * from) / to;
+    const i0 = Math.floor(x);
+    const frac = x - i0;
+    out[i] = (src[i0] ?? 0) * (1 - frac) + (src[i0 + 1] ?? 0) * frac;
+  }
+  return out;
 }
 
 function concat(parts: Float32Array[]): Float32Array {
@@ -156,16 +170,23 @@ function synthClick(durS = 0.15, sr = SR): Float32Array {
 }
 
 // ── rhythm: the metronome's own click must not count as the player's note ───
+//
+// There is deliberately no click-frequency filter to test: lib/clickTone.ts
+// documents at length why the ±35¢ notch around 1000 Hz was removed and must not
+// come back (when the click lands on top of a note — the common case, since both
+// are on the beat — YIN reports a frequency pulled *between* the two, which no
+// notch can see). The invariant is that the shipped click is aperiodic enough
+// that the pitch detector never voices it, so it cannot enter the voiced-run
+// segmentation this path uses. That is what gets asserted here, with the real
+// click rather than a stand-in.
 {
-  // Beats at 0s, 1s, 2s. Only the metronome's own click appears near each
-  // beat — no real playing at all. Before the click-frequency filter, this
-  // would misread as three perfectly-on-time hits.
-  const take = concat([
-    synthClick(), silence(1.0 - 0.15),
-    synthClick(), silence(1.0 - 0.15),
-    synthClick(), silence(0.3),
-  ]);
-  const result = runEvaluator(rhythmParams({ beatCount: 3 }), { samples: take, sampleRate: SR, beatTimestamps: [0, 1, 2] });
+  const click = resample(renderClick(), CLICK_SAMPLE_RATE, SR);
+  const bed = new Float32Array(Math.round(SR * 3.3));
+  for (const beat of [0, 1, 2]) {
+    const off = Math.round(beat * SR);
+    for (let i = 0; i < click.length && off + i < bed.length; i++) bed[off + i] += click[i];
+  }
+  const result = runEvaluator(rhythmParams({ beatCount: 3 }), { samples: bed, sampleRate: SR, beatTimestamps: [0, 1, 2] });
   check(
     'metronome click bleed alone is not counted as an on-time hit',
     result !== null && result.successCount === 0,
@@ -174,14 +195,83 @@ function synthClick(durS = 0.15, sr = SR): Float32Array {
 }
 
 {
-  // A genuine note landing 20ms after the beat, with no click in this
-  // fixture — confirms the filter doesn't also swallow real attempts.
+  // A sustained *tonal* click would leak — 150ms of pure 1kHz sine is 150 cycles
+  // of a periodic signal, and no amount of downstream filtering fixes that. This
+  // records the hazard so the reason CLICK_Q is held low stays visible: it is the
+  // only thing keeping the click out of this path.
+  const take = concat([
+    synthClick(), silence(1.0 - 0.15),
+    synthClick(), silence(1.0 - 0.15),
+    synthClick(), silence(0.3),
+  ]);
+  const result = runEvaluator(rhythmParams({ beatCount: 3 }), { samples: take, sampleRate: SR, beatTimestamps: [0, 1, 2] });
+  check(
+    'a tonal click DOES leak — why clickTone.ts keeps Q low rather than filtering',
+    result !== null && result.successCount > 0,
+    `successCount=${result?.successCount} (expected > 0, documenting the hazard)`,
+  );
+}
+
+{
+  // A genuine note landing 20ms after the beat, with no click in this fixture —
+  // confirms keeping the click out doesn't also swallow real attempts.
   const take = concat([silence(1.02), synthTone(440, 0.3)]);
   const result = runEvaluator(rhythmParams({ beatCount: 1 }), { samples: take, sampleRate: SR, beatTimestamps: [1.0] });
   check(
     'a genuine note near the beat is still detected as an on-time attempt',
     result !== null && result.successCount === 1,
     `successCount=${result?.successCount}, feedback=${result?.feedback}`,
+  );
+}
+
+// ── onsets come from the envelope, not from gaps in the pitch track ──────────
+//
+// Onsets used to be the start of each voiced pitch run, which silently required
+// ~150ms of SILENCE between notes. Real playing does not stop dead: keep the bow
+// on the string and every note in the take merges into one run, so eight notes
+// at 80 BPM produced a single onset and the drill reported no attack near any
+// click. A bow change re-attacks the envelope even when pitch never stops.
+{
+  const BPM = 80;
+  const PERIOD = 60 / BPM;
+  const BEATS = 6;
+  const LAG = 0.04; // played a consistent 40ms after each click
+
+  /** `floor` > 0 means the note decays toward a level rather than to silence. */
+  function playedTake(floor: number): Float32Array {
+    const n = Math.ceil(SR * (PERIOD * BEATS + 0.4));
+    const out = new Float32Array(n);
+    for (let b = 0; b < BEATS; b++) {
+      const start = Math.floor((b * PERIOD + LAG) * SR);
+      for (let i = 0; i < Math.floor(SR * PERIOD); i++) {
+        const idx = start + i;
+        if (idx >= n) break;
+        const t = i / SR;
+        const attack = Math.min(1, t / 0.015);
+        const body = t < 0.45 ? 1 : Math.exp(-(t - 0.45) / 0.05);
+        out[idx] += 0.3 * attack * Math.max(body, floor) * (Math.sin(2 * Math.PI * 440 * t) * 0.6
+          + Math.sin(2 * Math.PI * 880 * t) * 0.3);
+      }
+    }
+    return out;
+  }
+
+  const beats = Array.from({ length: BEATS }, (_, i) => i * PERIOD);
+  const params = rhythmParams({ beatCount: BEATS });
+
+  const detached = runEvaluator(params, { samples: playedTake(0), sampleRate: SR, beatTimestamps: beats });
+  check(
+    'detached playing lands every click',
+    detached !== null && detached.successCount === BEATS,
+    `successCount=${detached?.successCount}/${BEATS}`,
+  );
+
+  // The regression: with the bow left on the string the pitch track never breaks.
+  const legato = runEvaluator(params, { samples: playedTake(0.03), sampleRate: SR, beatTimestamps: beats });
+  check(
+    'a bow that stays on the string still lands every click',
+    legato !== null && legato.successCount === BEATS,
+    `successCount=${legato?.successCount}/${BEATS} — notes merged into one voiced run`,
   );
 }
 

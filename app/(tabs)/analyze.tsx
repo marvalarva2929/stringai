@@ -22,7 +22,7 @@ import { CameraView, useCameraPermissions, useMicrophonePermissions } from 'expo
 import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import { Directory, File, Paths } from 'expo-file-system';
-import { router, useNavigation } from 'expo-router';
+import { router, useNavigation, useLocalSearchParams } from 'expo-router';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useAnalysisStore } from '../../src/store/useAnalysisStore';
 import { useAuthStore } from '../../src/store/useAuthStore';
@@ -79,7 +79,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useCalibrationStore } from '../../src/store/useCalibrationStore';
 import { CALIBRATION_ENABLED } from '../../src/constants/featureFlags';
 import { track } from '../../src/services/analytics';
-import { breadcrumb, reportError, qaCheckpoint } from '../../src/services/crashReporting';
+import { breadcrumb, reportError } from '../../src/services/crashReporting';
 import { AnalyticsEvent } from '../../src/constants/analyticsEvents';
 import type {
   AnalysisDegradedReason,
@@ -536,13 +536,14 @@ function RadarChart({ metrics }: { metrics: import('../../src/types/analysis').M
   );
 }
 
+// Checklist, not prose: this is read at a glance while holding a violin.
 const UPLOAD_TIPS = [
-  'Ensure the entire violin — from scroll to tailpiece — remains fully visible throughout the recording.',
-  'Keep your left wrist in frame at all times to allow accurate technique analysis.',
-  'Maintain the bow within the frame for the majority of your bow strokes.',
-  'Remain in a consistent position and orientation throughout the recording.',
-  'Record in a quiet environment with minimal background noise for optimal pitch analysis.',
-  'Ensure the violin is clearly and consistently audible in the recording.',
+  'Whole violin in frame, scroll to tailpiece',
+  'Left wrist visible throughout',
+  'Bow in frame for most strokes',
+  'Stay in one position',
+  'Quiet room',
+  'Violin clearly audible',
 ];
 
 const METHOD_DEPTH = 5;
@@ -596,6 +597,10 @@ export default function AnalyzeScreen() {
     setPhase, setSelectedPiece, setRecordingUri, setResult, setError, reset,
     addToHistory, addToMetricHistory, cacheSessionResult, continueWithPiece,
   } = useAnalysisStore();
+  // 'pick' = arrived by tapping a piece card, 'new' = arrived via "New piece".
+  // Absent when this tab was opened directly or by first-run activation.
+  const { from: entryPoint } = useLocalSearchParams<{ from?: 'pick' | 'new' }>();
+  const cameFromPicker = entryPoint === 'pick' || entryPoint === 'new';
   const { profile } = useUserStore();
   const { isAuthenticated, playerCategory, weeklyGoalMinutes } = useAuthStore();
   const { entitlement } = useEntitlementStore();
@@ -999,7 +1004,19 @@ export default function AnalyzeScreen() {
 
   // ── Step 2: Method select ──────────────────────────────────
 
+  /**
+   * "Back" has two correct destinations depending on how the screen was reached.
+   *
+   * Arriving from a piece card on /practice/pick, the naming form is not where
+   * the user came from and not somewhere they asked to go — the picker is. But
+   * arriving via "New piece" (or first-run activation, which routes here
+   * directly), the naming form IS the previous step. `from` tells them apart.
+   */
   const handleBackToInput = () => {
+    if (entryPoint === 'pick') {
+      router.back();
+      return;
+    }
     setPhase('piece_input');
   };
 
@@ -1553,7 +1570,6 @@ export default function AnalyzeScreen() {
         will_fetch_coaching: willFetchCoaching,
         saved_remote: savedRemote,
       });
-      qaCheckpoint('analysis_completed'); // TEMPORARY — QA walkthrough checkpoint
 
       perfTrace.attribute('outcome', 'completed');
       perfTrace.attribute('degraded', degraded ?? 'none');
@@ -1693,28 +1709,6 @@ export default function AnalyzeScreen() {
 
   // ── Step 1: Piece input ────────────────────────────────────
   if (phase === 'piece_input') {
-    const query = songName.trim().toLowerCase();
-    const filteredSessions = sessionHistory.filter((s) => {
-      if (!query) return true;
-      const title = (s.piece?.title ?? '').toLowerCase();
-      return title.includes(query);
-    });
-    const hasSessions = sessionHistory.length > 0;
-
-    // Group sessions by piece title
-    const sessionGroups: { title: string; composer?: string; sessions: typeof filteredSessions }[] = [];
-    const titleMap = new Map<string, number>();
-    for (const s of filteredSessions) {
-      const key = s.piece?.title ?? TECHNIQUE_PIECE.title;
-      const displayTitle = key;
-      if (titleMap.has(key)) {
-        sessionGroups[titleMap.get(key)!].sessions.push(s);
-      } else {
-        titleMap.set(key, sessionGroups.length);
-        sessionGroups.push({ title: displayTitle, composer: s.piece?.composer, sessions: [s] });
-      }
-    }
-
     return (
       <RAnimated.View entering={FadeInRight.duration(220)} style={{ flex: 1 }}>
         <SafeAreaView style={styles.setupSafe}>
@@ -1729,15 +1723,21 @@ export default function AnalyzeScreen() {
                 keyboardShouldPersistTaps="handled"
                 showsVerticalScrollIndicator={false}
               >
-                {/* Title */}
-                <Text style={styles.setupTitle}>Start Practice{'\n'}Session</Text>
+                {/* Reached from the picker, so it needs a way back to it. Absent
+                    on first run, where this screen is the start of the flow. */}
+                {cameFromPicker && (
+                  <Pressable onPress={() => router.back()} hitSlop={12} style={styles.setupBack}>
+                    <Ionicons name="chevron-back" size={26} color={colors.text.secondary} />
+                  </Pressable>
+                )}
+                <Text style={styles.setupTitle}>New piece</Text>
 
-                {/* Search box */}
+                {/* Name field */}
                 <View style={styles.searchBox} {...pieceSpotlight}>
-                  <Ionicons name="search" size={20} color={colors.text.muted} style={styles.searchIcon} />
+                  <Ionicons name="musical-notes-outline" size={20} color={colors.text.muted} style={styles.searchIcon} />
                   <TextInput
                     style={styles.searchInput}
-                    placeholder="Search or name a piece…"
+                    placeholder="Name the piece"
                     placeholderTextColor={colors.text.muted}
                     value={songName}
                     onChangeText={setSongName}
@@ -1792,54 +1792,12 @@ export default function AnalyzeScreen() {
                   <Pressable style={styles.sheetMusicBtn} onPress={handleUploadSheetMusic}>
                     <Ionicons name="document-text-outline" size={22} color={colors.text.muted} />
                     <View>
-                      <Text style={styles.sheetMusicBtnTitle}>Add Sheet Music</Text>
-                      <Text style={styles.sheetMusicBtnSub}>Optional — upload a PDF for better analysis</Text>
+                      <Text style={styles.sheetMusicBtnTitle}>Add sheet music</Text>
+                      <Text style={styles.sheetMusicBtnSub}>Optional</Text>
                     </View>
                   </Pressable>
                 )}
 
-                {/* Previous sessions — grouped by piece */}
-                {hasSessions && (
-                  <>
-                    <Text style={styles.prevSessionsLabel}>or continue a previous session</Text>
-                    {sessionGroups.map(({ title, composer, sessions: group }) => (
-                      <View key={title} style={styles.sessionGroup}>
-                        <View style={styles.sessionGroupHeader}>
-                          <Ionicons name="musical-note" size={14} color={colors.brand[600]} />
-                          <Text style={styles.sessionGroupTitle} numberOfLines={1}>{title}</Text>
-                          {composer && <Text style={styles.sessionGroupComposer} numberOfLines={1}>{composer}</Text>}
-                        </View>
-                        {group.map((s) => {
-                          const dateStr = new Date(s.recordedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-                          return (
-                            <Pressable
-                              key={s.id}
-                              style={({ pressed }) => [styles.prevCard, pressed && { opacity: 0.85 }]}
-                              onPress={() => {
-                                haptic.light();
-                                // Sessions recorded before naming was required
-                                // have no piece; adopt the technique bucket so
-                                // continuing one still lands somewhere.
-                                continueWithPiece(
-                                  s.piece ? { ...s.piece, source: 'manual' as const } : TECHNIQUE_PIECE,
-                                );
-                              }}
-                            >
-                              <View style={styles.prevCardText}>
-                                <Text style={styles.prevCardTitle}>{dateStr}</Text>
-                              </View>
-                              <Text style={styles.prevCardScore}>{s.overallScore}</Text>
-                              <Ionicons name="chevron-forward" size={16} color={colors.text.muted} />
-                            </Pressable>
-                          );
-                        })}
-                      </View>
-                    ))}
-                    {sessionGroups.length === 0 && query.length > 0 && (
-                      <Text style={styles.noResultsText}>No previous sessions match — tap Next to start a new one.</Text>
-                    )}
-                  </>
-                )}
               </ScrollView>
 
               {/* Bottom: Next (needs a name) + the one non-piece bucket */}
@@ -1847,7 +1805,7 @@ export default function AnalyzeScreen() {
                 <BigButton label="Next →" onPress={handleNext} disabled={!songName.trim()} />
                 <Pressable style={styles.techniqueBtn} onPress={handleTechniqueSession}>
                   <Ionicons name="barbell-outline" size={16} color={colors.text.secondary} />
-                  <Text style={styles.techniqueLabel}>Not a piece — scales and technique</Text>
+                  <Text style={styles.techniqueLabel}>Scales &amp; technique</Text>
                 </Pressable>
               </View>
             </View>
@@ -1882,7 +1840,7 @@ export default function AnalyzeScreen() {
             <Pressable style={styles.drawerOverlay} onPress={() => setShowUploadTips(false)}>
               <Pressable style={styles.tipsDrawer} onPress={() => {}}>
                 <View style={styles.tipsDrawerHandle} />
-                <Text style={styles.tipsDrawerTitle}>Tips for an Accurate Analysis</Text>
+                <Text style={styles.tipsDrawerTitle}>Before you upload</Text>
                 {UPLOAD_TIPS.map((tip, i) => (
                   <View key={i} style={styles.tipRow}>
                     <View style={styles.tipBullet}>
@@ -2160,9 +2118,7 @@ export default function AnalyzeScreen() {
           {/* Landscape callout */}
           <View style={styles.landscapeCallout}>
             <Text style={styles.landscapeCalloutTitle}>Hold phone in landscape</Text>
-            <Text style={styles.landscapeCalloutBody}>
-              Rotate your phone sideways before recording — landscape captures your full arm reach in frame.
-            </Text>
+            <Text style={styles.landscapeCalloutBody}>It captures your full arm reach.</Text>
           </View>
 
           {/* Callout tips */}
@@ -2540,42 +2496,6 @@ const styles = StyleSheet.create({
     fontSize: 18,
     color: colors.text.primary,
   },
-  prevSessionsLabel: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: colors.text.muted,
-    textTransform: 'uppercase',
-    letterSpacing: 0.8,
-    marginTop: spacing.xs,
-  },
-  prevCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#fff',
-    borderRadius: 14,
-    paddingHorizontal: spacing.md,
-    paddingVertical: 14,
-    gap: spacing.sm,
-    borderWidth: 1.5,
-    borderColor: '#e5e7eb',
-    borderBottomWidth: 4,
-    borderBottomColor: '#d1d5db',
-  },
-  prevCardLeft: {
-    width: 32,
-    height: 32,
-    borderRadius: 8,
-    backgroundColor: colors.brand[50],
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  prevCardText: { flex: 1 },
-  prevCardTitle: { fontSize: 15, fontWeight: '700', color: colors.text.primary },
-  prevCardSub: { fontSize: 12, color: colors.text.muted, marginTop: 1 },
-  prevCardMeta: { alignItems: 'flex-end', gap: 2 },
-  prevCardScore: { fontSize: 15, fontWeight: '800', color: colors.brand[600] },
-  prevCardDate: { fontSize: 11, color: colors.text.muted },
-  noResultsText: { fontSize: 13, color: colors.text.muted, textAlign: 'center', paddingVertical: spacing.sm },
   setupBottom: {
     paddingHorizontal: spacing.lg,
     paddingTop: spacing.sm,
@@ -2678,6 +2598,7 @@ const styles = StyleSheet.create({
   dividerLabel: { fontSize: 13, color: colors.text.muted, fontWeight: '500' },
   tuneLink: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, paddingVertical: spacing.sm },
   tuneLinkText: { fontSize: 14, color: colors.brand[600], fontWeight: '600' },
+  setupBack: { alignSelf: 'flex-start', marginBottom: spacing.xs, marginLeft: -spacing.xs },
   backBtn: { alignItems: 'center', paddingVertical: spacing.sm },
   backLabel: { fontSize: 14, color: colors.text.muted, fontWeight: '500' },
   // Upload tips drawer
@@ -2726,26 +2647,6 @@ const styles = StyleSheet.create({
   tipBulletText: { fontSize: 11, fontWeight: '700', color: '#fff' },
   tipText: { flex: 1, fontSize: 14, color: 'rgba(255,255,255,0.9)', lineHeight: 20 },
   // Grouped sessions (piece_input)
-  sessionGroup: {
-    gap: 6,
-  },
-  sessionGroupHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    paddingHorizontal: 4,
-    paddingTop: spacing.xs,
-  },
-  sessionGroupTitle: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: colors.text.primary,
-    flex: 1,
-  },
-  sessionGroupComposer: {
-    fontSize: 12,
-    color: colors.text.muted,
-  },
 
   // Camera position guide
   cameraTipContent: {

@@ -138,8 +138,8 @@ export interface ToneFrameFeatures {
 /** Nearest-neighbour lookup of YIN periodicity/frequency for a given time. */
 function makePitchSampler(pitches: PitchFrame[]) {
   let ptr = 0;
-  return (t: number): { periodicity: number; frequency: number | null } => {
-    if (pitches.length === 0) return { periodicity: 0, frequency: null };
+  return (t: number): { periodicity: number; frequency: number | null; locked?: boolean } => {
+    if (pitches.length === 0) return { periodicity: 0, frequency: null, locked: false };
     while (ptr + 1 < pitches.length && pitches[ptr + 1].timestamp <= t) ptr++;
     // pick whichever of ptr / ptr+1 is closer in time
     let best = pitches[ptr];
@@ -147,7 +147,7 @@ function makePitchSampler(pitches: PitchFrame[]) {
         Math.abs(pitches[ptr + 1].timestamp - t) < Math.abs(best.timestamp - t)) {
       best = pitches[ptr + 1];
     }
-    return { periodicity: best.periodicity ?? 0, frequency: best.frequency };
+    return { periodicity: best.periodicity ?? 0, frequency: best.frequency, locked: best.locked };
   };
 }
 
@@ -186,7 +186,15 @@ export function extractToneFrameFeatures(
     for (let j = 0; j < FFT_SIZE && offset + j < samples.length; j++) sq += samples[offset + j] ** 2;
     const L = Math.sqrt(sq / FFT_SIZE);
 
-    const { periodicity, frequency: yinF0 } = samplePitch(t);
+    const { periodicity, frequency: sampledF0, locked } = samplePitch(t);
+    // Tone analysis needs "is this frame periodic?", not "what is the best pitch
+    // guess?". detectPitches now reports a pitch even when YIN found no dip below
+    // its absolute threshold (a global-minimum fallback, so the practice grader
+    // stops discarding real playing) — but on a genuinely noisy frame that
+    // fallback is an arbitrary lag. Treating it as a locked pitch would put a
+    // garbage f0 in place of the carried-forward one below, moving the harmonic
+    // and trough bins off the real partials and reading the noise floor as zero.
+    const yinF0 = locked === false ? null : sampledF0;
 
     if (maxMag < SILENCE_MAX_MAG) {
       out.push(emptyFrame(t, L));

@@ -110,7 +110,8 @@ export default function PieceDetailScreen() {
       <LinearGradient colors={[colors.brand[900], colors.brand[700]]} style={styles.header}>
         <Pressable onPress={() => router.back()} style={styles.backRow}>
           <Text style={styles.backArrow}>‹</Text>
-          <Text style={styles.backLabel}>Progress</Text>
+          {/* Reachable from Home as well as Progress, so it can't name a tab. */}
+          <Text style={styles.backLabel}>Back</Text>
         </Pressable>
         <Text style={styles.pieceTitle} numberOfLines={2}>{piece.title}</Text>
         {piece.composer && <Text style={styles.pieceComposer}>{piece.composer}</Text>}
