@@ -125,6 +125,7 @@
   "devDependencies": {
     "@babel/core": "^7.24.0",
     "@types/react": "~19.1.0",
+    "babel-preset-expo": "~54.0.12",
     "eslint": "^8.57.0",
     "eslint-config-expo": "~10.0.0",
     "openai": "^7.4.0",
