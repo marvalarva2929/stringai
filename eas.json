@@ -25,9 +25,11 @@
   "submit": {
     "production": {
       "ios": {
-        "appleId": "joshvigel@gmail.com",
         "ascAppId": "6801934738",
-        "appleTeamId": "TTKYKL258N"
+        "appleTeamId": "TTKYKL258N",
+        "ascApiKeyPath": "./keys/AuthKey_KGKKQYG5NW.p8",
+        "ascApiKeyId": "KGKKQYG5NW",
+        "ascApiKeyIssuerId": "52df3e4e-0911-4d99-8f18-ef9bbdaaef95"
       },
       "android": {
         "serviceAccountKeyPath": "./play-store-service-account.json",
