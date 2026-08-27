@@ -272,6 +272,44 @@ function PracticeLessonContent({
     setPhase('take');
   };
 
+  /**
+   * Leave this drill and move on without passing it.
+   *
+   * Beta feedback: the exercise loop had no way out of a drill you could not
+   * pass. "Not yet" offered try-again and nothing else, and "Couldn't judge
+   * that take" offered only try-again — so a player whose mic, camera or
+   * playing wasn't landing could retake forever and never reach the next block.
+   *
+   * The block is deliberately NOT marked complete and no attempt is logged: a
+   * skipped drill is unfinished work, and counting it as done would poison the
+   * did-the-drill-help join that advanceToNext exists to record. Excluding it
+   * from the nextIncompleteBlock search by id is what stops the plan handing
+   * the same block straight back.
+   */
+  const skipBlock = () => {
+    haptic.light();
+    track(AnalyticsEvent.PRACTICE_BLOCK_SKIP, {
+      scope: scope.kind,
+      block_id: block.id,
+      block_type: block.type,
+      ms: blockWatch.current.elapsed(),
+      retakes: retakeCount.current,
+    });
+    const nextBlock = nextIncompleteBlock(plan, [...completedIds, block.id]);
+    if (nextBlock) {
+      router.replace({ pathname: '/practice/[id]', params: { id: nextBlock.id, ...scopeParams } });
+    } else {
+      router.replace({ pathname: '/practice/plan', params: scopeParams });
+    }
+  };
+
+  /** Out of the practice flow entirely, from any phase. */
+  const exitPractice = () => {
+    haptic.light();
+    if (scope.kind === 'daily') router.replace('/(tabs)/train');
+    else router.replace({ pathname: '/practice/plan', params: scopeParams });
+  };
+
   const retake = () => {
     retakeCount.current += 1;
     track(AnalyticsEvent.PRACTICE_BLOCK_RETAKE, {
@@ -309,20 +347,17 @@ function PracticeLessonContent({
     <View style={s.root}>
       <SafeAreaView style={s.safe}>
         <View style={s.topBar}>
-          <Pressable style={s.roundBtn} onPress={back}>
+          <Pressable style={s.roundBtn} onPress={back} hitSlop={12} accessibilityLabel="Back">
             <Ionicons name="chevron-back" size={21} color="#fff" />
           </Pressable>
           <View style={s.progressTrack}>
             <View style={[s.progressFill, { width: `${Math.max(progress * 100, 4)}%` }]} />
           </View>
-          <Pressable
-            style={s.roundBtn}
-            onPress={() =>
-              scope.kind === 'daily'
-                ? router.replace('/(tabs)/train')
-                : router.replace({ pathname: '/practice/plan', params: scopeParams })
-            }
-          >
+          {/* The way out, from every phase including mid-take. hitSlop because
+              a 40pt circle in the corner is the control people reach for when
+              a drill has them stuck, and missing it is how a screen earns a
+              reputation for being hard to leave. */}
+          <Pressable style={s.roundBtn} onPress={exitPractice} hitSlop={12} accessibilityLabel="Exit practice">
             <Ionicons name="close" size={20} color="#fff" />
           </Pressable>
         </View>
@@ -401,6 +436,7 @@ function PracticeLessonContent({
               onSlower={() => { nudgeTempo(-BPM_STEP); retake(); }}
               onPass={advanceToNext}
               onRetry={retake}
+              onSkip={skipBlock}
               onRepair={(targets) =>
                 router.push({
                   pathname: '/practice/repair',
@@ -696,6 +732,10 @@ const MAX_TAKE_S = 30;
 // A camera take has no mic level to read, so it keeps a fixed window — shown as
 // a visible countdown so the player always knows how long they have.
 const CAMERA_TAKE_S = 15;
+// How long to wait for TakeCameraCapture to hand back the frames after a camera
+// take ends before giving up and delivering an empty one. Generous: this is a
+// backstop against the module never answering, not a deadline for normal work.
+const CAMERA_HANDOFF_TIMEOUT_MS = 5000;
 // Fallback window for a block that has no live signal to end itself on at all
 // (no mic tap, no camera, no click track) — still needs a visible, known end
 // instead of falling through to the silence watcher's blind no-input timeout.
@@ -813,11 +853,27 @@ function TakePhase({
   // until the take is graded to find out is far too late to fix it.
   const showLive = liveActive && !isRhythm && !canRecordCamera;
 
+  // A take is handed to the parent exactly once. The camera path can be
+  // answered by either TakeCameraCapture or the watchdog below, and a take
+  // delivered twice would judge, then re-judge, and land the player back on a
+  // spinner they had already left.
+  const deliveredRef = useRef(false);
+  const cameraWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const deliver = (take: CapturedTake | null) => {
+    if (deliveredRef.current) return;
+    deliveredRef.current = true;
+    if (cameraWatchdogRef.current) clearTimeout(cameraWatchdogRef.current);
+    cameraWatchdogRef.current = null;
+    onCaptured(take);
+  };
+
   const clearTimers = () => {
     if (timerRef.current) clearInterval(timerRef.current);
     if (checkRef.current) clearInterval(checkRef.current);
+    if (cameraWatchdogRef.current) clearTimeout(cameraWatchdogRef.current);
     timerRef.current = null;
     checkRef.current = null;
+    cameraWatchdogRef.current = null;
   };
 
   useEffect(() => {
@@ -838,6 +894,7 @@ function TakePhase({
   // `start()` so a scale take can insert a "get ready" countdown first.
   const beginTake = async () => {
     stoppedRef.current = false;
+    deliveredRef.current = false;
     heardPlayingRef.current = false;
     setHeardPlaying(false);
 
@@ -964,8 +1021,14 @@ function TakePhase({
     };
 
     if (canRecordCamera) {
-      // TakeCameraCapture fires onCaptured on the active→false edge
+      // TakeCameraCapture fires onCaptured on the active→false edge — which is
+      // the only thing that ends a camera take. If the native module never
+      // answers (module missing, capture already torn down), the screen would
+      // sit here with the take over, no spinner, and nothing to press. Hand up
+      // an empty take instead: the result screen says it couldn't judge it and
+      // offers a retake or a skip, both of which are ways forward.
       await releaseLiveTap();
+      cameraWatchdogRef.current = setTimeout(() => deliver(null), CAMERA_HANDOFF_TIMEOUT_MS);
       return;
     }
 
@@ -980,19 +1043,47 @@ function TakePhase({
       }
       try {
         const wav = uri ? await decodeWavFile(uri) : null;
-        onCaptured(wav ? {
+        deliver(wav ? {
           samples: wav.samples,
           sampleRate: wav.sampleRate,
           beatTimestamps: usesMetronome ? beatTimestampsRef.current : undefined,
         } : null);
       } catch {
-        onCaptured(null);
+        deliver(null);
       }
       return;
     }
 
     await releaseLiveTap();
-    onCaptured(null);
+    deliver(null);
+  };
+
+  /**
+   * Abandon a take that is counting in or already running and go back to the
+   * idle "Start take" screen.
+   *
+   * Beta feedback: every recording state was a state with no visible way out —
+   * the bottom bar only existed when `recording` was false, so a paced take,
+   * a count-in, or a silence watcher that never fired left the player with
+   * nothing to press.
+   */
+  const cancelTake = async () => {
+    stoppedRef.current = true;
+    deliveredRef.current = true;   // nothing from this take reaches the evaluator
+    clearTimers();
+    if (usesMetronome) metronome.stop();
+    setPreparing(false);
+    setCountdown(0);
+    setRecording(false);
+    // Same ordering rule as stop(): finalize the recorder before releasing the
+    // mic tap, which deactivates the shared audio session.
+    const rec = recordingRef.current;
+    recordingRef.current = null;
+    if (rec) await stopTakeRecording(rec).catch(() => {});
+    if (liveActive) {
+      setLiveActive(false);
+      await stopMicPitch().catch(() => {});
+    }
   };
 
   // The metronome auto-stops one beat after the last note (giving time to
@@ -1084,6 +1175,9 @@ function TakePhase({
                 : 'Get your bow and hand in position — recording starts automatically.'}
           </Text>
         </View>
+        <View style={[s.bottomBar, { paddingBottom: Math.max(insets.bottom, spacing.sm) }]}>
+          <DepthButton label="Cancel" icon="close" variant="neutral" onPress={() => { void cancelTake(); }} />
+        </View>
       </View>
     );
   }
@@ -1094,7 +1188,7 @@ function TakePhase({
         <View style={StyleSheet.absoluteFillObject}>
           <TakeCameraCapture
             active={recording}
-            onCaptured={(result) => onCaptured({ rawBowFrames: result.bowFrames })}
+            onCaptured={(result) => deliver({ rawBowFrames: result.bowFrames })}
           />
         </View>
       )}
@@ -1194,11 +1288,18 @@ function TakePhase({
         )}
       </View>
 
-      {!recording && (
-        <View style={[s.bottomBar, { paddingBottom: Math.max(insets.bottom, spacing.sm) }]}>
+      {/* Always a bar, in both states. A recording take used to render none at
+          all: an open-ended take ended on silence, a paced one on the click,
+          and when neither fired the screen had no control on it whatsoever.
+          "Stop take" ends it early and still submits what was played; the
+          cancel above throws the take away. */}
+      <View style={[s.bottomBar, { paddingBottom: Math.max(insets.bottom, spacing.sm) }]}>
+        {recording ? (
+          <DepthButton label="Stop take" icon="stop" variant="neutral" onPress={() => { void stop(); }} />
+        ) : (
           <DepthButton label="Start take" icon="mic" onPress={start} />
-        </View>
-      )}
+        )}
+      </View>
     </View>
   );
 }
@@ -1215,7 +1316,23 @@ function JudgingPhase({
 }) {
   useEffect(() => {
     // A tick lets the spinner paint before the (synchronous) scoring work runs.
-    const timer = setTimeout(() => onJudged(runEvaluator(block.evaluator, take)), 250);
+    const timer = setTimeout(() => {
+      try {
+        onJudged(runEvaluator(block.evaluator, take));
+      } catch {
+        // An evaluator that throws used to leave this spinner up for good:
+        // the error escaped the timer callback, onJudged never ran, and the
+        // phase never moved off 'judging'. Report it as an unjudgeable take —
+        // that screen offers a retake and a skip, both of which lead somewhere.
+        onJudged({
+          passed: false,
+          attempts: 0,
+          successCount: 0,
+          bestStreak: 0,
+          feedback: 'Something went wrong while scoring that take.',
+        });
+      }
+    }, 250);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1301,6 +1418,7 @@ function ResultPhase({
   scoreHistory,
   onPass,
   onRetry,
+  onSkip,
   onRepair,
 }: {
   block: PracticeBlock;
@@ -1319,6 +1437,8 @@ function ResultPhase({
   scoreHistory?: ScoreHistory | null;
   onPass: () => void;
   onRetry: () => void;
+  /** Moves on without passing. Every dead-end verdict must offer this. */
+  onSkip: () => void;
   /** Opens the per-note repair drill. Absent when the block isn't note-graded. */
   onRepair?: (targets: RepairTarget[]) => void;
 }) {
@@ -1402,8 +1522,12 @@ function ResultPhase({
           <Text style={s.takeTitle}>Couldn't judge that take</Text>
           <Text style={s.takeHint}>{block.fallbackCriteria}</Text>
         </View>
-        <View style={[s.bottomBar, { paddingBottom: bottomInset }]}>
+        <View style={[s.bottomBar, s.resultBar, { paddingBottom: bottomInset }]}>
           <DepthButton label="Try again" icon="refresh" onPress={onRetry} />
+          {/* This verdict means the app failed to hear or see the take, not
+              that the player failed it — so retake-forever must never be the
+              only door. */}
+          <DepthButton label="Skip this one" icon="play-forward" variant="neutral" onPress={onSkip} />
         </View>
       </View>
     );
@@ -1448,6 +1572,13 @@ function ResultPhase({
             onPress={onSlower}
           />
         )}
+        {/* Last, and quiet: a drill you can't pass today shouldn't hold the
+            whole plan hostage. A text link rather than a fourth 58pt button —
+            this bar can already carry three, and on a small screen a fourth
+            pushes the score off the top. It stays unfinished — see skipBlock. */}
+        <Pressable onPress={onSkip} hitSlop={10} style={s.skipLink}>
+          <Text style={s.skipLinkText}>Skip this one for now</Text>
+        </Pressable>
       </View>
     </View>
   );
@@ -1855,6 +1986,13 @@ const s = StyleSheet.create({
   resultBadgeWarn: { backgroundColor: '#fef3c7' },
   resultBadgeFail: { backgroundColor: '#fee2e2' },
   resultBar: { gap: spacing.sm },
+  skipLink: { alignSelf: 'center', paddingVertical: spacing.xs },
+  skipLinkText: {
+    color: 'rgba(255,255,255,0.6)',
+    fontSize: 14,
+    fontWeight: '700',
+    textDecorationLine: 'underline',
+  },
   rhythmMissList: { marginTop: spacing.md, alignItems: 'center', gap: 2 },
   rhythmMissRow: { color: 'rgba(255,255,255,0.75)', fontSize: 13, fontWeight: '700' },
   chipRow: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: spacing.xs, marginTop: spacing.md },

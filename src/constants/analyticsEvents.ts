@@ -73,6 +73,7 @@ export const AnalyticsEvent = {
   PRACTICE_BLOCK_COMPLETE: 'practice_block_complete',
   PRACTICE_BLOCK_RETAKE: 'practice_block_retake',
   PRACTICE_BLOCK_SKIP_TAKE: 'practice_block_skip_take',
+  PRACTICE_BLOCK_SKIP: 'practice_block_skip',
   PRACTICE_PLAN_COMPLETE: 'practice_plan_complete',
   PRACTICE_PLAN_ABANDONED: 'practice_plan_abandoned',
 

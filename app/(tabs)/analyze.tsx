@@ -1393,6 +1393,48 @@ export default function AnalyzeScreen() {
       }
       watch.split('video');
 
+      // The only gate on a live take.
+      //
+      // Nothing is asked of the player before they record any more (bow
+      // calibration is off — see CALIBRATION_ENABLED), so a take is never
+      // stopped on the way in. On the way out it is offered a redo in exactly
+      // one case: the take is completely empty — no notes heard, nobody in
+      // frame, no bow found. A take with *any* signal in it goes straight
+      // through and is scored on what it has, however thin.
+      //
+      // Even here the redo is an offer, not a wall: "see results anyway" is
+      // always available, because a player who has just played is a poor
+      // audience for the app insisting they didn't.
+      const emptyTake =
+        noteEvents.length === 0 &&
+        pipelinePoseFrames.length === 0 &&
+        pipelineBowFrames.length === 0;
+      if (emptyTake && source === 'record') {
+        const redo = await new Promise<boolean>((resolve) => {
+          Alert.alert(
+            'Nothing was picked up',
+            "That take had no sound and nobody in frame. Check the phone can see you and hear the violin, then record again — or look at the results as they are.",
+            [
+              { text: 'See results anyway', style: 'cancel', onPress: () => resolve(false) },
+              { text: 'Record again', onPress: () => resolve(true) },
+            ],
+            { cancelable: false },
+          );
+        });
+        if (redo) {
+          track(AnalyticsEvent.ANALYSIS_FAILED, {
+            stage: 'recording',
+            reason: 'empty_take',
+            source,
+            ms_elapsed: watch.elapsed(),
+          });
+          perfTrace.attribute('outcome', 'empty_take');
+          perfTrace.stop();
+          setPhase('camera_tip');
+          return;
+        }
+      }
+
       // Derive intonation analysis from the same note events — single source of truth.
       // If fuseSignals produces no events, intonation is undefined so feedback never
       // mentions notes that the debug log doesn't show (no pipeline divergence).

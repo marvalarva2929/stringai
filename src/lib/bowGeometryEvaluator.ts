@@ -2,6 +2,7 @@ import type { RawBowFrame } from '../types/signals';
 import type { BowCalibration } from '../types/calibration';
 import { deriveBowTimeSeries, applyCalibration, analyzeBowUsage, bowZoneLabel, type BowTimeSeries } from './bowAnalysis';
 import { evaluateBowControl, type BowControlSample, type PracticeEvaluation } from './practiceEvaluator';
+import { CALIBRATION_ENABLED } from '../constants/featureFlags';
 
 export type BowGeometrySignal = 'bowAngle' | 'bowContactPoint' | 'stringPos' | 'bowDistribution';
 
@@ -34,7 +35,11 @@ export function evaluateBowGeometry(
   calibration: BowCalibration | null,
   target: BowGeometryTarget,
 ): PracticeEvaluation {
-  if (CALIBRATION_REQUIRED.includes(target.signal) && !calibration) {
+  // Only refuse to grade while the calibration flow still exists to send them
+  // to. With CALIBRATION_ENABLED off there is no way to satisfy this gate, and
+  // returning UNCALIBRATED_EVALUATION would strand the player on "Couldn't
+  // judge that take" with no path forward — see app/practice/[id].tsx.
+  if (CALIBRATION_ENABLED && CALIBRATION_REQUIRED.includes(target.signal) && !calibration) {
     return UNCALIBRATED_EVALUATION;
   }
 
