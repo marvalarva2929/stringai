@@ -122,6 +122,15 @@ export function BowCalibrationFlow({
     return clip;
   };
 
+  /**
+   * Carry on without a calibration — what the old failure card's "Continue
+   * anyway" did, now the default for every soft failure. Both hosts supply it:
+   * the Analyze screen starts recording, /practice/calibrate returns to the
+   * drill. If neither is given there is nowhere to go, so the failure card
+   * stays as the fallback.
+   */
+  const continueUncalibrated = onSkip ?? onCancel;
+
   const startCalibration = async () => {
     if (runningRef.current) return;
     runningRef.current = true;
@@ -141,11 +150,22 @@ export function BowCalibrationFlow({
 
     const outcome = computeCalibration(clip1, clip2);
     if (isCalibrationError(outcome)) {
-      // Don't silently drop the player into recording — say what went wrong and
-      // let them choose. Continuing is still fine: bow metrics just fall back
-      // to their uncalibrated behaviour.
-      setError(outcome.error);
-      setStep('failed');
+      // One take, and then the player moves on. This used to stop on a
+      // "Couldn't get a clean bow-position reading…" card for any of six
+      // reasons, and in beta it hit far more often than it didn't — so the
+      // step that was meant to sharpen bow metrics became the step that stood
+      // between the player and recording anything at all.
+      //
+      // Now only a completely empty capture — the camera never found a bow in
+      // either clip — asks for a redo. Every other outcome continues: bow
+      // metrics fall back to their uncalibrated behaviour, which is exactly
+      // what "Continue anyway" did on the old failure card, minus the card.
+      if (outcome.nothingDetected || !continueUncalibrated) {
+        setError(outcome.error);
+        setStep('failed');
+        return;
+      }
+      continueUncalibrated();
       return;
     }
 

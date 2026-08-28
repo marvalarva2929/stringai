@@ -121,12 +121,47 @@ function makeClippedClip(n: number, bowFraction: number, stringFraction: number,
   check('all-low-confidence clip → error', isCalibrationError(result), isCalibrationError(result) ? result.error : 'unexpectedly succeeded');
 }
 
+// ── soft vs hard: which rejections may stop the player ──────────────────────
+// Only a capture with no bow in it at all earns a redo prompt. Everything else
+// continues uncalibrated — the whole point of the beta fix, so it is asserted
+// here rather than left to the UI. See BowCalibrationFlow.
+{
+  const tooShort = computeCalibration(makeClip(3, 0.85, 0.85), makeClip(15, 0.15, 0.15));
+  check('too few samples is a SOFT failure — flow continues',
+    isCalibrationError(tooShort) && tooShort.nothingDetected === false,
+    isCalibrationError(tooShort) ? tooShort.error : 'unexpectedly succeeded');
+
+  const lowConf = computeCalibration(
+    makeClip(15, 0.85, 0.85).map((f) => ({ ...f, confidence: 0.1 })),
+    makeClip(15, 0.15, 0.15),
+  );
+  check('one unreadable clip is a SOFT failure — the other clip still saw a bow',
+    isCalibrationError(lowConf) && lowConf.nothingDetected === false,
+    isCalibrationError(lowConf) ? lowConf.error : 'unexpectedly succeeded');
+
+  const empty = computeCalibration([], []);
+  check('no bow in either clip → HARD failure, the one case that prompts a redo',
+    isCalibrationError(empty) && empty.nothingDetected === true,
+    isCalibrationError(empty) ? empty.error : 'unexpectedly succeeded');
+
+  const bothUnreadable = computeCalibration(
+    makeClip(15, 0.85, 0.85).map((f) => ({ ...f, confidence: 0.1 })),
+    makeClip(15, 0.15, 0.15).map((f) => ({ ...f, confidence: 0.1 })),
+  );
+  check('both clips unreadable → HARD failure',
+    isCalibrationError(bothUnreadable) && bothUnreadable.nothingDetected === true,
+    isCalibrationError(bothUnreadable) ? bothUnreadable.error : 'unexpectedly succeeded');
+}
+
 // ── degenerate: both positions read almost the same fraction ────────────────
 {
   const samePosition1 = makeClip(15, 0.5, 0.5);
   const samePosition2 = makeClip(15, 0.52, 0.5);
   const result = computeCalibration(samePosition1, samePosition2);
   check('near-identical positions → degenerate error', isCalibrationError(result), isCalibrationError(result) ? result.error : 'unexpectedly succeeded');
+  check('near-identical positions is a SOFT failure — flow continues',
+    isCalibrationError(result) && result.nothingDetected === false,
+    isCalibrationError(result) ? result.error : 'unexpectedly succeeded');
 }
 
 if (failures > 0) {

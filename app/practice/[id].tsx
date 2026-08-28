@@ -240,18 +240,38 @@ function PracticeLessonContent({
     }
   };
 
-  // Calibration is stubbed out (see CALIBRATION_ENABLED) — bowGeometry blocks
-  // run uncalibrated instead of detouring through /practice/calibrate.
+  /**
+   * Whether to detour a bowGeometry block through /practice/calibrate.
+   *
+   * `calibrationOffered` is what stops this being a loop. Calibration can now
+   * finish without producing a calibration — a capture the camera couldn't
+   * read cleanly continues uncalibrated rather than stopping the player (see
+   * BowCalibrationFlow) — and so can the Skip button. Both return here with
+   * the store still empty, and without this latch the next press of Start
+   * would send them straight back to calibrate, forever.
+   *
+   * One offer per block. Decline it, or have it come back empty, and the drill
+   * runs uncalibrated.
+   */
+  const calibrationOffered = useRef(false);
+  useEffect(() => { calibrationOffered.current = false; }, [block.id]);
+
   const needsCalibration = () =>
     CALIBRATION_ENABLED &&
+    !calibrationOffered.current &&
     block.evaluator?.evaluatorId === 'bowGeometry' &&
     !useCalibrationStore.getState().calibration;
+
+  const goCalibrate = () => {
+    calibrationOffered.current = true;
+    router.push('/practice/calibrate');
+  };
 
   const onPrimary = () => {
     haptic.light();
     if (phase === 'intro') {
       if (needsCalibration()) {
-        router.push('/practice/calibrate');
+        goCalibrate();
         return;
       }
       setPhase('reps');
@@ -266,7 +286,7 @@ function PracticeLessonContent({
     haptic.light();
     track(AnalyticsEvent.PRACTICE_BLOCK_SKIP_TAKE, { block_id: block.id, block_type: block.type });
     if (needsCalibration()) {
-      router.push('/practice/calibrate');
+      goCalibrate();
       return;
     }
     setPhase('take');

@@ -88,13 +88,17 @@ export const CALIBRATION_COPY = {
   },
 
   /**
-   * Shown when computeCalibration() rejects the captures. The specific reason
-   * comes from calibrationCompute.ts; this is just the frame around it.
+   * The one case that still stops the flow: the camera found no bow at all,
+   * in either clip. Every other computeCalibration() rejection now continues
+   * uncalibrated without showing anything — see BowCalibrationFlow.
+   *
+   * Kept deliberately blame-free. The player did the holds; it was the camera
+   * that came back empty, and the fix is where the phone is pointing.
    */
   failure: {
-    kicker: "Didn't catch that",
-    title: 'Calibration failed',
-    retry: 'Try again',
+    kicker: 'Nothing in frame',
+    title: "Couldn't see your bow",
+    retry: 'Run it again',
     /** Bow metrics fall back to uncalibrated behaviour — the take is still usable. */
     skip: 'Continue anyway',
   },

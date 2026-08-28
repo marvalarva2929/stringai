@@ -6,7 +6,6 @@
 
 import { evaluateBowGeometry } from '../src/lib/bowGeometryEvaluator';
 import { computeCalibration, isCalibrationError } from '../src/lib/calibrationCompute';
-import { CALIBRATION_ENABLED } from '../src/constants/featureFlags';
 import type { RawBowFrame } from '../src/types/signals';
 
 let failures = 0;
@@ -56,24 +55,14 @@ const calibration = (() => {
   check('bowAngle works without calibration', result.passed === true, result.feedback);
 }
 
-// ── stringPos / bowDistribution without calibration ──────────────────────────
-// The refusal is only correct while there is a calibration flow to send the
-// player to. With CALIBRATION_ENABLED off, blocking here would strand them on
-// "Couldn't judge that take" with no way to satisfy it, so the take is graded
-// uncalibrated instead. Asserting both sides keeps the flag and the evaluator
-// from drifting apart.
+// ── stringPos / bowDistribution: require calibration ─────────────────────────
 {
   const clip = makeClip(15, 0.5, 0.5);
   const stringResult = evaluateBowGeometry(clip, null, { signal: 'stringPos', minValue: 0, maxValue: 1, requiredGoodFraction: 0.7 });
-  const distResult = evaluateBowGeometry(clip, null, { signal: 'bowDistribution', minRobustRange: 0.5 });
+  check('stringPos without calibration → blocked, zero attempts', stringResult.passed === false && stringResult.attempts === 0);
 
-  if (CALIBRATION_ENABLED) {
-    check('stringPos without calibration → blocked, zero attempts', stringResult.passed === false && stringResult.attempts === 0);
-    check('bowDistribution without calibration → blocked, zero attempts', distResult.passed === false && distResult.attempts === 0);
-  } else {
-    check('stringPos without calibration → graded anyway, not a dead end', stringResult.attempts > 0, stringResult.feedback);
-    check('bowDistribution without calibration → graded anyway, not a dead end', distResult.attempts > 0, distResult.feedback);
-  }
+  const distResult = evaluateBowGeometry(clip, null, { signal: 'bowDistribution', minRobustRange: 0.5 });
+  check('bowDistribution without calibration → blocked, zero attempts', distResult.passed === false && distResult.attempts === 0);
 }
 
 // ── stringPos with calibration: a mid-range reading passes a wide lane ───────

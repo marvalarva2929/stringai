@@ -12,6 +12,19 @@ const MIN_FRACTION_SEPARATION = 0.1;
 
 export interface CalibrationError {
   error: string;
+  /**
+   * True only when the camera saw no bow whatsoever across *both* clips — no
+   * qualifying reading, not one frame.
+   *
+   * This is the line between "we can't calibrate from this" and "there was
+   * nothing to calibrate from". Everything short of the latter is a soft
+   * failure: the player did the take, the camera saw a bow, it just wasn't
+   * clean or separated enough to derive a scale from. Sending them back to do
+   * the holds again over that is what made calibration feel like a wall in
+   * beta, so BowCalibrationFlow continues uncalibrated instead and only ever
+   * asks for a redo when this flag is set.
+   */
+  nothingDetected: boolean;
 }
 
 function median(values: number[]): number {
@@ -38,20 +51,29 @@ export function computeCalibration(
 
   const cp1 = nonNull(series1.bowContactPoint.points.map((p) => p.v));
   const cp2 = nonNull(series2.bowContactPoint.points.map((p) => p.v));
-  if (cp1.length < MIN_QUALIFYING_SAMPLES) {
-    return { error: "Couldn't get a clean bow-position reading for position 1. Keep a clear section of the bow visible on the strings, then try again." };
-  }
-  if (cp2.length < MIN_QUALIFYING_SAMPLES) {
-    return { error: "Couldn't get a clean bow-position reading for position 2. Keep a clear section of the bow visible on the strings, then try again." };
-  }
-
   const sp1 = nonNull(series1.stringPos.points.map((p) => p.v));
   const sp2 = nonNull(series2.stringPos.points.map((p) => p.v));
+
+  // The one hard failure: the camera never found a bow in either clip. Any
+  // other outcome below is soft — see CalibrationError.nothingDetected.
+  if (cp1.length === 0 && cp2.length === 0 && sp1.length === 0 && sp2.length === 0) {
+    return {
+      error: "The camera didn't pick up a bow at all. Check the phone can see you and your bow, then run it again.",
+      nothingDetected: true,
+    };
+  }
+
+  if (cp1.length < MIN_QUALIFYING_SAMPLES) {
+    return { error: "Couldn't get a clean bow-position reading for position 1.", nothingDetected: false };
+  }
+  if (cp2.length < MIN_QUALIFYING_SAMPLES) {
+    return { error: "Couldn't get a clean bow-position reading for position 2.", nothingDetected: false };
+  }
   if (sp1.length < MIN_QUALIFYING_SAMPLES) {
-    return { error: "Couldn't get a clean contact-point reading near the bridge — make sure the bow is clearly touching the string, then try again." };
+    return { error: "Couldn't get a clean contact-point reading near the bridge.", nothingDetected: false };
   }
   if (sp2.length < MIN_QUALIFYING_SAMPLES) {
-    return { error: "Couldn't get a clean contact-point reading near the fingerboard — make sure the bow is clearly touching the string, then try again." };
+    return { error: "Couldn't get a clean contact-point reading near the fingerboard.", nothingDetected: false };
   }
 
   const tipFraction = median(cp1);
@@ -60,10 +82,10 @@ export function computeCalibration(
   const fingerboardFraction = median(sp2);
 
   if (Math.abs(tipFraction - frogFraction) < MIN_FRACTION_SEPARATION) {
-    return { error: "The two bow positions read almost the same — move the bow clearly between the frog and the tip, then try again." };
+    return { error: 'The two bow positions read almost the same.', nothingDetected: false };
   }
   if (Math.abs(bridgeFraction - fingerboardFraction) < MIN_FRACTION_SEPARATION) {
-    return { error: "The two contact points read almost the same — move the bow clearly between the bridge and the fingerboard, then try again." };
+    return { error: 'The two contact points read almost the same.', nothingDetected: false };
   }
 
   return { frogFraction, tipFraction, fingerboardFraction, bridgeFraction, calibratedAt: Date.now() };
