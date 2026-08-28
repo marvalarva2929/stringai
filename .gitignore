@@ -11,6 +11,7 @@ web-build/
 *.orig.*
 web-build/
 .env
+.env*.local
 .DS_Store
 
 # @generated expo-cli sync-2b81b286409207a5da26e14c78851eb30d8ccbdb
@@ -60,3 +61,17 @@ ml/videos/
 
 # Generated knowledge-graph output — regenerable from source, not source itself.
 graphify-out/
+
+# Marketing source video. ~600MB of .mov that GitHub refuses outright (one file
+# is 197MB against a 100MB hard limit), stripped from history 2026-08-27. The
+# footage still lives in the working tree — it is just not version-controlled.
+# Anything that must survive a machine loss belongs in Drive, not here.
+marketing/organic content/
+
+# Marketing dashboard — standalone Next.js app under marketing/dashboard.
+# Its own dependency tree, build output, and local state (job logs, thumbnails,
+# conversation index) are all regenerable and machine-local.
+marketing/dashboard/node_modules/
+marketing/dashboard/.next/
+marketing/dashboard/.data/
+marketing/slideshows/string-ai-tiktok/.dashboard/

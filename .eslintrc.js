@@ -11,6 +11,7 @@ module.exports = {
     'ios/',
     'ml/',              // Python
     'site/',            // static marketing pages, no build step
+    'marketing/',       // standalone Next.js dashboard, own eslint config
     'graphify-out/',
     'supabase/functions/', // Deno runtime — URL imports and Deno globals
     '*.config.js',
