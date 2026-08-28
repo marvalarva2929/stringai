@@ -77,7 +77,10 @@ export const PITCH_HZ = 20;
 const WRIST_WINDOW_S = 2;
 const ELBOW_WINDOW_S = 2;
 const SHOULDER_WINDOW_S = 3;
-const SETUP_WINDOW_S = 1.5;
+// "Multiple seconds of nothing" before the coach says anything about it. A
+// 1.5s window meant a brief turn away from the camera — reaching for a stand,
+// leaning out to a music sheet — was enough to trigger the cue.
+const NO_POSE_WINDOW_S = 4;
 const NO_BOW_WINDOW_S = 4;
 const SHORT_BOW_WINDOW_S = 6;
 const CAMPED_WINDOW_S = 8;
@@ -152,16 +155,35 @@ const TONE_SCRATCH_RMS = 0.06;     // rough & at/above this loudness → scratch
 // Running bow-angle baseline, capped so a long take can't grow it without bound.
 const ANGLE_HISTORY_CAP = 2000;
 
-// The arm landmarks. A front-facing camera routinely drops one arm out of frame
-// as the player moves, so "get in frame" only fires when NEITHER arm is visible
-// — a frame showing even one of these counts as the player being present.
-const ARM_LANDMARKS = [
-  POSE.LEFT_SHOULDER, POSE.LEFT_ELBOW, POSE.LEFT_WRIST,
-  POSE.RIGHT_SHOULDER, POSE.RIGHT_ELBOW, POSE.RIGHT_WRIST,
-];
-// Fire no_pose only when the recent window is dominated by frames with no arm at
-// all (i.e. the player is genuinely out of shot), not merely missing one arm.
-const NO_POSE_PRESENT_SHARE = 0.25;
+/**
+ * "Is anybody there?" — deliberately the weakest question the coach asks.
+ *
+ * Beta feedback: "Step into frame" kept appearing with most of the student
+ * plainly visible. Two reasons, both fixed here.
+ *
+ * It used to look only at the six arm landmarks at the full measurement
+ * confidence (0.6). But how a student stands relative to the phone varies
+ * enormously, and an angled player loses both arms to occlusion and
+ * foreshortening while their head, shoulders and hips stay perfectly visible.
+ * Presence is now read from all 33 pose landmarks plus either hand, at a much
+ * lower bar: knowing a person is in shot is nothing like measuring a joint,
+ * and holding it to the same standard is what produced the false alarms.
+ *
+ * And it fired when fewer than a quarter of frames found the player, which
+ * could accuse someone the camera was seeing three times a second. Now a
+ * single frame anywhere in the window that finds any human landmark at all is
+ * enough to keep the cue away.
+ */
+const PRESENCE_CONFIDENCE = 0.2;
+
+function hasPerson(frame: FrameKeypoints): boolean {
+  // A detected hand is a person, whatever the body model made of the pose.
+  if (frame.leftHandLandmarks?.length || frame.rightHandLandmarks?.length) return true;
+  const pose = frame.poseLandmarks;
+  if (!pose) return false;
+  return pose.some((lm) =>
+    lm != null && (lm.visibility === undefined || lm.visibility >= PRESENCE_CONFIDENCE));
+}
 
 // ─── Small helpers ───────────────────────────────────────────────────────────
 
@@ -278,21 +300,17 @@ export function createLiveCoach(): LiveCoach {
     const found: CueId[] = [];
 
     // ── Setup ───────────────────────────────────────────────────────────────
-    // Held back for the first couple of seconds so a cold camera doesn't greet
-    // the player with a red banner before it has seen anything.
-    if (t >= 2.5) {
-      const setupWindow = since(poseFrames, t, SETUP_WINDOW_S);
-      // "Player present" = at least one arm landmark visible. Losing a single arm
-      // to a front-facing camera is normal and must not trip the cue.
-      const framesWithPlayer = setupWindow.filter((f) => {
-        const pose = f.poseLandmarks;
-        if (!pose) return false;
-        return ARM_LANDMARKS.some((i) => visible(pose[i]));
-      }).length;
-      // No frames at all, or almost none showing any arm: nobody is in view.
-      if (setupWindow.length === 0 || framesWithPlayer / setupWindow.length < NO_POSE_PRESENT_SHARE) {
+    // Held back until a full window has gone by, so a cold camera can't greet
+    // the player with a red banner before it has had a fair look.
+    if (t >= NO_POSE_WINDOW_S) {
+      const setupWindow = since(poseFrames, t, NO_POSE_WINDOW_S);
+      // Nobody in shot means exactly that: several seconds in which not one
+      // frame found a single human landmark. One frame that did is enough to
+      // stay quiet — see hasPerson.
+      const nobodyInShot = setupWindow.length === 0 || !setupWindow.some(hasPerson);
+      if (nobodyInShot) {
         found.push('no_pose');
-      } else if (since(bowFrames, t, NO_BOW_WINDOW_S).length === 0 && t >= NO_BOW_WINDOW_S) {
+      } else if (since(bowFrames, t, NO_BOW_WINDOW_S).length === 0) {
         found.push('no_bow');
       }
     }

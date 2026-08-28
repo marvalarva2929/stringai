@@ -63,6 +63,45 @@ function poseFrame(timestamp: number, opts: PoseOpts = {}): FrameKeypoints {
   return { timestamp, poseLandmarks: pose, leftHandLandmarks: null, rightHandLandmarks: null };
 }
 
+/**
+ * The student is angled away from the phone: both arms are lost to occlusion
+ * and foreshortening, but head, shoulders and hips are plainly visible.
+ *
+ * This is the shape that made "Step into frame" fire over a student the camera
+ * could see perfectly well — the old check read only the six arm landmarks.
+ */
+function angledAwayFrame(timestamp: number): FrameKeypoints {
+  const pose: Landmark[] = new Array(33).fill({ x: 0, y: 0, z: 0, visibility: 0 });
+  pose[POSE.NOSE] = lm(0.5, 0.15);
+  pose[POSE.LEFT_SHOULDER] = lm(0.60, 0.32);
+  pose[POSE.RIGHT_SHOULDER] = lm(0.40, 0.30);
+  return { timestamp, poseLandmarks: pose, leftHandLandmarks: null, rightHandLandmarks: null };
+}
+
+/** No body at all, but a hand is detected — still a person in shot. */
+function handOnlyFrame(timestamp: number): FrameKeypoints {
+  return {
+    timestamp,
+    poseLandmarks: null,
+    leftHandLandmarks: new Array(21).fill(lm(0.5, 0.5)),
+    rightHandLandmarks: null,
+  };
+}
+
+/** An empty frame: the detector ran and found nothing human. */
+function emptyFrame(timestamp: number): FrameKeypoints {
+  return { timestamp, poseLandmarks: null, leftHandLandmarks: null, rightHandLandmarks: null };
+}
+
+/** A window built frame-by-frame, so presence can vary across it. */
+function windowOf(t: number, frameAt: (ts: number) => FrameKeypoints): FrameKeypoints[] {
+  const frames: FrameKeypoints[] = [];
+  for (let ts = Math.max(0, t - COACH_WINDOW_S); ts <= t; ts += 1 / POSE_FPS) {
+    frames.push(frameAt(ts));
+  }
+  return frames;
+}
+
 function poseWindow(t: number, opts: PoseOpts = {}): FrameKeypoints[] {
   const frames: FrameKeypoints[] = [];
   for (let ts = Math.max(0, t - COACH_WINDOW_S); ts <= t; ts += 1 / POSE_FPS) {
@@ -162,13 +201,17 @@ interface ScenarioOpts {
   angleAt?: (ts: number) => number;
   audio?: () => Audio;
   noPose?: boolean;
+  /** Build each pose frame directly, for presence scenarios. */
+  frameAt?: (ts: number) => FrameKeypoints;
 }
 
 function snapshotAt(t: number, opts: ScenarioOpts = {}): LiveSnapshot {
   const audio = (opts.audio ?? neutralAudio)();
   return {
     t,
-    poseFrames: opts.noPose ? [] : poseWindow(t, opts.pose),
+    poseFrames: opts.noPose ? []
+      : opts.frameAt ? windowOf(t, opts.frameAt)
+      : poseWindow(t, opts.pose),
     // A steady mid-bow hold: no direction changes, so no bow judgement fires.
     bowFrames: bowWindow(t, opts.uAt ?? (() => 0.5), opts.angleAt),
     pitchHz: audio.pitchHz,
@@ -284,6 +327,37 @@ console.log('\nOne arm out of frame is tolerated');
   check('one visible arm does not trip get-in-frame',
     !shown.some((s) => s.id === 'no_pose'),
     `got ${shown.map((s) => s.id).join(', ')}`);
+}
+
+console.log('\nGet-in-frame only fires when nobody is there at all');
+{
+  // Angled away: no arms, but head and shoulders in plain view. The reported
+  // beta failure — the card appearing over a visible student.
+  const angled = run(14, () => ({ frameAt: angledAwayFrame }));
+  check('a student angled away from the phone is still in frame',
+    !angled.some((s) => s.id === 'no_pose'),
+    `got ${angled.map((s) => s.id).join(', ')}`);
+
+  // A hand and nothing else is still a human in shot.
+  const handOnly = run(14, () => ({ frameAt: handOnlyFrame }));
+  check('a detected hand alone counts as present',
+    !handOnly.some((s) => s.id === 'no_pose'),
+    `got ${handOnly.map((s) => s.id).join(', ')}`);
+
+  // Leaning out of shot for a moment — reaching for a stand, checking a sheet.
+  // Under the 4s window this must stay quiet.
+  const blip = run(14, () => ({
+    frameAt: (ts: number) => (ts >= 6 && ts < 8 ? emptyFrame(ts) : angledAwayFrame(ts)),
+  }));
+  check('a two-second step out of shot is not called out',
+    !blip.some((s) => s.id === 'no_pose'),
+    `got ${blip.map((s) => s.id).join(', ')}`);
+
+  // Genuinely gone: several seconds in which no frame finds anything human.
+  const gone = run(14, () => ({ frameAt: emptyFrame }));
+  check('nobody in shot for multiple seconds does fire',
+    gone.some((s) => s.id === 'no_pose'),
+    `got ${gone.map((s) => s.id).join(', ')}`);
 }
 
 console.log('\nBow distribution');
